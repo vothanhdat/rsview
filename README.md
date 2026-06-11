@@ -1,6 +1,6 @@
 # rsview — Rust proof-of-concept
 
-A native port of [react-obj-view](../)'s CLI core: memory-map a JSON file, parse
+A native port of [react-obj-view](https://github.com/vothanhdat/react-obj-view)'s CLI core: memory-map a JSON file, parse
 **on expand** (subtrees are byte ranges, never materialized), flatten a level
 only as far as the viewport scrolls, and search on a background thread. Opening a
 multi-GB file stays near-constant memory.
