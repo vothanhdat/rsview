@@ -161,6 +161,8 @@ pub struct RawChild {
     pub start: usize,
     pub end: usize,
     pub kind: Kind,
+    /// True when the label is an array index (vs. an object key) — used for coloring.
+    pub is_index: bool,
 }
 
 /// Resumable cursor over a container's immediate children — the port of
@@ -229,6 +231,7 @@ impl Cursor {
             start: vstart,
             end: vend,
             kind,
+            is_index: self.is_array,
         })
     }
 }

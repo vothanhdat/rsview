@@ -21,6 +21,29 @@ use ratatui::{
 };
 use std::{collections::HashSet, fs::File, sync::Arc, time::Duration};
 
+/// How many children to show in a collapsed container's inline preview.
+const PREVIEW_ITEMS: usize = 5;
+/// Max display width of a collapsed preview before it's truncated with `…`.
+const PREVIEW_WIDTH: usize = 64;
+
+// Syntax-highlight palette (ANSI named colors so it adapts to the terminal theme).
+const C_KEY: Color = Color::Cyan; // object keys
+const C_INDEX: Color = Color::DarkGray; // array indices
+const C_STR: Color = Color::Green; // string values
+const C_NUM: Color = Color::Yellow; // numbers
+const C_BOOL: Color = Color::Magenta; // true / false
+const C_PUNCT: Color = Color::DarkGray; // braces, colon, markers, previews
+
+/// The foreground color for a value of the given kind.
+fn value_color(kind: Kind) -> Color {
+    match kind {
+        Kind::Str => C_STR,
+        Kind::Number => C_NUM,
+        Kind::Bool => C_BOOL,
+        Kind::Null | Kind::Object | Kind::Array => C_PUNCT,
+    }
+}
+
 /// A lazily-expanding tree node. Children are scanned on demand from `cursor`
 /// (resumable), so a collapsed node costs O(1) and a huge level only enumerates
 /// as far as it's scrolled.
@@ -29,6 +52,7 @@ struct Node {
     start: usize,
     end: usize,
     kind: Kind,
+    is_index: bool,
     has_children: bool,
     expanded: bool,
     done: bool,
@@ -49,6 +73,7 @@ impl Node {
             start: rc.start,
             end: rc.end,
             kind: rc.kind,
+            is_index: rc.is_index,
             has_children: has,
             expanded: false,
             done: false,
@@ -86,29 +111,71 @@ impl Node {
         }
     }
 
+    /// The value text shown after the label. Collapsed containers get a real
+    /// one-line preview of their first few children; expanded ones get the
+    /// opening brace; scalars get their (truncated) literal.
     fn preview(&self, b: &[u8]) -> String {
         match self.kind {
-            Kind::Object => {
+            Kind::Object | Kind::Array => {
+                let arr = matches!(self.kind, Kind::Array);
                 if !self.has_children {
-                    "{}".into()
+                    if arr { "[]".into() } else { "{}".into() }
                 } else if self.expanded {
-                    "{".into()
+                    if arr { "[".into() } else { "{".into() }
                 } else {
-                    "{…}".into()
-                }
-            }
-            Kind::Array => {
-                if !self.has_children {
-                    "[]".into()
-                } else if self.expanded {
-                    "[".into()
-                } else {
-                    "[…]".into()
+                    self.collapsed_preview(b)
                 }
             }
             Kind::Str => format!("\"{}\"", truncate(&decode_str(b, self.start, self.end), 70)),
             _ => truncate(&String::from_utf8_lossy(&b[self.start..self.end]), 70),
         }
+    }
+
+    /// Scan the first few children of a collapsed container and render them
+    /// inline, e.g. `{ version: "0.3.2", deps: {…}, … }`. Uses a fresh resumable
+    /// `Cursor`, capped at `PREVIEW_ITEMS`, so it's O(few) regardless of size.
+    fn collapsed_preview(&self, b: &[u8]) -> String {
+        let arr = matches!(self.kind, Kind::Array);
+        let (open, close) = if arr { ("[", "]") } else { ("{", "}") };
+        let mut cur = Cursor::new(self.start, self.end, arr);
+        let mut parts: Vec<String> = Vec::new();
+        let mut more = false;
+        loop {
+            if parts.len() == PREVIEW_ITEMS {
+                more = cur.next(b).is_some(); // is there at least one more?
+                break;
+            }
+            match cur.next(b) {
+                Some(rc) => {
+                    let v = brief(b, &rc);
+                    parts.push(if arr { v } else { format!("{}: {}", rc.label, v) });
+                }
+                None => break,
+            }
+        }
+        if parts.is_empty() {
+            return format!("{open}{close}");
+        }
+        let mut body = parts.join(", ");
+        if more {
+            body.push_str(", …");
+        }
+        truncate(&format!("{open} {body} {close}"), PREVIEW_WIDTH)
+    }
+}
+
+/// A brief one-level rendering of a value for use inside a parent's preview:
+/// nested containers collapse to `{…}`/`[…]`, scalars show their literal.
+fn brief(b: &[u8], rc: &RawChild) -> String {
+    match rc.kind {
+        Kind::Object => {
+            if container_empty(b, rc.start, rc.end) { "{}".into() } else { "{…}".into() }
+        }
+        Kind::Array => {
+            if container_empty(b, rc.start, rc.end) { "[]".into() } else { "[…]".into() }
+        }
+        Kind::Str => format!("\"{}\"", truncate(&decode_str(b, rc.start, rc.end), 24)),
+        _ => truncate(&String::from_utf8_lossy(&b[rc.start..rc.end]), 24),
     }
 }
 
@@ -121,10 +188,14 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// A flattened, on-screen row plus the index path back to its node.
+/// A flattened, on-screen row plus the index path back to its node. Carries the
+/// label/value/kind separately so the renderer can syntax-color each segment.
 struct Row {
     depth: usize,
-    text: String,
+    label: String,
+    value: String,
+    kind: Kind,
+    is_index: bool,
     has_children: bool,
     expanded: bool,
     path: Vec<usize>,
@@ -139,7 +210,10 @@ fn flatten(node: &mut Node, b: &[u8], depth: usize, budget: usize, out: &mut Vec
     }
     out.push(Row {
         depth,
-        text: format!("{}: {}", node.label, node.preview(b)),
+        label: node.label.clone(),
+        value: node.preview(b),
+        kind: node.kind,
+        is_index: node.is_index,
         has_children: node.has_children,
         expanded: node.expanded,
         path: path.clone(),
@@ -231,6 +305,7 @@ impl App {
             start: rstart,
             end: b.len(), // root spans to EOF; the scanner stops at the real closer
             kind,
+            is_index: false,
             has_children: has,
             expanded: false,
             done: false,
@@ -377,17 +452,33 @@ fn ui(f: &mut Frame, app: &App, h: usize) {
         } else {
             " "
         };
-        let text = format!("{}{} {}", "  ".repeat(r.depth), marker, r.text);
-        let st = if i == app.focus {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else if cur_match == Some(&r.path) {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else if app.match_set.contains(&r.path) {
-            Style::default().fg(Color::Yellow)
+        let indent = "  ".repeat(r.depth);
+
+        let line = if i == app.focus {
+            // Selection bar: plain reversed, colors dropped for maximum contrast.
+            let text = format!("{indent}{marker} {}: {}", r.label, r.value);
+            Line::from(Span::styled(text, Style::default().add_modifier(Modifier::REVERSED)))
+        } else if cur_match == Some(&r.path) || app.match_set.contains(&r.path) {
+            // A search hit: whole row yellow (current match also bold).
+            let text = format!("{indent}{marker} {}: {}", r.label, r.value);
+            let mut st = Style::default().fg(Color::Yellow);
+            if cur_match == Some(&r.path) {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            Line::from(Span::styled(text, st))
         } else {
-            Style::default()
+            // Normal row: syntax-colored segments.
+            let key_color = if r.is_index { C_INDEX } else { C_KEY };
+            Line::from(vec![
+                Span::raw(indent),
+                Span::styled(marker, Style::default().fg(C_PUNCT)),
+                Span::raw(" "),
+                Span::styled(r.label.clone(), Style::default().fg(key_color)),
+                Span::styled(": ", Style::default().fg(C_PUNCT)),
+                Span::styled(r.value.clone(), Style::default().fg(value_color(r.kind))),
+            ])
         };
-        lines.push(Line::from(Span::styled(text, st)));
+        lines.push(line);
     }
     f.render_widget(Paragraph::new(lines), chunks[1]);
 

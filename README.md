@@ -3,7 +3,8 @@
 A native port of [react-obj-view](https://github.com/vothanhdat/react-obj-view)'s CLI core: memory-map a JSON file, parse
 **on expand** (subtrees are byte ranges, never materialized), flatten a level
 only as far as the viewport scrolls, and search on a background thread. Opening a
-multi-GB file stays near-constant memory.
+multi-GB file stays near-constant memory. Rows are syntax-colored, and collapsed
+containers show an inline preview of their first few children.
 
 This is a **proof-of-concept**, not the product: single JSON file argument only
 (no stdin/NDJSON streaming), no themes, no copy. Open / navigate / expand /
