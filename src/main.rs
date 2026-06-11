@@ -6,7 +6,9 @@
 //! (windowing). Opening a multi-GB file stays near-constant memory.
 
 mod scanner;
+mod search;
 use scanner::{container_empty, decode_str, skip_ws, value_kind, Cursor, Kind, RawChild};
+use search::Search;
 
 use memmap2::Mmap;
 use ratatui::{
@@ -17,7 +19,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
-use std::{fs::File, time::Duration};
+use std::{collections::HashSet, fs::File, sync::Arc, time::Duration};
 
 /// A lazily-expanding tree node. Children are scanned on demand from `cursor`
 /// (resumable), so a collapsed node costs O(1) and a huge level only enumerates
@@ -171,12 +173,47 @@ fn get_mut<'a>(mut n: &'a mut Node, path: &[usize]) -> &'a mut Node {
     n
 }
 
+/// Expand every ancestor of `path` (scanning children up to each step) so the
+/// target node becomes reachable in the flattened rows. The target itself is
+/// left as-is — only the chain above it is opened.
+fn expand_to(n: &mut Node, b: &[u8], path: &[usize]) {
+    if path.is_empty() {
+        return;
+    }
+    if n.is_container() && n.has_children && !n.expanded {
+        n.toggle();
+    }
+    n.ensure_child(b, path[0]);
+    if path[0] < n.children.len() {
+        expand_to(&mut n.children[path[0]], b, &path[1..]);
+    }
+}
+
+#[derive(PartialEq)]
+enum Mode {
+    Normal,
+    Search,
+}
+
 struct App {
     root: Node,
     name: String,
     focus: usize,
     scroll: usize,
     rows: Vec<Row>,
+    mode: Mode,
+    /// Live search-input buffer (typed while in `Mode::Search`).
+    query: String,
+    /// The running search, if any. `None` once cleared/cancelled.
+    search: Option<Search>,
+    /// Which match `n`/`N` is currently on.
+    match_idx: usize,
+    /// Set of match paths, for O(1) row highlighting. Grown incrementally.
+    match_set: HashSet<Vec<usize>>,
+    /// How many of `search.matches` are already in `match_set`.
+    indexed: usize,
+    /// A pending jump target: the next frame flattens far enough to land on it.
+    want_path: Option<Vec<usize>>,
 }
 
 impl App {
@@ -209,6 +246,13 @@ impl App {
             focus: 0,
             scroll: 0,
             rows: Vec::new(),
+            mode: Mode::Normal,
+            query: String::new(),
+            search: None,
+            match_idx: 0,
+            match_set: HashSet::new(),
+            indexed: 0,
+            want_path: None,
         }
     }
 
@@ -218,6 +262,67 @@ impl App {
         }
         let path = self.rows[self.focus].path.clone();
         get_mut(&mut self.root, &path).toggle();
+    }
+
+    /// (Re)launch the live search for the current `query`. Dropping the previous
+    /// `Search` cancels its worker thread; an empty query just clears results.
+    fn relaunch(&mut self, mmap: &Arc<Mmap>) {
+        if let Some(old) = self.search.take() {
+            old.cancel(); // belt-and-suspenders; Drop also flips the flag
+        }
+        self.match_set.clear();
+        self.indexed = 0;
+        self.match_idx = 0;
+        self.want_path = None;
+        if self.query.is_empty() {
+            return;
+        }
+        self.search = Some(Search::spawn(Arc::clone(mmap), self.query.clone()));
+    }
+
+    /// Pull newly-found matches into `match_set` so rows can be highlighted.
+    fn pump_search(&mut self) {
+        if let Some(s) = self.search.as_mut() {
+            s.drain();
+        }
+        let n = self.search.as_ref().map_or(0, |s| s.matches.len());
+        while self.indexed < n {
+            let p = self.search.as_ref().unwrap().matches[self.indexed].clone();
+            self.match_set.insert(p);
+            self.indexed += 1;
+        }
+    }
+
+    /// Move to the next/previous match (`dir` = +1 / -1) and queue a jump to it.
+    fn step_match(&mut self, dir: i32, b: &[u8]) {
+        let n = self.search.as_ref().map_or(0, |s| s.matches.len());
+        if n == 0 {
+            return;
+        }
+        self.match_idx = if dir >= 0 {
+            (self.match_idx + 1) % n
+        } else {
+            (self.match_idx + n - 1) % n
+        };
+        let path = self.search.as_ref().unwrap().matches[self.match_idx].clone();
+        self.jump_to(&path, b);
+    }
+
+    /// Expand the ancestors of `path` and queue the row for focus next frame.
+    fn jump_to(&mut self, path: &[usize], b: &[u8]) {
+        expand_to(&mut self.root, b, path);
+        self.want_path = Some(path.to_vec());
+    }
+
+    fn clear_search(&mut self) {
+        if let Some(s) = self.search.take() {
+            s.cancel();
+        }
+        self.query.clear();
+        self.match_set.clear();
+        self.indexed = 0;
+        self.match_idx = 0;
+        self.want_path = None;
     }
 
     fn collapse_or_parent(&mut self) {
@@ -254,6 +359,11 @@ fn ui(f: &mut Frame, app: &App, h: usize) {
         chunks[0],
     );
 
+    let cur_match = app
+        .search
+        .as_ref()
+        .and_then(|s| s.matches.get(app.match_idx));
+
     let mut lines = Vec::new();
     let end = (app.scroll + h).min(app.rows.len());
     for i in app.scroll..end {
@@ -268,30 +378,77 @@ fn ui(f: &mut Frame, app: &App, h: usize) {
             " "
         };
         let text = format!("{}{} {}", "  ".repeat(r.depth), marker, r.text);
-        let mut st = Style::default();
-        if i == app.focus {
-            st = st.add_modifier(Modifier::REVERSED);
-        }
+        let st = if i == app.focus {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else if cur_match == Some(&r.path) {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else if app.match_set.contains(&r.path) {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        };
         lines.push(Line::from(Span::styled(text, st)));
     }
     f.render_widget(Paragraph::new(lines), chunks[1]);
 
-    f.render_widget(
-        Paragraph::new(" ↑/↓ move · enter/→ expand · ← collapse · g top · q quit")
-            .style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
-    );
+    let footer = if app.mode == Mode::Search {
+        let count = app.search.as_ref().map_or(0, |s| s.matches.len());
+        let more = match &app.search {
+            Some(s) if !s.finished => "+",
+            _ => "",
+        };
+        Span::styled(
+            format!(" /{}    {}{} matches · enter go · esc cancel", app.query, count, more),
+            Style::default().fg(Color::Yellow),
+        )
+    } else if app.search.is_some() {
+        let count = app.search.as_ref().map_or(0, |s| s.matches.len());
+        Span::styled(
+            format!(
+                " /{}  {}/{}  · n/N next/prev · / search · q quit",
+                app.query,
+                app.match_idx + 1,
+                count
+            ),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        Span::styled(
+            " ↑/↓ move · enter/→ expand · ← collapse · / search · g top · q quit",
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    f.render_widget(Paragraph::new(Line::from(footer)), chunks[2]);
 }
 
-fn run(term: &mut ratatui::DefaultTerminal, app: &mut App, b: &[u8]) -> std::io::Result<()> {
+fn run(
+    term: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    b: &[u8],
+    mmap: &Arc<Mmap>,
+) -> std::io::Result<()> {
     loop {
+        // Fold in any matches the worker thread has produced since last frame.
+        app.pump_search();
+
         let (_, th) = ratatui::crossterm::terminal::size()?;
         let h = (th.saturating_sub(2) as usize).max(1);
-        // Flatten only as far as the viewport (plus a small lookahead) needs.
-        let budget = (app.scroll + h + 64).max(app.focus + 64);
+        // Normally flatten only as far as the viewport needs. When a jump is
+        // pending, flatten just far enough to include the target's row.
+        let budget = match &app.want_path {
+            Some(p) => p.iter().sum::<usize>() + p.len() + h + 64,
+            None => (app.scroll + h + 64).max(app.focus + 64),
+        };
         app.rows.clear();
         let mut path = Vec::new();
         flatten(&mut app.root, b, 0, budget, &mut app.rows, &mut path);
+
+        // Land a queued jump: find the target's row and focus it.
+        if let Some(p) = app.want_path.take() {
+            if let Some(idx) = app.rows.iter().position(|r| r.path == p) {
+                app.focus = idx;
+            }
+        }
 
         if app.focus >= app.rows.len() {
             app.focus = app.rows.len().saturating_sub(1);
@@ -305,25 +462,66 @@ fn run(term: &mut ratatui::DefaultTerminal, app: &mut App, b: &[u8]) -> std::io:
 
         term.draw(|f| ui(f, app, h))?;
 
-        if event::poll(Duration::from_millis(250))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    match k.code {
-                        KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                        KeyCode::Down | KeyCode::Char('j') => app.focus += 1,
-                        KeyCode::Up | KeyCode::Char('k') => app.focus = app.focus.saturating_sub(1),
-                        KeyCode::PageDown => app.focus += h,
-                        KeyCode::PageUp => app.focus = app.focus.saturating_sub(h),
-                        KeyCode::Home | KeyCode::Char('g') => {
-                            app.focus = 0;
-                            app.scroll = 0;
-                        }
-                        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => app.toggle_focus(),
-                        KeyCode::Left => app.collapse_or_parent(),
-                        _ => {}
+        // Short poll so streaming match counts keep ticking even without input.
+        if !event::poll(Duration::from_millis(100))? {
+            continue;
+        }
+        let Event::Key(k) = event::read()? else {
+            continue;
+        };
+        if k.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        if app.mode == Mode::Search {
+            // Live search input: each edit drops the old worker and starts fresh.
+            match k.code {
+                KeyCode::Esc => {
+                    app.mode = Mode::Normal;
+                    app.clear_search();
+                }
+                KeyCode::Enter => {
+                    app.mode = Mode::Normal;
+                    if app.search.as_ref().is_some_and(|s| !s.matches.is_empty()) {
+                        let first = app.search.as_ref().unwrap().matches[0].clone();
+                        app.match_idx = 0;
+                        app.jump_to(&first, b);
                     }
                 }
+                KeyCode::Backspace => {
+                    app.query.pop();
+                    app.relaunch(mmap);
+                }
+                KeyCode::Char(c) => {
+                    app.query.push(c);
+                    app.relaunch(mmap);
+                }
+                _ => {}
             }
+            continue;
+        }
+
+        // Normal mode.
+        match k.code {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+            KeyCode::Char('/') => {
+                app.mode = Mode::Search;
+                app.query.clear();
+                app.relaunch(mmap);
+            }
+            KeyCode::Char('n') => app.step_match(1, b),
+            KeyCode::Char('N') => app.step_match(-1, b),
+            KeyCode::Down | KeyCode::Char('j') => app.focus += 1,
+            KeyCode::Up | KeyCode::Char('k') => app.focus = app.focus.saturating_sub(1),
+            KeyCode::PageDown => app.focus += h,
+            KeyCode::PageUp => app.focus = app.focus.saturating_sub(h),
+            KeyCode::Home | KeyCode::Char('g') => {
+                app.focus = 0;
+                app.scroll = 0;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => app.toggle_focus(),
+            KeyCode::Left => app.collapse_or_parent(),
+            _ => {}
         }
     }
 }
@@ -338,12 +536,14 @@ fn main() -> std::io::Result<()> {
     };
     let file = File::open(&path)?;
     // SAFETY: the file isn't mutated while mapped for the lifetime of the viewer.
-    let mmap = unsafe { Mmap::map(&file)? };
+    // Wrapped in an Arc so the search worker thread can share the same mapping
+    // (zero-copy) without lifetime gymnastics.
+    let mmap = Arc::new(unsafe { Mmap::map(&file)? });
     let b: &[u8] = &mmap;
 
     let mut app = App::new(b, &path);
     let mut term = ratatui::init();
-    let res = run(&mut term, &mut app, b);
+    let res = run(&mut term, &mut app, b, &mmap);
     ratatui::restore();
     res
 }
