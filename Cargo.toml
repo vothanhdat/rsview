@@ -2,7 +2,15 @@
 name = "rsview"
 version = "0.1.0"
 edition = "2021"
-description = "Proof-of-concept: mmap + lazy byte-range JSON viewer in Rust (ratatui)"
+description = "Browse, navigate and search multi-GB JSON in the terminal at near-constant memory (mmap + lazy byte-range parsing)"
+authors = ["Dat Vo <datvogpt@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/vothanhdat/rsview"
+homepage = "https://github.com/vothanhdat/rsview"
+readme = "README.md"
+keywords = ["json", "tui", "viewer", "mmap", "ratatui"]
+categories = ["command-line-utilities", "visualization"]
+exclude = ["/.github"]
 
 [dependencies]
 memmap2 = "0.9"
