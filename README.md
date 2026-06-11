@@ -1,0 +1,74 @@
+# rsview — Rust proof-of-concept
+
+A native port of [react-obj-view](../)'s CLI core: memory-map a JSON file, parse
+**on expand** (subtrees are byte ranges, never materialized), flatten a level
+only as far as the viewport scrolls, and search on a background thread. Opening a
+multi-GB file stays near-constant memory.
+
+This is a **proof-of-concept**, not the product: single JSON file argument only
+(no stdin/NDJSON streaming), no themes, no copy. Open / navigate / expand /
+search.
+
+## Build & run
+
+```sh
+cargo build --release
+./target/release/rsview path/to/file.json
+# or
+cargo run --release -- path/to/file.json
+```
+
+Put it on your PATH (optional):
+
+```sh
+ln -sf "$PWD/target/release/rsview" ~/.local/bin/rsview
+rsview big.json
+```
+
+## Keys
+
+| Key | Action |
+| --- | --- |
+| `↑`/`↓`, `k`/`j` | move focus |
+| `PageUp`/`PageDown` | jump a screenful |
+| `g`, `Home` | top |
+| `Enter`/`→`/`Space` | expand / collapse focused node |
+| `←` | collapse, or jump to parent if already collapsed |
+| `/` | search (live — results stream as you type) |
+| `Enter` (in search) | jump to first match |
+| `Esc` (in search) | cancel search |
+| `n` / `N` | next / previous match |
+| `q`, `Esc` | quit |
+
+Top line is `filename   <focus>/<rows>+` — the `+` means the row count is a
+**lower bound**: the level has only been flattened as far as you've scrolled.
+Matches render yellow; the current match is brighter.
+
+## Why it's fast (and stays small)
+
+- **mmap, not read.** The file is mapped (`memmap2`), so opening it copies
+  nothing — the kernel pages in 4 KB chunks only when a byte is actually touched.
+  Browsing a 1 GB file sits around **2.6 MB RSS**.
+- **Scan bytes, don't parse.** [scanner.rs](src/scanner.rs) walks raw `&[u8]` to
+  find a container's child byte-ranges. Structural tokens (`{ } [ ] " : ,`) are
+  ASCII; every byte of a multi-byte UTF-8 sequence is ≥ 0x80, so the scan never
+  collides with them and never decodes. A value is decoded (`from_utf8`) only
+  when it's drawn — and only that slice.
+- **Parse on expand, incrementally.** A collapsed node costs O(1). Expanding uses
+  a resumable `Cursor` that scans **one more child per call**, so a level with
+  millions of keys only enumerates ~a screenful (`flatten` stops at a row
+  `budget`). First paint is ~constant regardless of file size.
+- **Search on a real thread.** [search.rs](src/search.rs) scans the mmap on its
+  own OS thread and streams match paths over an `mpsc` channel; an `AtomicBool`
+  the thread polls is the cancel. Retyping drops the old search instantly. The
+  UI never blocks because the scan isn't on the UI's loop. (A full scan does
+  fault in the pages it reads — evictable, file-backed page cache — so search
+  trades the near-zero-memory property for the bytes it must touch.)
+
+## Layout
+
+| File | Role |
+| --- | --- |
+| [src/scanner.rs](src/scanner.rs) | byte-range JSON scan + resumable child `Cursor` |
+| [src/main.rs](src/main.rs) | lazy `Node` tree, windowed flatten, ratatui viewer |
+| [src/search.rs](src/search.rs) | background-thread search + cancel + result stream |
