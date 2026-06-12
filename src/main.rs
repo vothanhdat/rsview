@@ -53,6 +53,9 @@ struct Node {
     end: usize,
     kind: Kind,
     is_index: bool,
+    /// Synthetic NDJSON root: children are the documents, enumerated by a
+    /// `Cursor::lines` instead of a bracketed-container cursor.
+    jsonl: bool,
     has_children: bool,
     expanded: bool,
     done: bool,
@@ -65,6 +68,16 @@ impl Node {
         matches!(self.kind, Kind::Object | Kind::Array)
     }
 
+    /// The right child-cursor for this node: a line stream for the NDJSON root,
+    /// otherwise a normal bracketed-container cursor.
+    fn make_cursor(&self) -> Cursor {
+        if self.jsonl {
+            Cursor::lines(self.start, self.end)
+        } else {
+            Cursor::new(self.start, self.end, matches!(self.kind, Kind::Array))
+        }
+    }
+
     fn from_raw(rc: RawChild, b: &[u8]) -> Node {
         let is_cont = matches!(rc.kind, Kind::Object | Kind::Array);
         let has = is_cont && !container_empty(b, rc.start, rc.end);
@@ -74,6 +87,7 @@ impl Node {
             end: rc.end,
             kind: rc.kind,
             is_index: rc.is_index,
+            jsonl: false,
             has_children: has,
             expanded: false,
             done: false,
@@ -90,7 +104,7 @@ impl Node {
         // Init the child cursor on first expand only; collapse keeps the cursor +
         // already-scanned children so re-expand resumes instead of rescanning.
         if self.expanded && self.cursor.is_none() && self.children.is_empty() && !self.done {
-            self.cursor = Some(Cursor::new(self.start, self.end, matches!(self.kind, Kind::Array)));
+            self.cursor = Some(self.make_cursor());
         }
     }
 
@@ -137,7 +151,7 @@ impl Node {
     fn collapsed_preview(&self, b: &[u8]) -> String {
         let arr = matches!(self.kind, Kind::Array);
         let (open, close) = if arr { ("[", "]") } else { ("{", "}") };
-        let mut cur = Cursor::new(self.start, self.end, arr);
+        let mut cur = self.make_cursor();
         let mut parts: Vec<String> = Vec::new();
         let mut more = false;
         loop {
@@ -291,21 +305,28 @@ struct App {
 }
 
 impl App {
-    fn new(b: &[u8], path: &str) -> App {
-        let rstart = skip_ws(b, 0, b.len());
-        let kind = value_kind(b, rstart);
-        let is_cont = matches!(kind, Kind::Object | Kind::Array);
-        let has = is_cont && !container_empty(b, rstart, b.len());
+    fn new(b: &[u8], path: &str, jsonl: bool) -> App {
         let name = std::path::Path::new(path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "ROOT".into());
+        // NDJSON: a synthetic array root spanning the whole file, with at least
+        // one document if there's any non-whitespace. Single-doc: the first value.
+        let (start, kind, has) = if jsonl {
+            (0, Kind::Array, skip_ws(b, 0, b.len()) < b.len())
+        } else {
+            let rstart = skip_ws(b, 0, b.len());
+            let k = value_kind(b, rstart);
+            let cont = matches!(k, Kind::Object | Kind::Array);
+            (rstart, k, cont && !container_empty(b, rstart, b.len()))
+        };
         let mut root = Node {
             label: name.clone(),
-            start: rstart,
+            start,
             end: b.len(), // root spans to EOF; the scanner stops at the real closer
             kind,
             is_index: false,
+            jsonl,
             has_children: has,
             expanded: false,
             done: false,
@@ -352,7 +373,7 @@ impl App {
         if self.query.is_empty() {
             return;
         }
-        self.search = Some(Search::spawn(Arc::clone(mmap), self.query.clone()));
+        self.search = Some(Search::spawn(Arc::clone(mmap), self.query.clone(), self.root.jsonl));
     }
 
     /// Pull newly-found matches into `match_set` so rows can be highlighted.
@@ -625,6 +646,13 @@ fn main() -> std::io::Result<()> {
             std::process::exit(2);
         }
     };
+    // NDJSON / JSON Lines detected by extension (cheap — a content sniff would
+    // have to scan the whole file and defeat the lazy open).
+    let lower = path.to_ascii_lowercase();
+    let jsonl = [".jsonl", ".ndjson", ".ldjson", ".jsonlines"]
+        .iter()
+        .any(|ext| lower.ends_with(ext));
+
     let file = File::open(&path)?;
     // SAFETY: the file isn't mutated while mapped for the lifetime of the viewer.
     // Wrapped in an Arc so the search worker thread can share the same mapping
@@ -632,7 +660,7 @@ fn main() -> std::io::Result<()> {
     let mmap = Arc::new(unsafe { Mmap::map(&file)? });
     let b: &[u8] = &mmap;
 
-    let mut app = App::new(b, &path);
+    let mut app = App::new(b, &path, jsonl);
     let mut term = ratatui::init();
     let res = run(&mut term, &mut app, b, &mmap);
     ratatui::restore();

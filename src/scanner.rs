@@ -174,6 +174,9 @@ pub struct Cursor {
     is_array: bool,
     index: usize,
     done: bool,
+    /// NDJSON / JSON-Lines mode: values are whitespace-separated with no
+    /// enclosing bracket and no commas (see [`Cursor::lines`]).
+    lines: bool,
 }
 
 impl Cursor {
@@ -185,6 +188,21 @@ impl Cursor {
             is_array,
             index: 0,
             done: false,
+            lines: false,
+        }
+    }
+
+    /// A cursor over a whitespace-separated stream of JSON values — NDJSON /
+    /// JSON Lines / concatenated JSON. There is no enclosing bracket; each value
+    /// is treated as an array-style element (`is_index`), one per `next()`.
+    pub fn lines(start: usize, end: usize) -> Self {
+        Cursor {
+            pos: start,
+            end,
+            is_array: true,
+            index: 0,
+            done: false,
+            lines: true,
         }
     }
 
@@ -193,6 +211,25 @@ impl Cursor {
             return None;
         }
         let mut i = skip_ws(b, self.pos, self.end);
+        if self.lines {
+            // No closer to stop at — EOF ends the stream. Each value is one record.
+            if i >= self.end {
+                self.done = true;
+                return None;
+            }
+            let label = self.index.to_string();
+            let vend = skip_value(b, i, self.end);
+            let kind = value_kind(b, i);
+            self.pos = vend;
+            self.index += 1;
+            return Some(RawChild {
+                label,
+                start: i,
+                end: vend,
+                kind,
+                is_index: true,
+            });
+        }
         if i >= self.end || b[i] == b'}' || b[i] == b']' {
             self.done = true;
             return None;

@@ -35,7 +35,7 @@ pub struct Search {
 impl Search {
     /// Spawn a worker that scans the whole document for `term` (case-insensitive)
     /// and streams the path of every matching node back over a channel.
-    pub fn spawn(mmap: Arc<Mmap>, term: String) -> Search {
+    pub fn spawn(mmap: Arc<Mmap>, term: String, jsonl: bool) -> Search {
         let cancel = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
@@ -45,16 +45,38 @@ impl Search {
 
         let handle = thread::spawn(move || {
             let b: &[u8] = &mmap;
-            let rstart = skip_ws(b, 0, b.len());
-            if rstart < b.len() {
-                let kind = value_kind(b, rstart);
-                let mut path = Vec::new();
-                let mut counter = 0u64;
-                let mut found = 0usize;
-                scan(
-                    b, rstart, b.len(), kind, "", &needle, &mut path, &cancel_w, &tx, &mut counter,
-                    &mut found,
-                );
+            let mut path = Vec::new();
+            let mut counter = 0u64;
+            let mut found = 0usize;
+            if jsonl {
+                // Each document is element [i]; recurse into it like an array child
+                // so match paths line up with the synthetic NDJSON array root.
+                let mut cur = Cursor::lines(0, b.len());
+                let mut i = 0usize;
+                while let Some(rc) = cur.next(b) {
+                    if cancel_w.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    path.push(i);
+                    let bailed = scan(
+                        b, rc.start, rc.end, rc.kind, &rc.label, &needle, &mut path, &cancel_w,
+                        &tx, &mut counter, &mut found,
+                    );
+                    path.pop();
+                    if bailed {
+                        break;
+                    }
+                    i += 1;
+                }
+            } else {
+                let rstart = skip_ws(b, 0, b.len());
+                if rstart < b.len() {
+                    let kind = value_kind(b, rstart);
+                    scan(
+                        b, rstart, b.len(), kind, "", &needle, &mut path, &cancel_w, &tx,
+                        &mut counter, &mut found,
+                    );
+                }
             }
             done_w.store(true, Ordering::Relaxed);
         });

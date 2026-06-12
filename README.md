@@ -6,9 +6,9 @@ only as far as the viewport scrolls, and search on a background thread. Opening 
 multi-GB file stays near-constant memory. Rows are syntax-colored, and collapsed
 containers show an inline preview of their first few children.
 
-This is a **proof-of-concept**, not the product: single JSON file argument only
-(no stdin/NDJSON streaming), no themes, no copy. Open / navigate / expand /
-search.
+This is a **proof-of-concept**, not the product: a single file argument
+(`.jsonl`/`.ndjson` shown as an array of documents; no stdin streaming yet), no
+themes, no copy. Open / navigate / expand / search.
 
 ## Install
 
