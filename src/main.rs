@@ -14,7 +14,7 @@ use source::Source;
 
 use memmap2::Mmap;
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEventKind},
+    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -315,8 +315,11 @@ struct App {
     query: String,
     /// The running search, if any. `None` once cleared/cancelled.
     search: Option<Search>,
-    /// Which match `n`/`N` is currently on.
+    /// Which match the cursor is currently on.
     match_idx: usize,
+    /// Whether match-cycling has landed on a result yet (so the first
+    /// next/prev press goes to the first/last match, not the second).
+    landed: bool,
     /// Set of match paths, for O(1) row highlighting. Grown incrementally.
     match_set: HashSet<Vec<usize>>,
     /// How many of `search.matches` are already in `match_set`.
@@ -418,6 +421,7 @@ impl App {
             match_set: HashSet::new(),
             indexed: 0,
             want_path: None,
+            landed: false,
         }
     }
 
@@ -458,6 +462,7 @@ impl App {
         self.match_set.clear();
         self.indexed = 0;
         self.match_idx = 0;
+        self.landed = false;
         self.want_path = None;
         if self.query.is_empty() {
             return;
@@ -478,13 +483,18 @@ impl App {
         }
     }
 
-    /// Move to the next/previous match (`dir` = +1 / -1) and queue a jump to it.
-    fn step_match(&mut self, dir: i32, b: &[u8]) {
+    /// Jump to the next/previous match (`dir` = +1 / -1), wrapping around. The
+    /// first press after a (re)search lands on the first (or last) match; later
+    /// presses step from there.
+    fn nav_match(&mut self, dir: i32, b: &[u8]) {
         let n = self.search.as_ref().map_or(0, |s| s.matches.len());
         if n == 0 {
             return;
         }
-        self.match_idx = if dir >= 0 {
+        self.match_idx = if !self.landed {
+            self.landed = true;
+            if dir >= 0 { 0 } else { n - 1 }
+        } else if dir >= 0 {
             (self.match_idx + 1) % n
         } else {
             (self.match_idx + n - 1) % n
@@ -507,6 +517,7 @@ impl App {
         self.match_set.clear();
         self.indexed = 0;
         self.match_idx = 0;
+        self.landed = false;
         self.want_path = None;
     }
 
@@ -602,24 +613,19 @@ fn ui(f: &mut Frame, app: &App, h: usize, streaming: bool) {
             Some(s) if !s.finished => "+",
             _ => "",
         };
+        // Show position once we've landed on a match, else the running total.
+        let pos = if app.landed && count > 0 {
+            format!("{}/{}{}", app.match_idx + 1, count, more)
+        } else {
+            format!("{}{} matches", count, more)
+        };
         Span::styled(
-            format!(" /{}    {}{} matches · enter go · esc cancel", app.query, count, more),
+            format!(" /{}   {} · ↵/↓ next · ⇧↵/↑ prev · esc close", app.query, pos),
             Style::default().fg(Color::Yellow),
-        )
-    } else if app.search.is_some() {
-        let count = app.search.as_ref().map_or(0, |s| s.matches.len());
-        Span::styled(
-            format!(
-                " /{}  {}/{}  · n/N next/prev · / search · q quit",
-                app.query,
-                app.match_idx + 1,
-                count
-            ),
-            Style::default().fg(Color::DarkGray),
         )
     } else {
         Span::styled(
-            " ↑/↓ move · enter/→ expand · ← collapse · / search · g top · q quit",
+            " ↑/↓ move · ^f/^b page · enter/→ expand · ← collapse · / search · g top · q quit",
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -670,21 +676,21 @@ fn render_frame(
 /// (re)launch is deferred to the caller via `KeyOutcome::Relaunch` because it
 /// needs a byte `Source`.
 fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], h: usize) -> KeyOutcome {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let shift = k.modifiers.contains(KeyModifiers::SHIFT);
+
     if app.mode == Mode::Search {
-        // Live search input: each edit drops the old worker and starts fresh.
+        // The search overlay stays open so matches can be cycled in place
+        // (find-box style): Enter / ↓ go to the next match, Shift+Enter / ↑ the
+        // previous, typing refines live, Esc closes.
         match k.code {
             KeyCode::Esc => {
                 app.mode = Mode::Normal;
                 app.clear_search();
             }
-            KeyCode::Enter => {
-                app.mode = Mode::Normal;
-                if app.search.as_ref().is_some_and(|s| !s.matches.is_empty()) {
-                    let first = app.search.as_ref().unwrap().matches[0].clone();
-                    app.match_idx = 0;
-                    app.jump_to(&first, b);
-                }
-            }
+            KeyCode::Enter if shift => app.nav_match(-1, b),
+            KeyCode::Enter | KeyCode::Down => app.nav_match(1, b),
+            KeyCode::Up => app.nav_match(-1, b),
             KeyCode::Backspace => {
                 app.query.pop();
                 return KeyOutcome::Relaunch;
@@ -706,12 +712,16 @@ fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], 
             app.query.clear();
             return KeyOutcome::Relaunch;
         }
-        KeyCode::Char('n') => app.step_match(1, b),
-        KeyCode::Char('N') => app.step_match(-1, b),
         KeyCode::Down | KeyCode::Char('j') => app.focus += 1,
         KeyCode::Up | KeyCode::Char('k') => app.focus = app.focus.saturating_sub(1),
+        // Paging: PageUp/PageDown plus Ctrl-F/B (full screen) and Ctrl-D/U (half),
+        // for keyboards without dedicated Page keys.
         KeyCode::PageDown => app.focus += h,
         KeyCode::PageUp => app.focus = app.focus.saturating_sub(h),
+        KeyCode::Char('f') if ctrl => app.focus += h,
+        KeyCode::Char('b') if ctrl => app.focus = app.focus.saturating_sub(h),
+        KeyCode::Char('d') if ctrl => app.focus += h / 2,
+        KeyCode::Char('u') if ctrl => app.focus = app.focus.saturating_sub(h / 2),
         KeyCode::Home | KeyCode::Char('g') => {
             app.focus = 0;
             app.scroll = 0;
@@ -920,6 +930,33 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
     rx
 }
 
+/// Ask the terminal to report modifiers on keys it normally wouldn't (so
+/// Shift+Enter is distinguishable from Enter). Only terminals implementing the
+/// Kitty keyboard protocol support this — most modern ones do (Kitty, WezTerm,
+/// foot, Ghostty, recent iTerm2/Konsole/VTE); on others it's a no-op and
+/// Shift+Enter falls back to ↑ for previous-match. Returns whether it was
+/// enabled (so it can be popped on exit).
+fn enable_enhanced_keys() -> bool {
+    use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+    use ratatui::crossterm::execute;
+    use ratatui::crossterm::terminal::supports_keyboard_enhancement;
+    if supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+        true
+    } else {
+        false
+    }
+}
+
+fn disable_enhanced_keys() {
+    use ratatui::crossterm::event::PopKeyboardEnhancementFlags;
+    use ratatui::crossterm::execute;
+    let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+}
+
 /// Open a file via mmap (zero-copy, near-constant memory) and run the viewer.
 fn run_file(path: String) -> std::io::Result<()> {
     // NDJSON / JSON Lines detected by extension (cheap — a content sniff would
@@ -935,7 +972,11 @@ fn run_file(path: String) -> std::io::Result<()> {
 
     let mut app = App::new(b, &path, jsonl);
     let mut term = ratatui::init();
+    let enhanced = enable_enhanced_keys();
     let res = run(&mut term, &mut app, b, &mmap);
+    if enhanced {
+        disable_enhanced_keys();
+    }
     ratatui::restore();
     res
 }
@@ -948,7 +989,11 @@ fn run_stdin() -> std::io::Result<()> {
     let mut jsonl = false;
     let mut app = App::new(&buf, "stdin", jsonl);
     let mut term = ratatui::init();
+    let enhanced = enable_enhanced_keys();
     let res = run_stream(&mut term, &mut app, &mut buf, &mut jsonl, rx);
+    if enhanced {
+        disable_enhanced_keys();
+    }
     ratatui::restore();
     res
 }

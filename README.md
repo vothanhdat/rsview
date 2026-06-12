@@ -55,15 +55,21 @@ cargo run --release -- path/to/file.json
 | Key | Action |
 | --- | --- |
 | `↑`/`↓`, `k`/`j` | move focus |
-| `PageUp`/`PageDown` | jump a screenful |
+| `PageUp`/`PageDown`, `Ctrl-F`/`Ctrl-B` | jump a screenful |
+| `Ctrl-D`/`Ctrl-U` | jump half a screenful |
 | `g`, `Home` | top |
 | `Enter`/`→`/`Space` | expand / collapse focused node |
 | `←` | collapse, or jump to parent if already collapsed |
 | `/` | search (live — results stream as you type) |
-| `Enter` (in search) | jump to first match |
-| `Esc` (in search) | cancel search |
-| `n` / `N` | next / previous match |
+| `Enter` / `↓` (in search) | next match |
+| `Shift-Enter` / `↑` (in search) | previous match |
+| `Esc` (in search) | close search (keeps cursor on the match) |
 | `q`, `Esc` | quit |
+
+The search box stays open so you can cycle matches in place, then `Esc` to
+explore the tree at the match. `Shift-Enter` needs a terminal that speaks the
+[Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
+(Kitty, WezTerm, foot, Ghostty, recent iTerm2/Konsole/VTE); elsewhere use `↑`.
 
 Top line is `filename   <focus>/<rows>+` — the `+` means the row count is a
 **lower bound**: the level has only been flattened as far as you've scrolled.
