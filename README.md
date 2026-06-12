@@ -10,20 +10,33 @@ This is a **proof-of-concept**, not the product: single JSON file argument only
 (no stdin/NDJSON streaming), no themes, no copy. Open / navigate / expand /
 search.
 
-## Build & run
+## Install
+
+**Prebuilt binary (no compile)** — Linux (x86_64/arm64), macOS (Intel/Apple
+Silicon), and Windows binaries are attached to each
+[GitHub Release](https://github.com/vothanhdat/rsview/releases). Download and
+drop on your `PATH`, or let [cargo-binstall](https://github.com/cargo-bins/cargo-binstall)
+fetch the right one:
+
+```sh
+cargo binstall rsview
+```
+
+**From crates.io (compiles from source):**
+
+```sh
+cargo install rsview
+```
+
+Either way you get an `rsview` on your `PATH`. Then: `rsview path/to/file.json`.
+
+## Build & run (from a checkout)
 
 ```sh
 cargo build --release
 ./target/release/rsview path/to/file.json
 # or
 cargo run --release -- path/to/file.json
-```
-
-Put it on your PATH (optional):
-
-```sh
-ln -sf "$PWD/target/release/rsview" ~/.local/bin/rsview
-rsview big.json
 ```
 
 ## Keys

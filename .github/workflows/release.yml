@@ -1,0 +1,41 @@
+name: release
+
+# Build prebuilt binaries for all common platforms and attach them to the
+# GitHub Release whenever a v* tag is pushed. The archive names are
+# cargo-binstall-compatible, so `cargo binstall rsview` pulls these directly.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  upload-binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and upload rsview
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: rsview
+          target: ${{ matrix.target }}
+          # → rsview-<target>.tar.gz (.zip on Windows), uploaded to the tag's release.
+          archive: $bin-$target
+          token: ${{ secrets.GITHUB_TOKEN }}
