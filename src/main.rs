@@ -21,7 +21,17 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
-use std::{collections::HashSet, fs::File, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::{IsTerminal, Read},
+    sync::{
+        mpsc::{self, Receiver, TryRecvError},
+        Arc,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 /// How many children to show in a collapsed container's inline preview.
 const PREVIEW_ITEMS: usize = 5;
@@ -285,6 +295,15 @@ enum Mode {
     Search,
 }
 
+/// What a key press asks the run loop to do that it can't do itself: quit, or
+/// (re)launch the search — which needs a byte `Source` the caller supplies (a
+/// fixed mmap for files, a fresh snapshot for streams).
+enum KeyOutcome {
+    Continue,
+    Quit,
+    Relaunch,
+}
+
 struct App {
     root: Node,
     name: String,
@@ -306,44 +325,86 @@ struct App {
     want_path: Option<Vec<usize>>,
 }
 
+/// Build the root node for a buffer. Shared by `App::new` and `App::rebuild`
+/// (the streaming re-parse), so a growing buffer always produces a consistent
+/// root. The root is auto-expanded (like `--depth 1`) when it has children.
+fn make_root(b: &[u8], name: &str, jsonl: bool) -> Node {
+    // NDJSON: a synthetic array root spanning the whole buffer, with at least one
+    // document if there's any non-whitespace. Single-doc: the first value.
+    let (start, kind, has) = if jsonl {
+        (0, Kind::Array, skip_ws(b, 0, b.len()) < b.len())
+    } else {
+        let rstart = skip_ws(b, 0, b.len());
+        if rstart >= b.len() {
+            // Empty / whitespace-only input (e.g. `rsview </dev/null`, or a stream
+            // with no data yet): show an empty root rather than indexing past the
+            // buffer in value_kind.
+            (rstart, Kind::Null, false)
+        } else {
+            let k = value_kind(b, rstart);
+            let cont = matches!(k, Kind::Object | Kind::Array);
+            (rstart, k, cont && !container_empty(b, rstart, b.len()))
+        }
+    };
+    let mut root = Node {
+        label: name.into(),
+        start,
+        end: b.len(), // root spans to EOF; the scanner stops at the real closer
+        kind,
+        is_index: false,
+        jsonl,
+        has_children: has,
+        expanded: false,
+        done: false,
+        children: Vec::new(),
+        cursor: None,
+    };
+    if has {
+        root.toggle(); // auto-expand the root (like --depth 1)
+    }
+    root
+}
+
+/// Collect the index-paths of every expanded container in the tree, in DFS
+/// preorder (parents before children). Used to carry expansion state across a
+/// streaming re-parse.
+fn collect_expanded(node: &Node, path: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+    if node.expanded {
+        out.push(path.clone());
+        for (i, ch) in node.children.iter().enumerate() {
+            path.push(i);
+            collect_expanded(ch, path, out);
+            path.pop();
+        }
+    }
+}
+
+/// Re-expand the node at `path`, opening (and scanning) each ancestor as needed.
+/// A no-op if the path isn't reachable yet (data hasn't arrived for it).
+fn set_expanded(root: &mut Node, b: &[u8], path: &[usize]) {
+    let mut n = root;
+    for &idx in path {
+        if n.is_container() && n.has_children && !n.expanded {
+            n.toggle();
+        }
+        n.ensure_child(b, idx);
+        if idx >= n.children.len() {
+            return; // child not present in the buffer yet
+        }
+        n = &mut n.children[idx];
+    }
+    if n.is_container() && n.has_children && !n.expanded {
+        n.toggle();
+    }
+}
+
 impl App {
     fn new(b: &[u8], path: &str, jsonl: bool) -> App {
         let name = std::path::Path::new(path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "ROOT".into());
-        // NDJSON: a synthetic array root spanning the whole file, with at least
-        // one document if there's any non-whitespace. Single-doc: the first value.
-        let (start, kind, has) = if jsonl {
-            (0, Kind::Array, skip_ws(b, 0, b.len()) < b.len())
-        } else {
-            let rstart = skip_ws(b, 0, b.len());
-            if rstart >= b.len() {
-                // Empty / whitespace-only input (e.g. `rsview </dev/null`): show an
-                // empty root rather than indexing past the buffer in value_kind.
-                (rstart, Kind::Null, false)
-            } else {
-                let k = value_kind(b, rstart);
-                let cont = matches!(k, Kind::Object | Kind::Array);
-                (rstart, k, cont && !container_empty(b, rstart, b.len()))
-            }
-        };
-        let mut root = Node {
-            label: name.clone(),
-            start,
-            end: b.len(), // root spans to EOF; the scanner stops at the real closer
-            kind,
-            is_index: false,
-            jsonl,
-            has_children: has,
-            expanded: false,
-            done: false,
-            children: Vec::new(),
-            cursor: None,
-        };
-        if has {
-            root.toggle(); // auto-expand the root (like --depth 1)
-        }
+        let root = make_root(b, &name, jsonl);
         App {
             root,
             name,
@@ -357,6 +418,26 @@ impl App {
             match_set: HashSet::new(),
             indexed: 0,
             want_path: None,
+        }
+    }
+
+    /// Re-parse a grown stream buffer from scratch, preserving the UI cursor and
+    /// expansion. Cheap because the parse is lazy: only the expanded/visible
+    /// extent is scanned, and byte offsets of already-seen content are stable
+    /// (the stream only appends). The focused row's path is queued as the next
+    /// jump so the cursor lands back on the same node.
+    fn rebuild(&mut self, b: &[u8], jsonl: bool) {
+        let mut expanded = Vec::new();
+        collect_expanded(&self.root, &mut Vec::new(), &mut expanded);
+        let focus_path = self.rows.get(self.focus).map(|r| r.path.clone());
+
+        self.root = make_root(b, &self.name, jsonl);
+        for path in &expanded {
+            set_expanded(&mut self.root, b, path);
+        }
+        // Keep the cursor on the same node (unless a jump is already pending).
+        if self.want_path.is_none() {
+            self.want_path = focus_path;
         }
     }
 
@@ -449,7 +530,7 @@ impl App {
     }
 }
 
-fn ui(f: &mut Frame, app: &App, h: usize) {
+fn ui(f: &mut Frame, app: &App, h: usize, streaming: bool) {
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -457,7 +538,11 @@ fn ui(f: &mut Frame, app: &App, h: usize) {
     ])
     .split(f.area());
 
-    let title = format!(" {}   {}/{}+", app.name, app.focus + 1, app.rows.len());
+    let title = if streaming {
+        format!(" {}   {}/{}+   ⟳ streaming", app.name, app.focus + 1, app.rows.len())
+    } else {
+        format!(" {}   {}/{}+", app.name, app.focus + 1, app.rows.len())
+    };
     f.render_widget(
         Paragraph::new(title).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         chunks[0],
@@ -541,6 +626,124 @@ fn ui(f: &mut Frame, app: &App, h: usize) {
     f.render_widget(Paragraph::new(Line::from(footer)), chunks[2]);
 }
 
+/// Flatten the visible window, land any pending jump, clamp focus/scroll, and
+/// draw one frame. Shared by the file and streaming loops.
+fn render_frame(
+    term: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    b: &[u8],
+    h: usize,
+    streaming: bool,
+) -> std::io::Result<()> {
+    // Normally flatten only as far as the viewport needs. When a jump is
+    // pending, flatten just far enough to include the target's row.
+    let budget = match &app.want_path {
+        Some(p) => p.iter().sum::<usize>() + p.len() + h + 64,
+        None => (app.scroll + h + 64).max(app.focus + 64),
+    };
+    app.rows.clear();
+    let mut path = Vec::new();
+    flatten(&mut app.root, b, 0, budget, &mut app.rows, &mut path);
+
+    // Land a queued jump: find the target's row and focus it.
+    if let Some(p) = app.want_path.take() {
+        if let Some(idx) = app.rows.iter().position(|r| r.path == p) {
+            app.focus = idx;
+        }
+    }
+
+    if app.focus >= app.rows.len() {
+        app.focus = app.rows.len().saturating_sub(1);
+    }
+    if app.focus < app.scroll {
+        app.scroll = app.focus;
+    }
+    if app.focus >= app.scroll + h {
+        app.scroll = app.focus + 1 - h;
+    }
+
+    term.draw(|f| ui(f, app, h, streaming))?;
+    Ok(())
+}
+
+/// Apply one key press. Everything self-contained happens here; search
+/// (re)launch is deferred to the caller via `KeyOutcome::Relaunch` because it
+/// needs a byte `Source`.
+fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], h: usize) -> KeyOutcome {
+    if app.mode == Mode::Search {
+        // Live search input: each edit drops the old worker and starts fresh.
+        match k.code {
+            KeyCode::Esc => {
+                app.mode = Mode::Normal;
+                app.clear_search();
+            }
+            KeyCode::Enter => {
+                app.mode = Mode::Normal;
+                if app.search.as_ref().is_some_and(|s| !s.matches.is_empty()) {
+                    let first = app.search.as_ref().unwrap().matches[0].clone();
+                    app.match_idx = 0;
+                    app.jump_to(&first, b);
+                }
+            }
+            KeyCode::Backspace => {
+                app.query.pop();
+                return KeyOutcome::Relaunch;
+            }
+            KeyCode::Char(c) => {
+                app.query.push(c);
+                return KeyOutcome::Relaunch;
+            }
+            _ => {}
+        }
+        return KeyOutcome::Continue;
+    }
+
+    // Normal mode.
+    match k.code {
+        KeyCode::Char('q') | KeyCode::Esc => return KeyOutcome::Quit,
+        KeyCode::Char('/') => {
+            app.mode = Mode::Search;
+            app.query.clear();
+            return KeyOutcome::Relaunch;
+        }
+        KeyCode::Char('n') => app.step_match(1, b),
+        KeyCode::Char('N') => app.step_match(-1, b),
+        KeyCode::Down | KeyCode::Char('j') => app.focus += 1,
+        KeyCode::Up | KeyCode::Char('k') => app.focus = app.focus.saturating_sub(1),
+        KeyCode::PageDown => app.focus += h,
+        KeyCode::PageUp => app.focus = app.focus.saturating_sub(h),
+        KeyCode::Home | KeyCode::Char('g') => {
+            app.focus = 0;
+            app.scroll = 0;
+        }
+        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => app.toggle_focus(),
+        KeyCode::Left => app.collapse_or_parent(),
+        _ => {}
+    }
+    KeyOutcome::Continue
+}
+
+fn term_rows() -> std::io::Result<usize> {
+    let (_, th) = ratatui::crossterm::terminal::size()?;
+    Ok((th.saturating_sub(2) as usize).max(1))
+}
+
+/// Poll for a key (up to `poll_ms`) and dispatch it. The `Relaunch` outcome is
+/// returned to the caller, which owns the byte `Source` the search needs.
+fn pump_input(app: &mut App, b: &[u8], h: usize, poll_ms: u64) -> std::io::Result<KeyOutcome> {
+    if !event::poll(Duration::from_millis(poll_ms))? {
+        return Ok(KeyOutcome::Continue);
+    }
+    let Event::Key(k) = event::read()? else {
+        return Ok(KeyOutcome::Continue);
+    };
+    if k.kind != KeyEventKind::Press {
+        return Ok(KeyOutcome::Continue);
+    }
+    Ok(process_key(app, k, b, h))
+}
+
+/// The file (mmap) / fully-buffered loop: one fixed byte source for the session.
 fn run(
     term: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -550,98 +753,78 @@ fn run(
     loop {
         // Fold in any matches the worker thread has produced since last frame.
         app.pump_search();
-
-        let (_, th) = ratatui::crossterm::terminal::size()?;
-        let h = (th.saturating_sub(2) as usize).max(1);
-        // Normally flatten only as far as the viewport needs. When a jump is
-        // pending, flatten just far enough to include the target's row.
-        let budget = match &app.want_path {
-            Some(p) => p.iter().sum::<usize>() + p.len() + h + 64,
-            None => (app.scroll + h + 64).max(app.focus + 64),
-        };
-        app.rows.clear();
-        let mut path = Vec::new();
-        flatten(&mut app.root, b, 0, budget, &mut app.rows, &mut path);
-
-        // Land a queued jump: find the target's row and focus it.
-        if let Some(p) = app.want_path.take() {
-            if let Some(idx) = app.rows.iter().position(|r| r.path == p) {
-                app.focus = idx;
-            }
-        }
-
-        if app.focus >= app.rows.len() {
-            app.focus = app.rows.len().saturating_sub(1);
-        }
-        if app.focus < app.scroll {
-            app.scroll = app.focus;
-        }
-        if app.focus >= app.scroll + h {
-            app.scroll = app.focus + 1 - h;
-        }
-
-        term.draw(|f| ui(f, app, h))?;
-
+        let h = term_rows()?;
+        render_frame(term, app, b, h, false)?;
         // Short poll so streaming match counts keep ticking even without input.
-        if !event::poll(Duration::from_millis(100))? {
-            continue;
+        match pump_input(app, b, h, 100)? {
+            KeyOutcome::Quit => return Ok(()),
+            KeyOutcome::Relaunch => app.relaunch(mmap),
+            KeyOutcome::Continue => {}
         }
-        let Event::Key(k) = event::read()? else {
-            continue;
+    }
+}
+
+/// How often a growing stream is re-parsed into the tree. Short enough to feel
+/// live, long enough not to thrash on a fast pipe.
+const STREAM_REBUILD_MS: u128 = 100;
+
+/// The streaming loop: bytes arrive on `rx` from the reader thread, the buffer
+/// grows, and the tree is re-parsed on a throttle (preserving cursor/expansion).
+/// Search snapshots the buffer at launch (so it covers the bytes parsed so far).
+fn run_stream(
+    term: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    buf: &mut Vec<u8>,
+    jsonl: &mut bool,
+    rx: Receiver<Vec<u8>>,
+) -> std::io::Result<()> {
+    let mut dirty = false; // bytes arrived that aren't in the tree yet
+    let mut done = false; // reader hit EOF
+    let mut last_build = Instant::now();
+    loop {
+        // Drain whatever the reader thread has produced.
+        loop {
+            match rx.try_recv() {
+                Ok(chunk) => {
+                    buf.extend_from_slice(&chunk);
+                    dirty = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    done = true;
+                    break;
+                }
+            }
+        }
+        // NDJSON detection is sticky: once multi-doc, stay multi-doc.
+        if !*jsonl && sniff_multi(buf) {
+            *jsonl = true;
+        }
+        // Re-parse on a throttle, or immediately once the stream is complete.
+        if dirty && (done || last_build.elapsed().as_millis() >= STREAM_REBUILD_MS) {
+            app.rebuild(buf, *jsonl);
+            dirty = false;
+            last_build = Instant::now();
+        }
+
+        app.pump_search();
+        let h = term_rows()?;
+        // Borrow the (possibly grown) buffer just for this frame's render + input,
+        // then release it so a search relaunch can snapshot it below.
+        let outcome = {
+            let b: &[u8] = buf;
+            render_frame(term, app, b, h, !done)?;
+            pump_input(app, b, h, 100)?
         };
-        if k.kind != KeyEventKind::Press {
-            continue;
-        }
-
-        if app.mode == Mode::Search {
-            // Live search input: each edit drops the old worker and starts fresh.
-            match k.code {
-                KeyCode::Esc => {
-                    app.mode = Mode::Normal;
-                    app.clear_search();
-                }
-                KeyCode::Enter => {
-                    app.mode = Mode::Normal;
-                    if app.search.as_ref().is_some_and(|s| !s.matches.is_empty()) {
-                        let first = app.search.as_ref().unwrap().matches[0].clone();
-                        app.match_idx = 0;
-                        app.jump_to(&first, b);
-                    }
-                }
-                KeyCode::Backspace => {
-                    app.query.pop();
-                    app.relaunch(mmap);
-                }
-                KeyCode::Char(c) => {
-                    app.query.push(c);
-                    app.relaunch(mmap);
-                }
-                _ => {}
+        match outcome {
+            KeyOutcome::Quit => return Ok(()),
+            KeyOutcome::Relaunch => {
+                // Search over the bytes parsed so far (the stream keeps growing,
+                // but one search covers what's arrived at its launch).
+                let snap = Arc::new(Source::Buffered(buf.clone()));
+                app.relaunch(&snap);
             }
-            continue;
-        }
-
-        // Normal mode.
-        match k.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-            KeyCode::Char('/') => {
-                app.mode = Mode::Search;
-                app.query.clear();
-                app.relaunch(mmap);
-            }
-            KeyCode::Char('n') => app.step_match(1, b),
-            KeyCode::Char('N') => app.step_match(-1, b),
-            KeyCode::Down | KeyCode::Char('j') => app.focus += 1,
-            KeyCode::Up | KeyCode::Char('k') => app.focus = app.focus.saturating_sub(1),
-            KeyCode::PageDown => app.focus += h,
-            KeyCode::PageUp => app.focus = app.focus.saturating_sub(h),
-            KeyCode::Home | KeyCode::Char('g') => {
-                app.focus = 0;
-                app.scroll = 0;
-            }
-            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => app.toggle_focus(),
-            KeyCode::Left => app.collapse_or_parent(),
-            _ => {}
+            KeyOutcome::Continue => {}
         }
     }
 }
@@ -659,8 +842,8 @@ fn sniff_multi(b: &[u8]) -> bool {
     skip_ws(b, after, b.len()) < b.len()
 }
 
-/// After draining a piped stdin, point fd 0 back at the real terminal so
-/// crossterm reads keys from it.
+/// Point fd 0 back at the real terminal so crossterm reads keys from it (the
+/// reader thread keeps its own dup'd handle to the pipe for the JSON).
 ///
 /// crossterm's own fallback — open `/dev/tty` when stdin isn't a tty — is fatal
 /// on macOS: a `/dev/tty` fd can't be registered with kqueue (it returns
@@ -693,52 +876,92 @@ fn reattach_terminal_to_stdin() {
     }
 }
 
+/// Hand back a readable handle to the piped stdin for the background reader.
+///
+/// On unix the reader needs its own fd because we hand fd 0 back to the
+/// terminal (see `reattach_terminal_to_stdin`): dup the pipe first, then
+/// reattach. On Windows, crossterm reads keys from the console (not stdin), so
+/// the reader can just take stdin directly.
+#[cfg(unix)]
+fn take_pipe_reader() -> Box<dyn Read + Send> {
+    use std::os::fd::FromRawFd;
+    unsafe {
+        let dup = libc::dup(libc::STDIN_FILENO);
+        reattach_terminal_to_stdin();
+        Box::new(File::from_raw_fd(dup))
+    }
+}
+
 #[cfg(not(unix))]
-fn reattach_terminal_to_stdin() {}
+fn take_pipe_reader() -> Box<dyn Read + Send> {
+    Box::new(std::io::stdin())
+}
 
-fn main() -> std::io::Result<()> {
-    // Source the bytes: a file argument is memory-mapped (zero-copy, near-constant
-    // memory); with no argument and a piped stdin the stream is buffered into
-    // memory (a pipe has no seekable fd to map). A bare TTY with no file is usage.
-    let (source, name, jsonl) = match std::env::args().nth(1) {
-        Some(path) => {
-            // NDJSON / JSON Lines detected by extension (cheap — a content sniff
-            // would have to scan the whole file and defeat the lazy open).
-            let lower = path.to_ascii_lowercase();
-            let jsonl = [".jsonl", ".ndjson", ".ldjson", ".jsonlines"]
-                .iter()
-                .any(|ext| lower.ends_with(ext));
-            let file = File::open(&path)?;
-            // SAFETY: the file isn't mutated while mapped for the viewer's lifetime.
-            (Source::Mapped(unsafe { Mmap::map(&file)? }), path, jsonl)
-        }
-        None => {
-            use std::io::{IsTerminal, Read};
-            if std::io::stdin().is_terminal() {
-                eprintln!("usage: rsview <file.json>   (or pipe JSON: cat file.json | rsview)");
-                std::process::exit(2);
+/// Read the pipe in chunks on a background thread, streaming each to the UI loop
+/// over a channel. The thread ends (and the channel disconnects, signalling EOF)
+/// when the pipe closes or the receiver is dropped.
+fn spawn_reader(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break; // receiver gone — viewer quit
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
             }
-            // A pipe can't be mmap'd, so read it all into memory. Keyboard input
-            // still comes from /dev/tty (crossterm opens it when stdin isn't a
-            // tty), so consuming stdin here doesn't steal the keys. With the
-            // bytes already in hand, sniffing single-doc vs NDJSON is free.
-            let mut buf = Vec::new();
-            std::io::stdin().read_to_end(&mut buf)?;
-            // stdin is now spent; hand it back to the real terminal for keys.
-            reattach_terminal_to_stdin();
-            let jsonl = sniff_multi(&buf);
-            (Source::Buffered(buf), "stdin".to_string(), jsonl)
         }
-    };
+    });
+    rx
+}
 
-    // Wrapped in an Arc so the search worker thread can share the same bytes
-    // (zero-copy) without lifetime gymnastics.
-    let mmap = Arc::new(source);
+/// Open a file via mmap (zero-copy, near-constant memory) and run the viewer.
+fn run_file(path: String) -> std::io::Result<()> {
+    // NDJSON / JSON Lines detected by extension (cheap — a content sniff would
+    // have to scan the whole file and defeat the lazy open).
+    let lower = path.to_ascii_lowercase();
+    let jsonl = [".jsonl", ".ndjson", ".ldjson", ".jsonlines"]
+        .iter()
+        .any(|ext| lower.ends_with(ext));
+    let file = File::open(&path)?;
+    // SAFETY: the file isn't mutated while mapped for the viewer's lifetime.
+    let mmap = Arc::new(Source::Mapped(unsafe { Mmap::map(&file)? }));
     let b: &[u8] = &mmap;
 
-    let mut app = App::new(b, &name, jsonl);
+    let mut app = App::new(b, &path, jsonl);
     let mut term = ratatui::init();
     let res = run(&mut term, &mut app, b, &mmap);
     ratatui::restore();
     res
+}
+
+/// Stream piped stdin: the JSON renders progressively as it arrives (a pipe
+/// can't be mmap'd, so it's buffered in RAM and re-parsed on a throttle).
+fn run_stdin() -> std::io::Result<()> {
+    let rx = spawn_reader(take_pipe_reader());
+    let mut buf: Vec<u8> = Vec::new();
+    let mut jsonl = false;
+    let mut app = App::new(&buf, "stdin", jsonl);
+    let mut term = ratatui::init();
+    let res = run_stream(&mut term, &mut app, &mut buf, &mut jsonl, rx);
+    ratatui::restore();
+    res
+}
+
+fn main() -> std::io::Result<()> {
+    match std::env::args().nth(1) {
+        Some(path) => run_file(path),
+        None => {
+            if std::io::stdin().is_terminal() {
+                eprintln!("usage: rsview <file.json>   (or pipe JSON: cat file.json | rsview)");
+                std::process::exit(2);
+            }
+            run_stdin()
+        }
+    }
 }

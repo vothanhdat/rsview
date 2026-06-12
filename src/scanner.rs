@@ -259,6 +259,13 @@ impl Cursor {
             }
             vstart = skip_ws(b, j, self.end);
         }
+        // The value isn't in the buffer yet (truncated mid-key/colon while
+        // streaming an incomplete document). Don't emit a half child — stop here;
+        // a later re-scan with more bytes will pick it up.
+        if vstart >= self.end {
+            self.done = true;
+            return None;
+        }
         let vend = skip_value(b, vstart, self.end);
         let kind = value_kind(b, vstart);
         self.pos = vend;

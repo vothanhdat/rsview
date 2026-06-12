@@ -8,10 +8,12 @@ containers show an inline preview of their first few children.
 
 This is a **proof-of-concept**, not the product: a single file argument or piped
 stdin (`.jsonl`/`.ndjson` shown as an array of documents), no themes, no copy.
-Open / navigate / expand / search. Piped input is buffered in memory (a stream
-can't be memory-mapped), so the near-constant-memory property is the file path's;
-it isn't progressively streamed. Keys still come from `/dev/tty` while JSON
-arrives on stdin.
+Open / navigate / expand / search. Piped input **streams** — it renders
+progressively as bytes arrive, so `curl … | rsview` shows the document *before
+it's complete*, and your cursor and expanded nodes stay put as new data fills in.
+(A stream can't be memory-mapped, so it's buffered in RAM and re-parsed on a
+throttle; the near-constant-memory property is the file path's.) Keys come from
+`/dev/tty` while JSON arrives on stdin.
 
 ## Install
 
@@ -35,7 +37,8 @@ Either way you get an `rsview` on your `PATH`. Then:
 
 ```sh
 rsview path/to/file.json
-cat path/to/file.json | rsview     # or pipe it (NDJSON auto-detected)
+cat path/to/file.json | rsview                       # pipe it (NDJSON auto-detected)
+curl -s https://api.example.com/big.json | rsview    # streams as it downloads
 ```
 
 ## Build & run (from a checkout)
@@ -92,5 +95,6 @@ Matches render yellow; the current match is brighter.
 | File | Role |
 | --- | --- |
 | [src/scanner.rs](src/scanner.rs) | byte-range JSON scan + resumable child `Cursor` |
-| [src/main.rs](src/main.rs) | lazy `Node` tree, windowed flatten, ratatui viewer |
+| [src/main.rs](src/main.rs) | lazy `Node` tree, windowed flatten, ratatui viewer, stdin streaming |
 | [src/search.rs](src/search.rs) | background-thread search + cancel + result stream |
+| [src/source.rs](src/source.rs) | byte source: memory-mapped file vs. buffered stream |
