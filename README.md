@@ -71,9 +71,12 @@ explore the tree at the match. `Shift-Enter` needs a terminal that speaks the
 [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
 (Kitty, WezTerm, foot, Ghostty, recent iTerm2/Konsole/VTE); elsewhere use `↑`.
 
-Top line is `filename   <focus>/<rows>+` — the `+` means the row count is a
-**lower bound**: the level has only been flattened as far as you've scrolled.
-Matches render yellow; the current match is brighter.
+Top line is `filename   <focus>/<rows>+   <breadcrumb>` — the `+` means the row
+count is a **lower bound**: the level has only been flattened as far as you've
+scrolled. The breadcrumb is the path to the focused node (`data › users › [1] ›
+city`, array elements bracketed); it left-truncates with a leading `…` on deep
+paths so the tail nearest your cursor stays visible. Matches render yellow; the
+current match is brighter.
 
 ## Why it's fast (and stays small)
 

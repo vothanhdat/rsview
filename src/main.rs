@@ -541,6 +541,77 @@ impl App {
     }
 }
 
+/// Walk the focus `path` from the root, collecting each ancestor's label and a
+/// flag for whether it's an array element. The root (the filename) is excluded —
+/// it's already shown at the start of the top bar.
+fn breadcrumb_segments(root: &Node, path: &[usize]) -> Vec<(String, bool)> {
+    let mut out = Vec::with_capacity(path.len());
+    let mut n = root;
+    for &i in path {
+        if i >= n.children.len() {
+            break; // path points past what's scanned (shouldn't happen for a row)
+        }
+        n = &n.children[i];
+        out.push((n.label.clone(), n.is_index));
+    }
+    out
+}
+
+/// Render the focus breadcrumb (`users › [2] › city`) as styled spans that fit
+/// within `avail` columns, **left-truncating** with a leading `…` so the tail
+/// nearest the focused node always stays visible. Array elements are bracketed;
+/// the last (current) segment is bold.
+fn breadcrumb_spans(segs: &[(String, bool)], avail: usize) -> Vec<Span<'static>> {
+    if segs.is_empty() || avail == 0 {
+        return Vec::new();
+    }
+    const SEP: &str = " › ";
+    const SEP_W: usize = 3;
+    let texts: Vec<String> = segs
+        .iter()
+        .map(|(l, is_idx)| if *is_idx { format!("[{l}]") } else { l.clone() })
+        .collect();
+    let widths: Vec<usize> = texts.iter().map(|t| t.chars().count()).collect();
+    let total: usize = widths.iter().sum::<usize>() + SEP_W * segs.len().saturating_sub(1);
+
+    // Find the first segment to show. 0 = the whole path fits, no ellipsis. Else
+    // pick the smallest start ≥ 1 whose suffix (plus a leading `…`) fits.
+    let mut start = 0usize;
+    if total > avail {
+        start = segs.len(); // nothing fits yet
+        let mut acc = 0usize; // width of the accepted suffix (excluding the `…`)
+        for i in (0..segs.len()).rev() {
+            let add = SEP_W + widths[i]; // each shown segment gets a leading separator
+            if 1 + acc + add <= avail {
+                acc += add;
+                start = i;
+            } else {
+                break;
+            }
+        }
+    }
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled("…", Style::default().fg(C_PUNCT)));
+        if start >= segs.len() {
+            return spans; // too narrow for even the last segment — just the `…`
+        }
+    }
+    for i in start..segs.len() {
+        if i > 0 || start > 0 {
+            spans.push(Span::styled(SEP, Style::default().fg(C_PUNCT)));
+        }
+        let color = if segs[i].1 { C_INDEX } else { C_KEY };
+        let mut st = Style::default().fg(color);
+        if i == segs.len() - 1 {
+            st = st.add_modifier(Modifier::BOLD); // the focused node
+        }
+        spans.push(Span::styled(texts[i].clone(), st));
+    }
+    spans
+}
+
 fn ui(f: &mut Frame, app: &App, h: usize, streaming: bool) {
     let chunks = Layout::vertical([
         Constraint::Length(1),
@@ -549,15 +620,32 @@ fn ui(f: &mut Frame, app: &App, h: usize, streaming: bool) {
     ])
     .split(f.area());
 
-    let title = if streaming {
+    let prefix = if streaming {
         format!(" {}   {}/{}+   ⟳ streaming", app.name, app.focus + 1, app.rows.len())
     } else {
         format!(" {}   {}/{}+", app.name, app.focus + 1, app.rows.len())
     };
-    f.render_widget(
-        Paragraph::new(title).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        chunks[0],
-    );
+    let prefix_w = prefix.chars().count();
+    let mut title = vec![Span::styled(
+        prefix,
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )];
+    // Breadcrumb to the focused row, left-truncated to whatever space is left.
+    let segs = app
+        .rows
+        .get(app.focus)
+        .map(|r| breadcrumb_segments(&app.root, &r.path))
+        .unwrap_or_default();
+    if !segs.is_empty() {
+        const GAP: usize = 3;
+        let avail = (chunks[0].width as usize).saturating_sub(prefix_w + GAP);
+        let crumb = breadcrumb_spans(&segs, avail);
+        if !crumb.is_empty() {
+            title.push(Span::raw("   "));
+            title.extend(crumb);
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(title)), chunks[0]);
 
     let cur_match = app
         .search
