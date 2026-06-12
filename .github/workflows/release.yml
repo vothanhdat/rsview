@@ -13,7 +13,23 @@ permissions:
   contents: write
 
 jobs:
+  # The upload action below attaches assets to an existing release but does not
+  # create one, so make it first (idempotent — tolerate an existing release).
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the GitHub Release for this tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" \
+                 --repo "$GITHUB_REPOSITORY" \
+                 --title "rsview $GITHUB_REF_NAME" \
+                 --notes "Prebuilt binaries for Linux (x86_64/arm64), macOS (Intel/Apple Silicon), and Windows. Or install with \`cargo binstall rsview\`."
+
   upload-binaries:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
