@@ -7,8 +7,10 @@
 
 mod scanner;
 mod search;
-use scanner::{container_empty, decode_str, skip_ws, value_kind, Cursor, Kind, RawChild};
+mod source;
+use scanner::{container_empty, decode_str, skip_value, skip_ws, value_kind, Cursor, Kind, RawChild};
 use search::Search;
+use source::Source;
 
 use memmap2::Mmap;
 use ratatui::{
@@ -316,9 +318,15 @@ impl App {
             (0, Kind::Array, skip_ws(b, 0, b.len()) < b.len())
         } else {
             let rstart = skip_ws(b, 0, b.len());
-            let k = value_kind(b, rstart);
-            let cont = matches!(k, Kind::Object | Kind::Array);
-            (rstart, k, cont && !container_empty(b, rstart, b.len()))
+            if rstart >= b.len() {
+                // Empty / whitespace-only input (e.g. `rsview </dev/null`): show an
+                // empty root rather than indexing past the buffer in value_kind.
+                (rstart, Kind::Null, false)
+            } else {
+                let k = value_kind(b, rstart);
+                let cont = matches!(k, Kind::Object | Kind::Array);
+                (rstart, k, cont && !container_empty(b, rstart, b.len()))
+            }
         };
         let mut root = Node {
             label: name.clone(),
@@ -362,7 +370,7 @@ impl App {
 
     /// (Re)launch the live search for the current `query`. Dropping the previous
     /// `Search` cancels its worker thread; an empty query just clears results.
-    fn relaunch(&mut self, mmap: &Arc<Mmap>) {
+    fn relaunch(&mut self, mmap: &Arc<Source>) {
         if let Some(old) = self.search.take() {
             old.cancel(); // belt-and-suspenders; Drop also flips the flag
         }
@@ -537,7 +545,7 @@ fn run(
     term: &mut ratatui::DefaultTerminal,
     app: &mut App,
     b: &[u8],
-    mmap: &Arc<Mmap>,
+    mmap: &Arc<Source>,
 ) -> std::io::Result<()> {
     loop {
         // Fold in any matches the worker thread has produced since last frame.
@@ -638,29 +646,97 @@ fn run(
     }
 }
 
+/// Sniff whether a buffer holds more than one top-level JSON value — NDJSON or
+/// concatenated JSON — rather than a single document. Used for piped stdin,
+/// which has no filename extension to key off. Cheap: it skips exactly one
+/// value and checks whether anything non-whitespace follows.
+fn sniff_multi(b: &[u8]) -> bool {
+    let i = skip_ws(b, 0, b.len());
+    if i >= b.len() {
+        return false;
+    }
+    let after = skip_value(b, i, b.len());
+    skip_ws(b, after, b.len()) < b.len()
+}
+
+/// After draining a piped stdin, point fd 0 back at the real terminal so
+/// crossterm reads keys from it.
+///
+/// crossterm's own fallback — open `/dev/tty` when stdin isn't a tty — is fatal
+/// on macOS: a `/dev/tty` fd can't be registered with kqueue (it returns
+/// EINVAL), so the key-event reader never initializes and the first keypress
+/// errors out. The actual terminal device *can* be registered, so resolve its
+/// path via `ttyname()` on stdout/stderr (still ttys here — only stdin was
+/// piped), open it read-write, and dup it over stdin. Then `isatty(0)` is true,
+/// crossterm uses fd 0 directly, and kqueue accepts it. Linux's `/dev/tty` is
+/// pollable so this is redundant there, but it's harmless.
+#[cfg(unix)]
+fn reattach_terminal_to_stdin() {
+    unsafe {
+        for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+            if libc::isatty(fd) != 1 {
+                continue;
+            }
+            let name = libc::ttyname(fd);
+            if name.is_null() {
+                continue;
+            }
+            let f = libc::open(name, libc::O_RDWR);
+            if f >= 0 {
+                libc::dup2(f, libc::STDIN_FILENO);
+                if f != libc::STDIN_FILENO {
+                    libc::close(f);
+                }
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn reattach_terminal_to_stdin() {}
+
 fn main() -> std::io::Result<()> {
-    let path = match std::env::args().nth(1) {
-        Some(p) => p,
+    // Source the bytes: a file argument is memory-mapped (zero-copy, near-constant
+    // memory); with no argument and a piped stdin the stream is buffered into
+    // memory (a pipe has no seekable fd to map). A bare TTY with no file is usage.
+    let (source, name, jsonl) = match std::env::args().nth(1) {
+        Some(path) => {
+            // NDJSON / JSON Lines detected by extension (cheap — a content sniff
+            // would have to scan the whole file and defeat the lazy open).
+            let lower = path.to_ascii_lowercase();
+            let jsonl = [".jsonl", ".ndjson", ".ldjson", ".jsonlines"]
+                .iter()
+                .any(|ext| lower.ends_with(ext));
+            let file = File::open(&path)?;
+            // SAFETY: the file isn't mutated while mapped for the viewer's lifetime.
+            (Source::Mapped(unsafe { Mmap::map(&file)? }), path, jsonl)
+        }
         None => {
-            eprintln!("usage: rsview <file.json>");
-            std::process::exit(2);
+            use std::io::{IsTerminal, Read};
+            if std::io::stdin().is_terminal() {
+                eprintln!("usage: rsview <file.json>   (or pipe JSON: cat file.json | rsview)");
+                std::process::exit(2);
+            }
+            // A pipe can't be mmap'd, so read it all into memory. Keyboard input
+            // still comes from /dev/tty (crossterm opens it when stdin isn't a
+            // tty), so consuming stdin here doesn't steal the keys. With the
+            // bytes already in hand, sniffing single-doc vs NDJSON is free.
+            let mut buf = Vec::new();
+            std::io::stdin().read_to_end(&mut buf)?;
+            // stdin is now spent; hand it back to the real terminal for keys.
+            reattach_terminal_to_stdin();
+            let jsonl = sniff_multi(&buf);
+            (Source::Buffered(buf), "stdin".to_string(), jsonl)
         }
     };
-    // NDJSON / JSON Lines detected by extension (cheap — a content sniff would
-    // have to scan the whole file and defeat the lazy open).
-    let lower = path.to_ascii_lowercase();
-    let jsonl = [".jsonl", ".ndjson", ".ldjson", ".jsonlines"]
-        .iter()
-        .any(|ext| lower.ends_with(ext));
 
-    let file = File::open(&path)?;
-    // SAFETY: the file isn't mutated while mapped for the lifetime of the viewer.
-    // Wrapped in an Arc so the search worker thread can share the same mapping
+    // Wrapped in an Arc so the search worker thread can share the same bytes
     // (zero-copy) without lifetime gymnastics.
-    let mmap = Arc::new(unsafe { Mmap::map(&file)? });
+    let mmap = Arc::new(source);
     let b: &[u8] = &mmap;
 
-    let mut app = App::new(b, &path, jsonl);
+    let mut app = App::new(b, &name, jsonl);
     let mut term = ratatui::init();
     let res = run(&mut term, &mut app, b, &mmap);
     ratatui::restore();

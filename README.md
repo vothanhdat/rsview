@@ -6,9 +6,12 @@ only as far as the viewport scrolls, and search on a background thread. Opening 
 multi-GB file stays near-constant memory. Rows are syntax-colored, and collapsed
 containers show an inline preview of their first few children.
 
-This is a **proof-of-concept**, not the product: a single file argument
-(`.jsonl`/`.ndjson` shown as an array of documents; no stdin streaming yet), no
-themes, no copy. Open / navigate / expand / search.
+This is a **proof-of-concept**, not the product: a single file argument or piped
+stdin (`.jsonl`/`.ndjson` shown as an array of documents), no themes, no copy.
+Open / navigate / expand / search. Piped input is buffered in memory (a stream
+can't be memory-mapped), so the near-constant-memory property is the file path's;
+it isn't progressively streamed. Keys still come from `/dev/tty` while JSON
+arrives on stdin.
 
 ## Install
 
@@ -28,7 +31,12 @@ cargo binstall rsview
 cargo install rsview
 ```
 
-Either way you get an `rsview` on your `PATH`. Then: `rsview path/to/file.json`.
+Either way you get an `rsview` on your `PATH`. Then:
+
+```sh
+rsview path/to/file.json
+cat path/to/file.json | rsview     # or pipe it (NDJSON auto-detected)
+```
 
 ## Build & run (from a checkout)
 

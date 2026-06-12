@@ -334,6 +334,7 @@ dependencies = [
 name = "rsview"
 version = "0.3.0"
 dependencies = [
+ "libc",
  "memmap2",
  "ratatui",
 ]

@@ -16,6 +16,11 @@ exclude = ["/.github"]
 memmap2 = "0.9"
 ratatui = "0.29"
 
+# Only for the piped-stdin path: reopen the real terminal device onto fd 0 so
+# crossterm reads keys from it (see reattach_terminal_to_stdin in main.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 opt-level = 3
 lto = true

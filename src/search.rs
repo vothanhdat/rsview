@@ -7,7 +7,7 @@
 //! flips the flag) and spawns a new one — no starvation, no shared loop.
 
 use crate::scanner::{decode_str, skip_ws, value_kind, Cursor, Kind};
-use memmap2::Mmap;
+use crate::source::Source;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, Sender},
@@ -35,7 +35,7 @@ pub struct Search {
 impl Search {
     /// Spawn a worker that scans the whole document for `term` (case-insensitive)
     /// and streams the path of every matching node back over a channel.
-    pub fn spawn(mmap: Arc<Mmap>, term: String, jsonl: bool) -> Search {
+    pub fn spawn(mmap: Arc<Source>, term: String, jsonl: bool) -> Search {
         let cancel = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
