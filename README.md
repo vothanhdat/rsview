@@ -57,6 +57,7 @@ cargo run --release -- path/to/file.json
 | `↑`/`↓`, `k`/`j` | move focus |
 | `PageUp`/`PageDown`, `Ctrl-F`/`Ctrl-B` | jump a screenful |
 | `Ctrl-D`/`Ctrl-U` | jump half a screenful |
+| mouse wheel | scroll the pane under the pointer (≈3 rows a notch) |
 | `g`, `Home` | top |
 | `Enter`/`→`/`Space` | expand / collapse focused node |
 | `←` | collapse, or jump to parent if already collapsed |
@@ -76,6 +77,10 @@ The search box stays open so you can cycle matches in place, then `Esc` to
 explore the tree at the match. `Shift-Enter` needs a terminal that speaks the
 [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
 (Kitty, WezTerm, foot, Ghostty, recent iTerm2/Konsole/VTE); elsewhere use `↑`.
+
+Input is coalesced per frame, so holding a key or spinning the wheel stays
+snappy instead of lagging behind. Capturing the mouse suppresses the terminal's
+own text selection — hold `Shift` to select/copy as usual.
 
 **Panes.** Press `s` on any container to split off a new pane rooted at that
 node — the same document seen from a different path — and switch to it. `o`

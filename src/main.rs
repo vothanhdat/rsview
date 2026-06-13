@@ -14,7 +14,7 @@ use source::Source;
 
 use memmap2::Mmap;
 use ratatui::{
-    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
@@ -44,6 +44,9 @@ const PREVIEW_WIDTH: usize = 64;
 const WEIGHT_DEFAULT: u16 = 4;
 const WEIGHT_MIN: u16 = 1;
 const WEIGHT_MAX: u16 = 16;
+
+/// Rows moved per mouse-wheel notch — chunky like tmux, not the 1-row arrow step.
+const WHEEL_STEP: usize = 3;
 
 // Syntax-highlight palette (ANSI named colors so it adapts to the terminal theme).
 const C_KEY: Color = Color::Cyan; // object keys
@@ -1247,19 +1250,62 @@ fn term_area() -> std::io::Result<Rect> {
     Ok(Rect::new(0, 0, w, h))
 }
 
-/// Poll for a key (up to `poll_ms`) and dispatch it. The `Relaunch` outcome is
-/// returned to the caller, which owns the byte `Source` the search needs.
+/// Which pane (index) the screen cell `(col, row)` falls in, if any — for
+/// routing a mouse-wheel scroll to the pane under the cursor.
+fn pane_at(app: &App, col: u16, row: u16) -> std::io::Result<Option<usize>> {
+    let rects = pane_layout(panes_area(term_area()?), &app.weights(), app.stacked);
+    for i in 0..app.views.len() {
+        let r = rects[i * 2];
+        if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
+}
+
+/// Drain the whole pending input burst (coalescing), dispatching each event, so
+/// the caller renders once per burst. Holding a key or spinning the wheel then
+/// moves many rows per frame instead of one row per redraw — the lag fix. The
+/// first poll blocks up to `poll_ms` so streaming match counts keep ticking when
+/// idle. The `Relaunch` outcome is coalesced (search relaunches once after the
+/// burst) and returned to the caller, which owns the byte `Source`.
 fn pump_input(app: &mut App, b: &[u8], h: usize, poll_ms: u64) -> std::io::Result<KeyOutcome> {
     if !event::poll(Duration::from_millis(poll_ms))? {
         return Ok(KeyOutcome::Continue);
     }
-    let Event::Key(k) = event::read()? else {
-        return Ok(KeyOutcome::Continue);
-    };
-    if k.kind != KeyEventKind::Press {
-        return Ok(KeyOutcome::Continue);
+    let mut outcome = KeyOutcome::Continue;
+    loop {
+        match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press => match process_key(app, k, b, h) {
+                KeyOutcome::Quit => return Ok(KeyOutcome::Quit),
+                KeyOutcome::Relaunch => outcome = KeyOutcome::Relaunch,
+                KeyOutcome::Continue => {}
+            },
+            Event::Mouse(m) => {
+                let step = match m.kind {
+                    MouseEventKind::ScrollDown => WHEEL_STEP as isize,
+                    MouseEventKind::ScrollUp => -(WHEEL_STEP as isize),
+                    _ => 0,
+                };
+                if step != 0 {
+                    if let Some(i) = pane_at(app, m.column, m.row)? {
+                        let v = &mut app.views[i];
+                        v.focus = if step > 0 {
+                            v.focus + step as usize
+                        } else {
+                            v.focus.saturating_sub((-step) as usize)
+                        };
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Stop once the input queue is empty, then render the coalesced result.
+        if !event::poll(Duration::from_millis(0))? {
+            break;
+        }
     }
-    Ok(process_key(app, k, b, h))
+    Ok(outcome)
 }
 
 /// The file (mmap) / fully-buffered loop: one fixed byte source for the session.
@@ -1474,6 +1520,20 @@ fn disable_enhanced_keys() {
     let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
 }
 
+/// Capture the mouse so wheel events reach the app (for scrolling). Like tmux,
+/// this takes over the terminal's native selection — hold Shift to select text.
+fn enable_mouse() {
+    use ratatui::crossterm::event::EnableMouseCapture;
+    use ratatui::crossterm::execute;
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+}
+
+fn disable_mouse() {
+    use ratatui::crossterm::event::DisableMouseCapture;
+    use ratatui::crossterm::execute;
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+}
+
 /// Open a file via mmap (zero-copy, near-constant memory) and run the viewer.
 fn run_file(path: String) -> std::io::Result<()> {
     // NDJSON / JSON Lines detected by extension (cheap — a content sniff would
@@ -1490,7 +1550,9 @@ fn run_file(path: String) -> std::io::Result<()> {
     let mut app = App::single(View::new(b, &path, jsonl));
     let mut term = ratatui::init();
     let enhanced = enable_enhanced_keys();
+    enable_mouse();
     let res = run(&mut term, &mut app, b, &mmap);
+    disable_mouse();
     if enhanced {
         disable_enhanced_keys();
     }
@@ -1507,7 +1569,9 @@ fn run_stdin() -> std::io::Result<()> {
     let mut app = App::single(View::new(&buf, "stdin", jsonl));
     let mut term = ratatui::init();
     let enhanced = enable_enhanced_keys();
+    enable_mouse();
     let res = run_stream(&mut term, &mut app, &mut buf, &mut jsonl, rx);
+    disable_mouse();
     if enhanced {
         disable_enhanced_keys();
     }
