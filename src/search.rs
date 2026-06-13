@@ -6,7 +6,7 @@
 //! back over an `mpsc` channel. Retyping just drops the old `Search` (its `Drop`
 //! flips the flag) and spawns a new one — no starvation, no shared loop.
 
-use crate::scanner::{decode_str, skip_ws, value_kind, Cursor, Kind};
+use crate::scanner::{decode_str, Cursor, Kind};
 use crate::source::Source;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -33,9 +33,19 @@ pub struct Search {
 }
 
 impl Search {
-    /// Spawn a worker that scans the whole document for `term` (case-insensitive)
-    /// and streams the path of every matching node back over a channel.
-    pub fn spawn(mmap: Arc<Source>, term: String, jsonl: bool) -> Search {
+    /// Spawn a worker that scans the subtree rooted at byte range `[start, end)`
+    /// for `term` (case-insensitive) and streams the path of every matching node
+    /// back over a channel. Paths are relative to that root, so a pane viewing a
+    /// sub-range gets matches that line up with its own rows. For the whole
+    /// document pass the document root's range; for NDJSON, the whole buffer.
+    pub fn spawn(
+        mmap: Arc<Source>,
+        term: String,
+        jsonl: bool,
+        start: usize,
+        end: usize,
+        kind: Kind,
+    ) -> Search {
         let cancel = Arc::new(AtomicBool::new(false));
         let done = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
@@ -51,7 +61,7 @@ impl Search {
             if jsonl {
                 // Each document is element [i]; recurse into it like an array child
                 // so match paths line up with the synthetic NDJSON array root.
-                let mut cur = Cursor::lines(0, b.len());
+                let mut cur = Cursor::lines(start, end);
                 let mut i = 0usize;
                 while let Some(rc) = cur.next(b) {
                     if cancel_w.load(Ordering::Relaxed) {
@@ -68,15 +78,11 @@ impl Search {
                     }
                     i += 1;
                 }
-            } else {
-                let rstart = skip_ws(b, 0, b.len());
-                if rstart < b.len() {
-                    let kind = value_kind(b, rstart);
-                    scan(
-                        b, rstart, b.len(), kind, "", &needle, &mut path, &cancel_w, &tx,
-                        &mut counter, &mut found,
-                    );
-                }
+            } else if start < end {
+                scan(
+                    b, start, end, kind, "", &needle, &mut path, &cancel_w, &tx, &mut counter,
+                    &mut found,
+                );
             }
             done_w.store(true, Ordering::Relaxed);
         });

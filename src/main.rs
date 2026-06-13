@@ -15,7 +15,7 @@ use source::Source;
 use memmap2::Mmap;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    layout::{Constraint, Layout},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
@@ -304,9 +304,17 @@ enum KeyOutcome {
     Relaunch,
 }
 
-struct App {
+/// One pane: an independent lazy tree + viewport over a byte range of the shared
+/// `Source`. The main pane is the whole document; a split pane (`derived`) is
+/// rooted at another pane's focused node. Each keeps its own focus, scroll,
+/// expansion, and search.
+struct View {
     root: Node,
     name: String,
+    /// True for a pane spun off by `s` (rooted at a sub-range), false for the
+    /// original document pane. Drives the `↳` title marker and which pane the
+    /// streaming re-parse feeds.
+    derived: bool,
     focus: usize,
     scroll: usize,
     rows: Vec<Row>,
@@ -368,6 +376,54 @@ fn make_root(b: &[u8], name: &str, jsonl: bool) -> Node {
     root
 }
 
+/// Build a pane root over the byte range `[start, end)` of an existing node (the
+/// focused node of the pane being split). Unlike `make_root` this is a real
+/// bounded container, not the to-EOF document root, so its cursor stops at the
+/// node's own closer. Auto-expanded like the document root.
+fn make_subroot(b: &[u8], label: String, start: usize, end: usize, kind: Kind) -> Node {
+    let cont = matches!(kind, Kind::Object | Kind::Array);
+    let has = cont && !container_empty(b, start, end);
+    let mut root = Node {
+        label,
+        start,
+        end,
+        kind,
+        is_index: false,
+        jsonl: false,
+        has_children: has,
+        expanded: false,
+        done: false,
+        children: Vec::new(),
+        cursor: None,
+    };
+    if has {
+        root.toggle();
+    }
+    root
+}
+
+/// Render a node path as a JSON accessor string (`users[1].address`), used as a
+/// split pane's title. `base` is the source pane's own origin (empty for the
+/// document pane) so chained splits accumulate (`users[1].address.city`).
+fn join_path(base: &str, segs: &[(String, bool)]) -> String {
+    let mut s = base.to_string();
+    for (label, is_idx) in segs {
+        if *is_idx {
+            s.push_str(&format!("[{label}]"));
+        } else {
+            if !s.is_empty() {
+                s.push('.');
+            }
+            s.push_str(label);
+        }
+    }
+    if s.is_empty() {
+        "root".into()
+    } else {
+        s
+    }
+}
+
 /// Collect the index-paths of every expanded container in the tree, in DFS
 /// preorder (parents before children). Used to carry expansion state across a
 /// streaming re-parse.
@@ -401,16 +457,23 @@ fn set_expanded(root: &mut Node, b: &[u8], path: &[usize]) {
     }
 }
 
-impl App {
-    fn new(b: &[u8], path: &str, jsonl: bool) -> App {
+impl View {
+    fn new(b: &[u8], path: &str, jsonl: bool) -> View {
         let name = std::path::Path::new(path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "ROOT".into());
         let root = make_root(b, &name, jsonl);
-        App {
+        View::with_root(root, name, false)
+    }
+
+    /// A pane over an already-built root (the document root, or a split's
+    /// sub-range root). `name` is the origin path shown in the title.
+    fn with_root(root: Node, name: String, derived: bool) -> View {
+        View {
             root,
             name,
+            derived,
             focus: 0,
             scroll: 0,
             rows: Vec::new(),
@@ -467,7 +530,14 @@ impl App {
         if self.query.is_empty() {
             return;
         }
-        self.search = Some(Search::spawn(Arc::clone(mmap), self.query.clone(), self.root.jsonl));
+        self.search = Some(Search::spawn(
+            Arc::clone(mmap),
+            self.query.clone(),
+            self.root.jsonl,
+            self.root.start,
+            self.root.end,
+            self.root.kind,
+        ));
     }
 
     /// Pull newly-found matches into `match_set` so rows can be highlighted.
@@ -538,6 +608,107 @@ impl App {
                 self.focus = idx;
             }
         }
+    }
+
+    /// Flatten this pane's visible window, land any pending jump, and clamp
+    /// focus/scroll into range. `h` is the pane's content height.
+    fn flatten_window(&mut self, b: &[u8], h: usize) {
+        // Normally flatten only as far as the viewport needs. When a jump is
+        // pending, flatten just far enough to include the target's row.
+        let budget = match &self.want_path {
+            Some(p) => p.iter().sum::<usize>() + p.len() + h + 64,
+            None => (self.scroll + h + 64).max(self.focus + 64),
+        };
+        self.rows.clear();
+        let mut path = Vec::new();
+        flatten(&mut self.root, b, 0, budget, &mut self.rows, &mut path);
+
+        // Land a queued jump: find the target's row and focus it.
+        if let Some(p) = self.want_path.take() {
+            if let Some(idx) = self.rows.iter().position(|r| r.path == p) {
+                self.focus = idx;
+            }
+        }
+        if self.focus >= self.rows.len() {
+            self.focus = self.rows.len().saturating_sub(1);
+        }
+        if self.focus < self.scroll {
+            self.scroll = self.focus;
+        }
+        if self.focus >= self.scroll + h {
+            self.scroll = self.focus + 1 - h;
+        }
+    }
+}
+
+/// The workspace: one or more panes side by side, with `active` receiving keys.
+/// Splitting pushes a new pane rooted at the active pane's focused node; closing
+/// removes it. All panes share the same byte `Source`, so a split is O(1).
+struct App {
+    views: Vec<View>,
+    active: usize,
+}
+
+impl App {
+    fn single(view: View) -> App {
+        App { views: vec![view], active: 0 }
+    }
+
+    fn active_view(&self) -> &View {
+        &self.views[self.active]
+    }
+
+    fn active_mut(&mut self) -> &mut View {
+        &mut self.views[self.active]
+    }
+
+    fn next_pane(&mut self) {
+        let n = self.views.len();
+        if n > 1 {
+            self.active = (self.active + 1) % n;
+        }
+    }
+
+    fn prev_pane(&mut self) {
+        let n = self.views.len();
+        if n > 1 {
+            self.active = (self.active + n - 1) % n;
+        }
+    }
+
+    /// Close the active pane. Returns false if it was the only pane (the caller
+    /// then quits the app).
+    fn close_active(&mut self) -> bool {
+        if self.views.len() <= 1 {
+            return false;
+        }
+        self.views.remove(self.active);
+        if self.active >= self.views.len() {
+            self.active = self.views.len() - 1;
+        }
+        true
+    }
+
+    /// Split: open a new pane rooted at the active pane's focused node (must be a
+    /// non-empty container) and make it active. No-op on a scalar/empty node.
+    fn split_active(&mut self, b: &[u8]) {
+        let src = self.active_view();
+        let Some(row) = src.rows.get(src.focus) else {
+            return;
+        };
+        let path = row.path.clone();
+        let node = get(&src.root, &path);
+        if !node.is_container() || !node.has_children {
+            return;
+        }
+        let (start, end, kind, label) = (node.start, node.end, node.kind, node.label.clone());
+        // Chain the origin label off a derived pane's own name; start fresh
+        // (no filename prefix) for the document pane.
+        let base = if src.derived { src.name.clone() } else { String::new() };
+        let origin = join_path(&base, &breadcrumb_segments(&src.root, &path));
+        let root = make_subroot(b, label, start, end, kind);
+        self.views.push(View::with_root(root, origin, true));
+        self.active = self.views.len() - 1;
     }
 }
 
@@ -612,29 +783,62 @@ fn breadcrumb_spans(segs: &[(String, bool)], avail: usize) -> Vec<Span<'static>>
     spans
 }
 
-fn ui(f: &mut Frame, app: &App, h: usize, streaming: bool) {
+/// Draw every pane side by side, separated by a vertical rule. `streaming` only
+/// affects the (non-derived) document pane's title.
+fn ui(f: &mut Frame, app: &App, streaming: bool) {
+    let n = app.views.len();
+    let mut constraints = Vec::with_capacity(n * 2 - 1);
+    for i in 0..n {
+        if i > 0 {
+            constraints.push(Constraint::Length(1)); // vertical separator column
+        }
+        constraints.push(Constraint::Min(8));
+    }
+    let cols = Layout::horizontal(constraints).split(f.area());
+
+    for i in 0..n {
+        if i > 0 {
+            let sep = cols[i * 2 - 1];
+            let rule: Vec<Line> = (0..sep.height)
+                .map(|_| Line::from(Span::styled("│", Style::default().fg(C_PUNCT))))
+                .collect();
+            f.render_widget(Paragraph::new(rule), sep);
+        }
+        let view = &app.views[i];
+        render_pane(f, cols[i * 2], view, i == app.active, streaming && !view.derived);
+    }
+}
+
+/// Draw one pane (title + breadcrumb, content rows, footer) into `rect`. The
+/// active pane gets a bright title and the key/search footer; others are dimmed
+/// and footerless.
+fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: bool) {
     let chunks = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
-    .split(f.area());
+    .split(rect);
 
+    // Title: `↳ origin   focus/rows+` plus the focus breadcrumb.
+    let marker = if view.derived { "↳ " } else { "" };
     let prefix = if streaming {
-        format!(" {}   {}/{}+   ⟳ streaming", app.name, app.focus + 1, app.rows.len())
+        format!(" {marker}{}   {}/{}+   ⟳ streaming", view.name, view.focus + 1, view.rows.len())
     } else {
-        format!(" {}   {}/{}+", app.name, app.focus + 1, app.rows.len())
+        format!(" {marker}{}   {}/{}+", view.name, view.focus + 1, view.rows.len())
     };
     let prefix_w = prefix.chars().count();
-    let mut title = vec![Span::styled(
-        prefix,
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )];
+    let title_style = if active {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let mut title = vec![Span::styled(prefix, title_style)];
     // Breadcrumb to the focused row, left-truncated to whatever space is left.
-    let segs = app
+    let segs = view
         .rows
-        .get(app.focus)
-        .map(|r| breadcrumb_segments(&app.root, &r.path))
+        .get(view.focus)
+        .map(|r| breadcrumb_segments(&view.root, &r.path))
         .unwrap_or_default();
     if !segs.is_empty() {
         const GAP: usize = 3;
@@ -647,15 +851,13 @@ fn ui(f: &mut Frame, app: &App, h: usize, streaming: bool) {
     }
     f.render_widget(Paragraph::new(Line::from(title)), chunks[0]);
 
-    let cur_match = app
-        .search
-        .as_ref()
-        .and_then(|s| s.matches.get(app.match_idx));
+    let cur_match = view.search.as_ref().and_then(|s| s.matches.get(view.match_idx));
 
+    let h = chunks[1].height as usize;
     let mut lines = Vec::new();
-    let end = (app.scroll + h).min(app.rows.len());
-    for i in app.scroll..end {
-        let r = &app.rows[i];
+    let end = (view.scroll + h).min(view.rows.len());
+    for i in view.scroll..end {
+        let r = &view.rows[i];
         let marker = if r.has_children {
             if r.expanded {
                 "▼"
@@ -667,11 +869,16 @@ fn ui(f: &mut Frame, app: &App, h: usize, streaming: bool) {
         };
         let indent = "  ".repeat(r.depth);
 
-        let line = if i == app.focus {
-            // Selection bar: plain reversed, colors dropped for maximum contrast.
+        let line = if i == view.focus {
+            // Selection bar: reversed for contrast; dimmed on inactive panes so
+            // the live pane's cursor reads as the bright one.
             let text = format!("{indent}{marker} {}: {}", r.label, r.value);
-            Line::from(Span::styled(text, Style::default().add_modifier(Modifier::REVERSED)))
-        } else if cur_match == Some(&r.path) || app.match_set.contains(&r.path) {
+            let mut st = Style::default().add_modifier(Modifier::REVERSED);
+            if !active {
+                st = st.add_modifier(Modifier::DIM);
+            }
+            Line::from(Span::styled(text, st))
+        } else if cur_match == Some(&r.path) || view.match_set.contains(&r.path) {
             // A search hit: whole row yellow (current match also bold).
             let text = format!("{indent}{marker} {}: {}", r.label, r.value);
             let mut st = Style::default().fg(Color::Yellow);
@@ -695,25 +902,29 @@ fn ui(f: &mut Frame, app: &App, h: usize, streaming: bool) {
     }
     f.render_widget(Paragraph::new(lines), chunks[1]);
 
-    let footer = if app.mode == Mode::Search {
-        let count = app.search.as_ref().map_or(0, |s| s.matches.len());
-        let more = match &app.search {
+    // Only the active pane shows a footer (keys / search status).
+    if !active {
+        return;
+    }
+    let footer = if view.mode == Mode::Search {
+        let count = view.search.as_ref().map_or(0, |s| s.matches.len());
+        let more = match &view.search {
             Some(s) if !s.finished => "+",
             _ => "",
         };
         // Show position once we've landed on a match, else the running total.
-        let pos = if app.landed && count > 0 {
-            format!("{}/{}{}", app.match_idx + 1, count, more)
+        let pos = if view.landed && count > 0 {
+            format!("{}/{}{}", view.match_idx + 1, count, more)
         } else {
             format!("{}{} matches", count, more)
         };
         Span::styled(
-            format!(" /{}   {} · ↵/↓ next · ⇧↵/↑ prev · esc close", app.query, pos),
+            format!(" /{}   {} · ↵/↓ next · ⇧↵/↑ prev · esc close", view.query, pos),
             Style::default().fg(Color::Yellow),
         )
     } else {
         Span::styled(
-            " ↑/↓ move · ^f/^b page · enter/→ expand · ← collapse · / search · g top · q quit",
+            " ↑/↓ move · enter/→ expand · ← collapse · / search · s split · tab pane · x close · q quit",
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -729,34 +940,10 @@ fn render_frame(
     h: usize,
     streaming: bool,
 ) -> std::io::Result<()> {
-    // Normally flatten only as far as the viewport needs. When a jump is
-    // pending, flatten just far enough to include the target's row.
-    let budget = match &app.want_path {
-        Some(p) => p.iter().sum::<usize>() + p.len() + h + 64,
-        None => (app.scroll + h + 64).max(app.focus + 64),
-    };
-    app.rows.clear();
-    let mut path = Vec::new();
-    flatten(&mut app.root, b, 0, budget, &mut app.rows, &mut path);
-
-    // Land a queued jump: find the target's row and focus it.
-    if let Some(p) = app.want_path.take() {
-        if let Some(idx) = app.rows.iter().position(|r| r.path == p) {
-            app.focus = idx;
-        }
+    for v in &mut app.views {
+        v.flatten_window(b, h);
     }
-
-    if app.focus >= app.rows.len() {
-        app.focus = app.rows.len().saturating_sub(1);
-    }
-    if app.focus < app.scroll {
-        app.scroll = app.focus;
-    }
-    if app.focus >= app.scroll + h {
-        app.scroll = app.focus + 1 - h;
-    }
-
-    term.draw(|f| ui(f, app, h, streaming))?;
+    term.draw(|f| ui(f, app, streaming))?;
     Ok(())
 }
 
@@ -767,24 +954,26 @@ fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], 
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let shift = k.modifiers.contains(KeyModifiers::SHIFT);
 
-    if app.mode == Mode::Search {
-        // The search overlay stays open so matches can be cycled in place
-        // (find-box style): Enter / ↓ go to the next match, Shift+Enter / ↑ the
-        // previous, typing refines live, Esc closes.
+    // Search mode belongs to the active pane. (Pane-switching keys are normal-mode
+    // only, so at most the active pane is ever in search mode.)
+    if app.active_view().mode == Mode::Search {
+        let v = app.active_mut();
+        // Find-box style: the overlay stays open so matches cycle in place —
+        // Enter / ↓ next, Shift+Enter / ↑ prev, typing refines live, Esc closes.
         match k.code {
             KeyCode::Esc => {
-                app.mode = Mode::Normal;
-                app.clear_search();
+                v.mode = Mode::Normal;
+                v.clear_search();
             }
-            KeyCode::Enter if shift => app.nav_match(-1, b),
-            KeyCode::Enter | KeyCode::Down => app.nav_match(1, b),
-            KeyCode::Up => app.nav_match(-1, b),
+            KeyCode::Enter if shift => v.nav_match(-1, b),
+            KeyCode::Enter | KeyCode::Down => v.nav_match(1, b),
+            KeyCode::Up => v.nav_match(-1, b),
             KeyCode::Backspace => {
-                app.query.pop();
+                v.query.pop();
                 return KeyOutcome::Relaunch;
             }
             KeyCode::Char(c) => {
-                app.query.push(c);
+                v.query.push(c);
                 return KeyOutcome::Relaunch;
             }
             _ => {}
@@ -792,30 +981,58 @@ fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], 
         return KeyOutcome::Continue;
     }
 
-    // Normal mode.
+    // Normal mode: workspace-level keys (pane management) first.
     match k.code {
-        KeyCode::Char('q') | KeyCode::Esc => return KeyOutcome::Quit,
+        // q / Esc close the active pane, quitting only when it's the last one.
+        KeyCode::Char('q') | KeyCode::Esc => {
+            if !app.close_active() {
+                return KeyOutcome::Quit;
+            }
+            return KeyOutcome::Continue;
+        }
+        KeyCode::Char('x') => {
+            app.close_active();
+            return KeyOutcome::Continue;
+        }
+        KeyCode::Char('s') => {
+            app.split_active(b);
+            return KeyOutcome::Continue;
+        }
+        KeyCode::Tab => {
+            app.next_pane();
+            return KeyOutcome::Continue;
+        }
+        KeyCode::BackTab => {
+            app.prev_pane();
+            return KeyOutcome::Continue;
+        }
+        _ => {}
+    }
+
+    // Per-pane navigation goes to the active pane.
+    let v = app.active_mut();
+    match k.code {
         KeyCode::Char('/') => {
-            app.mode = Mode::Search;
-            app.query.clear();
+            v.mode = Mode::Search;
+            v.query.clear();
             return KeyOutcome::Relaunch;
         }
-        KeyCode::Down | KeyCode::Char('j') => app.focus += 1,
-        KeyCode::Up | KeyCode::Char('k') => app.focus = app.focus.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => v.focus += 1,
+        KeyCode::Up | KeyCode::Char('k') => v.focus = v.focus.saturating_sub(1),
         // Paging: PageUp/PageDown plus Ctrl-F/B (full screen) and Ctrl-D/U (half),
         // for keyboards without dedicated Page keys.
-        KeyCode::PageDown => app.focus += h,
-        KeyCode::PageUp => app.focus = app.focus.saturating_sub(h),
-        KeyCode::Char('f') if ctrl => app.focus += h,
-        KeyCode::Char('b') if ctrl => app.focus = app.focus.saturating_sub(h),
-        KeyCode::Char('d') if ctrl => app.focus += h / 2,
-        KeyCode::Char('u') if ctrl => app.focus = app.focus.saturating_sub(h / 2),
+        KeyCode::PageDown => v.focus += h,
+        KeyCode::PageUp => v.focus = v.focus.saturating_sub(h),
+        KeyCode::Char('f') if ctrl => v.focus += h,
+        KeyCode::Char('b') if ctrl => v.focus = v.focus.saturating_sub(h),
+        KeyCode::Char('d') if ctrl => v.focus += h / 2,
+        KeyCode::Char('u') if ctrl => v.focus = v.focus.saturating_sub(h / 2),
         KeyCode::Home | KeyCode::Char('g') => {
-            app.focus = 0;
-            app.scroll = 0;
+            v.focus = 0;
+            v.scroll = 0;
         }
-        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => app.toggle_focus(),
-        KeyCode::Left => app.collapse_or_parent(),
+        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => v.toggle_focus(),
+        KeyCode::Left => v.collapse_or_parent(),
         _ => {}
     }
     KeyOutcome::Continue
@@ -849,14 +1066,16 @@ fn run(
     mmap: &Arc<Source>,
 ) -> std::io::Result<()> {
     loop {
-        // Fold in any matches the worker thread has produced since last frame.
-        app.pump_search();
+        // Fold in any matches the worker threads have produced since last frame.
+        for v in &mut app.views {
+            v.pump_search();
+        }
         let h = term_rows()?;
         render_frame(term, app, b, h, false)?;
         // Short poll so streaming match counts keep ticking even without input.
         match pump_input(app, b, h, 100)? {
             KeyOutcome::Quit => return Ok(()),
-            KeyOutcome::Relaunch => app.relaunch(mmap),
+            KeyOutcome::Relaunch => app.active_mut().relaunch(mmap),
             KeyOutcome::Continue => {}
         }
     }
@@ -899,13 +1118,19 @@ fn run_stream(
             *jsonl = true;
         }
         // Re-parse on a throttle, or immediately once the stream is complete.
+        // Only the document pane tracks the growing buffer; split panes are
+        // snapshots of the bytes that had arrived when they were spun off.
         if dirty && (done || last_build.elapsed().as_millis() >= STREAM_REBUILD_MS) {
-            app.rebuild(buf, *jsonl);
+            if let Some(main) = app.views.iter_mut().find(|v| !v.derived) {
+                main.rebuild(buf, *jsonl);
+            }
             dirty = false;
             last_build = Instant::now();
         }
 
-        app.pump_search();
+        for v in &mut app.views {
+            v.pump_search();
+        }
         let h = term_rows()?;
         // Borrow the (possibly grown) buffer just for this frame's render + input,
         // then release it so a search relaunch can snapshot it below.
@@ -920,7 +1145,7 @@ fn run_stream(
                 // Search over the bytes parsed so far (the stream keeps growing,
                 // but one search covers what's arrived at its launch).
                 let snap = Arc::new(Source::Buffered(buf.clone()));
-                app.relaunch(&snap);
+                app.active_mut().relaunch(&snap);
             }
             KeyOutcome::Continue => {}
         }
@@ -1058,7 +1283,7 @@ fn run_file(path: String) -> std::io::Result<()> {
     let mmap = Arc::new(Source::Mapped(unsafe { Mmap::map(&file)? }));
     let b: &[u8] = &mmap;
 
-    let mut app = App::new(b, &path, jsonl);
+    let mut app = App::single(View::new(b, &path, jsonl));
     let mut term = ratatui::init();
     let enhanced = enable_enhanced_keys();
     let res = run(&mut term, &mut app, b, &mmap);
@@ -1075,7 +1300,7 @@ fn run_stdin() -> std::io::Result<()> {
     let rx = spawn_reader(take_pipe_reader());
     let mut buf: Vec<u8> = Vec::new();
     let mut jsonl = false;
-    let mut app = App::new(&buf, "stdin", jsonl);
+    let mut app = App::single(View::new(&buf, "stdin", jsonl));
     let mut term = ratatui::init();
     let enhanced = enable_enhanced_keys();
     let res = run_stream(&mut term, &mut app, &mut buf, &mut jsonl, rx);

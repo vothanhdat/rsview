@@ -8,7 +8,7 @@ containers show an inline preview of their first few children.
 
 This is a **proof-of-concept**, not the product: a single file argument or piped
 stdin (`.jsonl`/`.ndjson` shown as an array of documents), no themes, no copy.
-Open / navigate / expand / search. Piped input **streams** — it renders
+Open / navigate / expand / search / split into panes. Piped input **streams** — it renders
 progressively as bytes arrive, so `curl … | rsview` shows the document *before
 it's complete*, and your cursor and expanded nodes stay put as new data fills in.
 (A stream can't be memory-mapped, so it's buffered in RAM and re-parsed on a
@@ -64,12 +64,22 @@ cargo run --release -- path/to/file.json
 | `Enter` / `↓` (in search) | next match |
 | `Shift-Enter` / `↑` (in search) | previous match |
 | `Esc` (in search) | close search (keeps cursor on the match) |
-| `q`, `Esc` | quit |
+| `s` | split: open a new pane rooted at the focused node |
+| `Tab` / `Shift-Tab` | switch the active pane |
+| `x` | close the active pane |
+| `q`, `Esc` | close the active pane (quit on the last one) |
 
 The search box stays open so you can cycle matches in place, then `Esc` to
 explore the tree at the match. `Shift-Enter` needs a terminal that speaks the
 [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
 (Kitty, WezTerm, foot, Ghostty, recent iTerm2/Konsole/VTE); elsewhere use `↑`.
+
+**Panes.** Press `s` on any container to split off a new pane rooted at that
+node — the same document seen from a different path. Panes sit side by side and
+all share the one memory-mapped file, so a split costs nothing. Each pane keeps
+its own focus, expansion, breadcrumb, and search (scoped to that pane's
+subtree); keys go to the active pane, whose title is highlighted. `Tab` switches
+panes, `x` closes one.
 
 Top line is `filename   <focus>/<rows>+   <breadcrumb>` — the `+` means the row
 count is a **lower bound**: the level has only been flattened as far as you've
@@ -104,6 +114,6 @@ current match is brighter.
 | File | Role |
 | --- | --- |
 | [src/scanner.rs](src/scanner.rs) | byte-range JSON scan + resumable child `Cursor` |
-| [src/main.rs](src/main.rs) | lazy `Node` tree, windowed flatten, ratatui viewer, stdin streaming |
+| [src/main.rs](src/main.rs) | lazy `Node` tree, windowed flatten, multi-pane ratatui viewer, stdin streaming |
 | [src/search.rs](src/search.rs) | background-thread search + cancel + result stream |
 | [src/source.rs](src/source.rs) | byte source: memory-mapped file vs. buffered stream |
