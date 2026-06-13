@@ -324,6 +324,14 @@ struct View {
     derived: bool,
     /// Relative size in the workspace layout (a `Fill` weight); `+`/`-` adjust it.
     weight: u16,
+    /// Stable identity for parent/child links (Vec indices shift when a pane is
+    /// closed, so links can't be indices).
+    id: u64,
+    /// The pane this was split from. Closing a pane closes its descendants too.
+    parent: Option<u64>,
+    /// The child reused by `o` (open-or-replace): re-rooted in place rather than
+    /// opening yet another pane.
+    preview_child: Option<u64>,
     focus: usize,
     scroll: usize,
     rows: Vec<Row>,
@@ -484,6 +492,9 @@ impl View {
             name,
             derived,
             weight: WEIGHT_DEFAULT,
+            id: 0,
+            parent: None,
+            preview_child: None,
             focus: 0,
             scroll: 0,
             rows: Vec::new(),
@@ -496,6 +507,21 @@ impl View {
             want_path: None,
             landed: false,
         }
+    }
+
+    /// Re-root this pane at a new subtree (used by `o` to reuse a preview pane).
+    /// Resets the viewport and drops any search, since the content changed; keeps
+    /// the pane's id/links and size weight.
+    fn reroot(&mut self, root: Node, name: String) {
+        self.root = root;
+        self.name = name;
+        self.derived = true;
+        self.focus = 0;
+        self.scroll = 0;
+        self.rows.clear();
+        self.want_path = None;
+        self.mode = Mode::Normal;
+        self.clear_search();
     }
 
     /// Re-parse a grown stream buffer from scratch, preserving the UI cursor and
@@ -660,11 +686,24 @@ struct App {
     /// Pane orientation: false = side by side (columns), true = stacked (rows).
     /// Toggled with `\`.
     stacked: bool,
+    /// Monotonic source of pane ids (never reused, so links stay unambiguous).
+    next_id: u64,
 }
 
 impl App {
-    fn single(view: View) -> App {
-        App { views: vec![view], active: 0, stacked: false }
+    fn single(mut view: View) -> App {
+        view.id = 0;
+        App { views: vec![view], active: 0, stacked: false, next_id: 1 }
+    }
+
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    fn index_of(&self, id: u64) -> Option<usize> {
+        self.views.iter().position(|v| v.id == id)
     }
 
     fn active_view(&self) -> &View {
@@ -698,8 +737,8 @@ impl App {
     /// The active pane's content height (rows) for a given screen area — used to
     /// size paging jumps, since each pane reserves a title + footer row.
     fn active_height(&self, area: Rect) -> usize {
-        let rects = pane_layout(area, &self.weights(), self.stacked);
-        (rects[self.active * 2].height as usize).saturating_sub(2).max(1)
+        let rects = pane_layout(panes_area(area), &self.weights(), self.stacked);
+        (rects[self.active * 2].height as usize).saturating_sub(1).max(1)
     }
 
     fn next_pane(&mut self) {
@@ -716,39 +755,103 @@ impl App {
         }
     }
 
-    /// Close the active pane. Returns false if it was the only pane (the caller
-    /// then quits the app).
+    /// Close the active pane and every pane descending from it (split from it,
+    /// transitively). Returns false if that would close every pane — the caller
+    /// then quits. The closed pane's parent (if any) becomes active.
     fn close_active(&mut self) -> bool {
         if self.views.len() <= 1 {
             return false;
         }
-        self.views.remove(self.active);
-        if self.active >= self.views.len() {
-            self.active = self.views.len() - 1;
+        // Gather the active pane plus everything that descends from it.
+        let mut doomed = HashSet::new();
+        doomed.insert(self.views[self.active].id);
+        loop {
+            let mut grew = false;
+            for v in &self.views {
+                if let Some(p) = v.parent {
+                    if doomed.contains(&p) && doomed.insert(v.id) {
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
         }
+        if doomed.len() >= self.views.len() {
+            return false; // active is the ancestor of all panes — quit instead
+        }
+        let parent = self.views[self.active].parent;
+        self.views.retain(|v| !doomed.contains(&v.id));
+        // Drop now-dangling preview links (their target was just closed).
+        let alive: HashSet<u64> = self.views.iter().map(|v| v.id).collect();
+        for v in &mut self.views {
+            if v.preview_child.is_some_and(|c| !alive.contains(&c)) {
+                v.preview_child = None;
+            }
+        }
+        // Land on the closed pane's parent if it survived, else clamp.
+        self.active = parent
+            .and_then(|pid| self.index_of(pid))
+            .unwrap_or_else(|| self.active.min(self.views.len() - 1));
         true
     }
 
-    /// Split: open a new pane rooted at the active pane's focused node (must be a
-    /// non-empty container) and make it active. No-op on a scalar/empty node.
-    fn split_active(&mut self, b: &[u8]) {
+    /// Build the (subroot, origin-label) for a child pane rooted at the active
+    /// pane's focused node. `None` if that node isn't a non-empty container.
+    fn make_child_root(&self, b: &[u8]) -> Option<(Node, String)> {
         let src = self.active_view();
-        let Some(row) = src.rows.get(src.focus) else {
-            return;
-        };
+        let row = src.rows.get(src.focus)?;
         let path = row.path.clone();
         let node = get(&src.root, &path);
         if !node.is_container() || !node.has_children {
-            return;
+            return None;
         }
-        let (start, end, kind, label) = (node.start, node.end, node.kind, node.label.clone());
         // Chain the origin label off a derived pane's own name; start fresh
         // (no filename prefix) for the document pane.
         let base = if src.derived { src.name.clone() } else { String::new() };
         let origin = join_path(&base, &breadcrumb_segments(&src.root, &path));
-        let root = make_subroot(b, label, start, end, kind);
-        self.views.push(View::with_root(root, origin, true));
+        let root = make_subroot(b, node.label.clone(), node.start, node.end, node.kind);
+        Some((root, origin))
+    }
+
+    /// Split: open a *new* child pane rooted at the active pane's focused node and
+    /// switch to it. The child links back to the parent, so closing the parent
+    /// closes it too. No-op on a scalar/empty node.
+    fn split_active(&mut self, b: &[u8]) {
+        let Some((root, origin)) = self.make_child_root(b) else {
+            return;
+        };
+        let parent = self.views[self.active].id;
+        let id = self.alloc_id();
+        let mut v = View::with_root(root, origin, true);
+        v.id = id;
+        v.parent = Some(parent);
+        self.views.push(v);
         self.active = self.views.len() - 1;
+    }
+
+    /// Open-or-replace: re-root the active pane's preview child at the focused
+    /// node (opening one the first time), and *stay on the parent* so you can keep
+    /// browsing with a live detail pane. No-op on a scalar/empty node.
+    fn preview_active(&mut self, b: &[u8]) {
+        let Some((root, origin)) = self.make_child_root(b) else {
+            return;
+        };
+        let parent = self.views[self.active].id;
+        let existing = self.views[self.active]
+            .preview_child
+            .and_then(|cid| self.index_of(cid));
+        if let Some(ci) = existing {
+            self.views[ci].reroot(root, origin); // reuse the detail pane
+        } else {
+            let id = self.alloc_id();
+            let mut v = View::with_root(root, origin, true);
+            v.id = id;
+            v.parent = Some(parent);
+            self.views.push(v);
+            self.views[self.active].preview_child = Some(id);
+        }
     }
 }
 
@@ -860,9 +963,18 @@ fn render_separator(f: &mut Frame, sep: Rect, stacked: bool) {
 
 /// Draw every pane (side by side or stacked, per `app.stacked`), separated by a
 /// rule. `streaming` only affects the (non-derived) document pane's title.
+/// The vertical span used for panes: everything above the global footer row.
+fn panes_area(area: Rect) -> Rect {
+    Rect { height: area.height.saturating_sub(1), ..area }
+}
+
+/// Draw every pane (side by side or stacked) above a single global footer that
+/// spans the full width. `streaming` only affects the (non-derived) document
+/// pane's title.
 fn ui(f: &mut Frame, app: &App, streaming: bool) {
+    let area = f.area();
     let n = app.views.len();
-    let rects = pane_layout(f.area(), &app.weights(), app.stacked);
+    let rects = pane_layout(panes_area(area), &app.weights(), app.stacked);
     for i in 0..n {
         if i > 0 {
             render_separator(f, rects[i * 2 - 1], app.stacked);
@@ -870,18 +982,43 @@ fn ui(f: &mut Frame, app: &App, streaming: bool) {
         let view = &app.views[i];
         render_pane(f, rects[i * 2], view, i == app.active, streaming && !view.derived);
     }
+    // One global footer at the very bottom, reflecting the active pane's mode.
+    let footer_row = Rect { y: area.y + area.height.saturating_sub(1), height: 1, ..area };
+    render_footer(f, footer_row, app.active_view());
 }
 
-/// Draw one pane (title + breadcrumb, content rows, footer) into `rect`. The
-/// active pane gets a bright title and the key/search footer; others are dimmed
-/// and footerless.
+/// The single global key/search-status bar, reflecting the active pane.
+fn render_footer(f: &mut Frame, area: Rect, view: &View) {
+    let footer = if view.mode == Mode::Search {
+        let count = view.search.as_ref().map_or(0, |s| s.matches.len());
+        let more = match &view.search {
+            Some(s) if !s.finished => "+",
+            _ => "",
+        };
+        // Show position once we've landed on a match, else the running total.
+        let pos = if view.landed && count > 0 {
+            format!("{}/{}{}", view.match_idx + 1, count, more)
+        } else {
+            format!("{}{} matches", count, more)
+        };
+        Span::styled(
+            format!(" /{}   {} · ↵/↓ next · ⇧↵/↑ prev · esc close", view.query, pos),
+            Style::default().fg(Color::Yellow),
+        )
+    } else {
+        Span::styled(
+            " ↑/↓ move · enter expand · / search · s split · o preview · \\ layout · +/- size · tab pane · x close · q quit",
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    f.render_widget(Paragraph::new(Line::from(footer)), area);
+}
+
+/// Draw one pane (title + breadcrumb, then content rows) into `rect`. The active
+/// pane gets a bright title and is the only one to show its cursor bar; the
+/// key/search footer is global (see [`render_footer`]), not per-pane.
 fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: bool) {
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .split(rect);
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(rect);
 
     // Title: `↳ origin   focus/rows+` plus the focus breadcrumb.
     let marker = if view.derived { "↳ " } else { "" };
@@ -962,34 +1099,6 @@ fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: 
         lines.push(line);
     }
     f.render_widget(Paragraph::new(lines), chunks[1]);
-
-    // Only the active pane shows a footer (keys / search status).
-    if !active {
-        return;
-    }
-    let footer = if view.mode == Mode::Search {
-        let count = view.search.as_ref().map_or(0, |s| s.matches.len());
-        let more = match &view.search {
-            Some(s) if !s.finished => "+",
-            _ => "",
-        };
-        // Show position once we've landed on a match, else the running total.
-        let pos = if view.landed && count > 0 {
-            format!("{}/{}{}", view.match_idx + 1, count, more)
-        } else {
-            format!("{}{} matches", count, more)
-        };
-        Span::styled(
-            format!(" /{}   {} · ↵/↓ next · ⇧↵/↑ prev · esc close", view.query, pos),
-            Style::default().fg(Color::Yellow),
-        )
-    } else {
-        Span::styled(
-            " ↑/↓ move · enter expand · / search · s split · \\ layout · +/- size · tab pane · x close · q quit",
-            Style::default().fg(Color::DarkGray),
-        )
-    };
-    f.render_widget(Paragraph::new(Line::from(footer)), chunks[2]);
 }
 
 /// Flatten the visible window, land any pending jump, clamp focus/scroll, and
@@ -1001,10 +1110,11 @@ fn render_frame(
     streaming: bool,
 ) -> std::io::Result<()> {
     // Each pane flattens to its own content height (which depends on orientation
-    // and pane count), so a stacked pane only walks its shorter window.
-    let rects = pane_layout(term_area()?, &app.weights(), app.stacked);
+    // and pane count), so a stacked pane only walks its shorter window. Each pane
+    // reserves one title row; the footer is global, below the panes.
+    let rects = pane_layout(panes_area(term_area()?), &app.weights(), app.stacked);
     for (i, v) in app.views.iter_mut().enumerate() {
-        let h = (rects[i * 2].height as usize).saturating_sub(2).max(1);
+        let h = (rects[i * 2].height as usize).saturating_sub(1).max(1);
         v.flatten_window(b, h);
     }
     term.draw(|f| ui(f, app, streaming))?;
@@ -1060,6 +1170,10 @@ fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], 
         }
         KeyCode::Char('s') => {
             app.split_active(b);
+            return KeyOutcome::Continue;
+        }
+        KeyCode::Char('o') => {
+            app.preview_active(b);
             return KeyOutcome::Continue;
         }
         KeyCode::Char('\\') => {

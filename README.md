@@ -64,12 +64,13 @@ cargo run --release -- path/to/file.json
 | `Enter` / `↓` (in search) | next match |
 | `Shift-Enter` / `↑` (in search) | previous match |
 | `Esc` (in search) | close search (keeps cursor on the match) |
-| `s` | split: open a new pane rooted at the focused node |
+| `s` | split: open a new pane rooted at the focused node (and switch to it) |
+| `o` | open/re-root a single preview pane at the focused node (stay on parent) |
 | `\` | toggle pane layout (side by side ↔ stacked) |
 | `+` / `-` | grow / shrink the active pane |
 | `Tab` / `Shift-Tab` | switch the active pane |
-| `x` | close the active pane |
-| `q`, `Esc` | close the active pane (quit on the last one) |
+| `x` | close the active pane (and any panes split from it) |
+| `q`, `Esc` | close the active pane and its children (quit on the last) |
 
 The search box stays open so you can cycle matches in place, then `Esc` to
 explore the tree at the match. `Shift-Enter` needs a terminal that speaks the
@@ -77,12 +78,17 @@ explore the tree at the match. `Shift-Enter` needs a terminal that speaks the
 (Kitty, WezTerm, foot, Ghostty, recent iTerm2/Konsole/VTE); elsewhere use `↑`.
 
 **Panes.** Press `s` on any container to split off a new pane rooted at that
-node — the same document seen from a different path. Panes sit side by side and
-all share the one memory-mapped file, so a split costs nothing. Each pane keeps
-its own focus, expansion, breadcrumb, and search (scoped to that pane's
-subtree); keys go to the active pane, whose title is highlighted. `Tab` switches
-panes, `x` closes one, `\` toggles the whole workspace between side-by-side
-(columns) and stacked (rows), and `+`/`-` grow and shrink the active pane.
+node — the same document seen from a different path — and switch to it. `o`
+instead opens (or, if one already exists, **re-roots**) a single *preview* pane
+and keeps you on the parent, so you can move the cursor and watch a detail pane
+follow along — master/detail browsing. Panes form a tree: each child links to
+the pane it was split from, and closing a pane (`x`, or `q`/`Esc`) closes
+everything split from it too. They share the one memory-mapped file, so a split
+costs nothing; each keeps its own focus, expansion, breadcrumb, and search
+(scoped to that pane's subtree). Keys go to the active pane, which alone shows
+the highlighted title and cursor bar. `Tab` switches panes, `\` toggles the
+workspace between side-by-side (columns) and stacked (rows), and `+`/`-` grow and
+shrink the active pane.
 
 Top line is `filename   <focus>/<rows>+   <breadcrumb>` — the `+` means the row
 count is a **lower bound**: the level has only been flattened as far as you've
