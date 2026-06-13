@@ -649,22 +649,34 @@ impl View {
     /// Flatten this pane's visible window, land any pending jump, and clamp
     /// focus/scroll into range. `h` is the pane's content height.
     fn flatten_window(&mut self, b: &[u8], h: usize) {
-        // Normally flatten only as far as the viewport needs. When a jump is
-        // pending, flatten just far enough to include the target's row.
-        let budget = match &self.want_path {
-            Some(p) => p.iter().sum::<usize>() + p.len() + h + 64,
-            None => (self.scroll + h + 64).max(self.focus + 64),
-        };
-        self.rows.clear();
-        let mut path = Vec::new();
-        flatten(&mut self.root, b, 0, budget, &mut self.rows, &mut path);
-
-        // Land a queued jump: find the target's row and focus it.
-        if let Some(p) = self.want_path.take() {
-            if let Some(idx) = self.rows.iter().position(|r| r.path == p) {
+        if let Some(target) = self.want_path.take() {
+            // Jump: flatten far enough to include the target's row. A static
+            // estimate undershoots once sibling subtrees are expanded (e.g.
+            // cycling search matches expands each visited node, pushing later
+            // rows down), so grow the budget until the target appears — or the
+            // tree is fully walked (target unreachable / not arrived yet).
+            let mut budget = target.iter().sum::<usize>() + target.len() + h + 64;
+            loop {
+                self.rows.clear();
+                let mut path = Vec::new();
+                flatten(&mut self.root, b, 0, budget, &mut self.rows, &mut path);
+                let walked_all = self.rows.len() < budget;
+                if self.rows.iter().any(|r| r.path == target) || walked_all {
+                    break;
+                }
+                budget = budget.saturating_mul(2);
+            }
+            if let Some(idx) = self.rows.iter().position(|r| r.path == target) {
                 self.focus = idx;
             }
+        } else {
+            // No jump pending: flatten only as far as the viewport needs.
+            let budget = (self.scroll + h + 64).max(self.focus + 64);
+            self.rows.clear();
+            let mut path = Vec::new();
+            flatten(&mut self.root, b, 0, budget, &mut self.rows, &mut path);
         }
+
         if self.focus >= self.rows.len() {
             self.focus = self.rows.len().saturating_sub(1);
         }
