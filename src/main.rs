@@ -38,6 +38,13 @@ const PREVIEW_ITEMS: usize = 5;
 /// Max display width of a collapsed preview before it's truncated with `…`.
 const PREVIEW_WIDTH: usize = 64;
 
+/// Pane size weights (a ratatui `Fill` factor). A new pane starts at
+/// `WEIGHT_DEFAULT`; `+`/`-` step it within `[WEIGHT_MIN, WEIGHT_MAX]`. Equal
+/// weights divide the space evenly; a larger weight takes a bigger share.
+const WEIGHT_DEFAULT: u16 = 4;
+const WEIGHT_MIN: u16 = 1;
+const WEIGHT_MAX: u16 = 16;
+
 // Syntax-highlight palette (ANSI named colors so it adapts to the terminal theme).
 const C_KEY: Color = Color::Cyan; // object keys
 const C_INDEX: Color = Color::DarkGray; // array indices
@@ -315,6 +322,8 @@ struct View {
     /// original document pane. Drives the `↳` title marker and which pane the
     /// streaming re-parse feeds.
     derived: bool,
+    /// Relative size in the workspace layout (a `Fill` weight); `+`/`-` adjust it.
+    weight: u16,
     focus: usize,
     scroll: usize,
     rows: Vec<Row>,
@@ -474,6 +483,7 @@ impl View {
             root,
             name,
             derived,
+            weight: WEIGHT_DEFAULT,
             focus: 0,
             scroll: 0,
             rows: Vec::new(),
@@ -647,11 +657,14 @@ impl View {
 struct App {
     views: Vec<View>,
     active: usize,
+    /// Pane orientation: false = side by side (columns), true = stacked (rows).
+    /// Toggled with `\`.
+    stacked: bool,
 }
 
 impl App {
     fn single(view: View) -> App {
-        App { views: vec![view], active: 0 }
+        App { views: vec![view], active: 0, stacked: false }
     }
 
     fn active_view(&self) -> &View {
@@ -660,6 +673,33 @@ impl App {
 
     fn active_mut(&mut self) -> &mut View {
         &mut self.views[self.active]
+    }
+
+    fn toggle_layout(&mut self) {
+        self.stacked = !self.stacked;
+    }
+
+    fn grow_active(&mut self) {
+        let w = &mut self.active_mut().weight;
+        *w = (*w + 1).min(WEIGHT_MAX);
+    }
+
+    fn shrink_active(&mut self) {
+        let w = &mut self.active_mut().weight;
+        *w = (*w - 1).max(WEIGHT_MIN);
+    }
+
+    /// Each pane's layout weight, in order — the `Fill` factors handed to
+    /// [`pane_layout`].
+    fn weights(&self) -> Vec<u16> {
+        self.views.iter().map(|v| v.weight).collect()
+    }
+
+    /// The active pane's content height (rows) for a given screen area — used to
+    /// size paging jumps, since each pane reserves a title + footer row.
+    fn active_height(&self, area: Rect) -> usize {
+        let rects = pane_layout(area, &self.weights(), self.stacked);
+        (rects[self.active * 2].height as usize).saturating_sub(2).max(1)
     }
 
     fn next_pane(&mut self) {
@@ -783,29 +823,52 @@ fn breadcrumb_spans(segs: &[(String, bool)], avail: usize) -> Vec<Span<'static>>
     spans
 }
 
-/// Draw every pane side by side, separated by a vertical rule. `streaming` only
-/// affects the (non-derived) document pane's title.
+/// Split the screen into pane rects interleaved with 1-cell separator rects:
+/// `[pane0, sep, pane1, sep, …]`. Side by side (columns) by default, stacked
+/// (rows) when `stacked`. Each pane is a `Fill(weight)`, so the leftover space
+/// (after the fixed-size separators) divides in proportion to the weights.
+fn pane_layout(area: Rect, weights: &[u16], stacked: bool) -> std::rc::Rc<[Rect]> {
+    let n = weights.len();
+    let mut constraints = Vec::with_capacity(n * 2 - 1);
+    for (i, &w) in weights.iter().enumerate() {
+        if i > 0 {
+            constraints.push(Constraint::Length(1)); // separator row/column
+        }
+        constraints.push(Constraint::Fill(w.max(1)));
+    }
+    if stacked {
+        Layout::vertical(constraints).split(area)
+    } else {
+        Layout::horizontal(constraints).split(area)
+    }
+}
+
+/// The rule between panes: a vertical `│` column (side by side) or a horizontal
+/// `─` row (stacked).
+fn render_separator(f: &mut Frame, sep: Rect, stacked: bool) {
+    let style = Style::default().fg(C_PUNCT);
+    if stacked {
+        let rule = "─".repeat(sep.width as usize);
+        f.render_widget(Paragraph::new(Line::from(Span::styled(rule, style))), sep);
+    } else {
+        let rule: Vec<Line> = (0..sep.height)
+            .map(|_| Line::from(Span::styled("│", style)))
+            .collect();
+        f.render_widget(Paragraph::new(rule), sep);
+    }
+}
+
+/// Draw every pane (side by side or stacked, per `app.stacked`), separated by a
+/// rule. `streaming` only affects the (non-derived) document pane's title.
 fn ui(f: &mut Frame, app: &App, streaming: bool) {
     let n = app.views.len();
-    let mut constraints = Vec::with_capacity(n * 2 - 1);
+    let rects = pane_layout(f.area(), &app.weights(), app.stacked);
     for i in 0..n {
         if i > 0 {
-            constraints.push(Constraint::Length(1)); // vertical separator column
-        }
-        constraints.push(Constraint::Min(8));
-    }
-    let cols = Layout::horizontal(constraints).split(f.area());
-
-    for i in 0..n {
-        if i > 0 {
-            let sep = cols[i * 2 - 1];
-            let rule: Vec<Line> = (0..sep.height)
-                .map(|_| Line::from(Span::styled("│", Style::default().fg(C_PUNCT))))
-                .collect();
-            f.render_widget(Paragraph::new(rule), sep);
+            render_separator(f, rects[i * 2 - 1], app.stacked);
         }
         let view = &app.views[i];
-        render_pane(f, cols[i * 2], view, i == app.active, streaming && !view.derived);
+        render_pane(f, rects[i * 2], view, i == app.active, streaming && !view.derived);
     }
 }
 
@@ -869,15 +932,13 @@ fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: 
         };
         let indent = "  ".repeat(r.depth);
 
-        let line = if i == view.focus {
-            // Selection bar: reversed for contrast; dimmed on inactive panes so
-            // the live pane's cursor reads as the bright one.
+        let line = if active && i == view.focus {
+            // Selection bar: only the active pane shows its cursor, so the one
+            // highlighted row unambiguously marks which pane is live. Inactive
+            // panes keep their focus (it returns on Tab) but draw it as a normal
+            // row.
             let text = format!("{indent}{marker} {}: {}", r.label, r.value);
-            let mut st = Style::default().add_modifier(Modifier::REVERSED);
-            if !active {
-                st = st.add_modifier(Modifier::DIM);
-            }
-            Line::from(Span::styled(text, st))
+            Line::from(Span::styled(text, Style::default().add_modifier(Modifier::REVERSED)))
         } else if cur_match == Some(&r.path) || view.match_set.contains(&r.path) {
             // A search hit: whole row yellow (current match also bold).
             let text = format!("{indent}{marker} {}: {}", r.label, r.value);
@@ -924,7 +985,7 @@ fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: 
         )
     } else {
         Span::styled(
-            " ↑/↓ move · enter/→ expand · ← collapse · / search · s split · tab pane · x close · q quit",
+            " ↑/↓ move · enter expand · / search · s split · \\ layout · +/- size · tab pane · x close · q quit",
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -937,10 +998,13 @@ fn render_frame(
     term: &mut ratatui::DefaultTerminal,
     app: &mut App,
     b: &[u8],
-    h: usize,
     streaming: bool,
 ) -> std::io::Result<()> {
-    for v in &mut app.views {
+    // Each pane flattens to its own content height (which depends on orientation
+    // and pane count), so a stacked pane only walks its shorter window.
+    let rects = pane_layout(term_area()?, &app.weights(), app.stacked);
+    for (i, v) in app.views.iter_mut().enumerate() {
+        let h = (rects[i * 2].height as usize).saturating_sub(2).max(1);
         v.flatten_window(b, h);
     }
     term.draw(|f| ui(f, app, streaming))?;
@@ -998,6 +1062,20 @@ fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], 
             app.split_active(b);
             return KeyOutcome::Continue;
         }
+        KeyCode::Char('\\') => {
+            app.toggle_layout();
+            return KeyOutcome::Continue;
+        }
+        // Grow / shrink the active pane. `=`/`_` are the unshifted twins of
+        // `+`/`-`, so both forms work whatever the terminal reports.
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            app.grow_active();
+            return KeyOutcome::Continue;
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            app.shrink_active();
+            return KeyOutcome::Continue;
+        }
         KeyCode::Tab => {
             app.next_pane();
             return KeyOutcome::Continue;
@@ -1038,9 +1116,9 @@ fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], 
     KeyOutcome::Continue
 }
 
-fn term_rows() -> std::io::Result<usize> {
-    let (_, th) = ratatui::crossterm::terminal::size()?;
-    Ok((th.saturating_sub(2) as usize).max(1))
+fn term_area() -> std::io::Result<Rect> {
+    let (w, h) = ratatui::crossterm::terminal::size()?;
+    Ok(Rect::new(0, 0, w, h))
 }
 
 /// Poll for a key (up to `poll_ms`) and dispatch it. The `Relaunch` outcome is
@@ -1070,8 +1148,8 @@ fn run(
         for v in &mut app.views {
             v.pump_search();
         }
-        let h = term_rows()?;
-        render_frame(term, app, b, h, false)?;
+        render_frame(term, app, b, false)?;
+        let h = app.active_height(term_area()?);
         // Short poll so streaming match counts keep ticking even without input.
         match pump_input(app, b, h, 100)? {
             KeyOutcome::Quit => return Ok(()),
@@ -1131,12 +1209,12 @@ fn run_stream(
         for v in &mut app.views {
             v.pump_search();
         }
-        let h = term_rows()?;
         // Borrow the (possibly grown) buffer just for this frame's render + input,
         // then release it so a search relaunch can snapshot it below.
         let outcome = {
             let b: &[u8] = buf;
-            render_frame(term, app, b, h, !done)?;
+            render_frame(term, app, b, !done)?;
+            let h = app.active_height(term_area()?);
             pump_input(app, b, h, 100)?
         };
         match outcome {

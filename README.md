@@ -65,6 +65,8 @@ cargo run --release -- path/to/file.json
 | `Shift-Enter` / `↑` (in search) | previous match |
 | `Esc` (in search) | close search (keeps cursor on the match) |
 | `s` | split: open a new pane rooted at the focused node |
+| `\` | toggle pane layout (side by side ↔ stacked) |
+| `+` / `-` | grow / shrink the active pane |
 | `Tab` / `Shift-Tab` | switch the active pane |
 | `x` | close the active pane |
 | `q`, `Esc` | close the active pane (quit on the last one) |
@@ -79,7 +81,8 @@ node — the same document seen from a different path. Panes sit side by side an
 all share the one memory-mapped file, so a split costs nothing. Each pane keeps
 its own focus, expansion, breadcrumb, and search (scoped to that pane's
 subtree); keys go to the active pane, whose title is highlighted. `Tab` switches
-panes, `x` closes one.
+panes, `x` closes one, `\` toggles the whole workspace between side-by-side
+(columns) and stacked (rows), and `+`/`-` grow and shrink the active pane.
 
 Top line is `filename   <focus>/<rows>+   <breadcrumb>` — the `+` means the row
 count is a **lower bound**: the level has only been flattened as far as you've
