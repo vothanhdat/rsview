@@ -9,7 +9,7 @@ containers show an inline preview of their first few children.
 This is a **proof-of-concept**, not the product: a single file argument or piped
 stdin (`.jsonl`/`.ndjson` shown as an array of documents), no themes, no copy.
 Open / navigate / expand / search / split into panes. Piped input **streams** — it renders
-progressively as bytes arrive, so `curl … | rsview` shows the document *before
+progressively as bytes arrive, so `curl -s … | rsview` shows the document *before
 it's complete*, and your cursor and expanded nodes stay put as new data fills in.
 (A stream can't be memory-mapped, so it's buffered in RAM and re-parsed on a
 throttle; the near-constant-memory property is the file path's.) Keys come from
@@ -122,6 +122,26 @@ current match is brighter.
   UI never blocks because the scan isn't on the UI's loop. (A full scan does
   fault in the pages it reads — evictable, file-backed page cache — so search
   trades the near-zero-memory property for the bytes it must touch.)
+
+## How it compares
+
+Interactive terminal JSON viewers — [jless](https://jless.io/), [fx](https://fx.wtf/),
+jnv — read and parse the **whole document into memory** at startup. That's ideal up
+to tens or hundreds of MB; a multi-GB file means multi-GB of RAM (or it simply won't
+open). Streaming and query engines — `jq --stream`, Miller, DuckDB's `read_json_auto`,
+[simdjson](https://github.com/simdjson/simdjson) — stay at near-constant memory but
+aren't *browsers*: you pipe data in and get data out, you don't navigate and expand it.
+
+rsview goes for the overlap those two camps leave open: **browse and search a multi-GB
+file interactively while memory stays near-constant.** It memory-maps the file and
+decodes byte-ranges only as you expand and scroll, so opening a 1 GB document sits
+around 2.6 MB RSS instead of loading the whole thing.
+
+It is deliberately **not** a transform/query tool — no `jq`-style reshaping, and not
+by oversight: constructing new values means materializing them, which would forfeit
+exactly the property that makes rsview worth using on a huge file. Reach for `jq` or
+DuckDB when you need to *produce* data; reach for rsview when you need to *read* a file
+too big to open comfortably anywhere else.
 
 ## Layout
 
