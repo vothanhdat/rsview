@@ -6,7 +6,7 @@
 //! back over an `mpsc` channel. Retyping just drops the old `Search` (its `Drop`
 //! flips the flag) and spawns a new one — no starvation, no shared loop.
 
-use crate::scanner::{decode_str, Cursor, Kind};
+use crate::scanner::{decode_str, Cursor, Kind, MAX_DEPTH};
 use crate::source::Source;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -53,39 +53,45 @@ impl Search {
         let done_w = done.clone();
         let needle = term.to_lowercase();
 
-        let handle = thread::spawn(move || {
-            let b: &[u8] = &mmap;
-            let mut path = Vec::new();
-            let mut counter = 0u64;
-            let mut found = 0usize;
-            if jsonl {
-                // Each document is element [i]; recurse into it like an array child
-                // so match paths line up with the synthetic NDJSON array root.
-                let mut cur = Cursor::lines(start, end);
-                let mut i = 0usize;
-                while let Some(rc) = cur.next(b) {
-                    if cancel_w.load(Ordering::Relaxed) {
-                        break;
+        // A generous stack for the worker: `scan` recurses per nesting level, and
+        // while MAX_DEPTH caps that, a roomy stack keeps margin regardless of how
+        // big a frame the compiler picks. (Default thread stacks are ~2 MiB.)
+        let handle = thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                let b: &[u8] = &mmap;
+                let mut path = Vec::new();
+                let mut counter = 0u64;
+                let mut found = 0usize;
+                if jsonl {
+                    // Each document is element [i]; recurse into it like an array child
+                    // so match paths line up with the synthetic NDJSON array root.
+                    let mut cur = Cursor::lines(start, end);
+                    let mut i = 0usize;
+                    while let Some(rc) = cur.next(b) {
+                        if cancel_w.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        path.push(i);
+                        let bailed = scan(
+                            b, rc.start, rc.end, rc.kind, &rc.label, &needle, 1, &mut path,
+                            &cancel_w, &tx, &mut counter, &mut found,
+                        );
+                        path.pop();
+                        if bailed {
+                            break;
+                        }
+                        i += 1;
                     }
-                    path.push(i);
-                    let bailed = scan(
-                        b, rc.start, rc.end, rc.kind, &rc.label, &needle, &mut path, &cancel_w,
-                        &tx, &mut counter, &mut found,
+                } else if start < end {
+                    scan(
+                        b, start, end, kind, "", &needle, 0, &mut path, &cancel_w, &tx,
+                        &mut counter, &mut found,
                     );
-                    path.pop();
-                    if bailed {
-                        break;
-                    }
-                    i += 1;
                 }
-            } else if start < end {
-                scan(
-                    b, start, end, kind, "", &needle, &mut path, &cancel_w, &tx, &mut counter,
-                    &mut found,
-                );
-            }
-            done_w.store(true, Ordering::Relaxed);
-        });
+                done_w.store(true, Ordering::Relaxed);
+            })
+            .expect("spawn search worker thread");
 
         Search {
             cancel,
@@ -137,6 +143,7 @@ fn scan(
     kind: Kind,
     label: &str,
     needle: &str,
+    depth: usize,
     path: &mut Vec<usize>,
     cancel: &AtomicBool,
     tx: &Sender<Vec<usize>>,
@@ -174,13 +181,17 @@ fn scan(
         *found += 1;
     }
 
-    if matches!(kind, Kind::Object | Kind::Array) {
+    // Stop descending past the depth cap — a pathologically deep document would
+    // otherwise overflow the stack. We still emitted this node's own match above;
+    // we just don't recurse into its children. (See MAX_DEPTH.)
+    if depth < MAX_DEPTH && matches!(kind, Kind::Object | Kind::Array) {
         let mut cur = Cursor::new(start, end, matches!(kind, Kind::Array));
         let mut i = 0;
         while let Some(rc) = cur.next(b) {
             path.push(i);
             let bailed = scan(
-                b, rc.start, rc.end, rc.kind, &rc.label, needle, path, cancel, tx, counter, found,
+                b, rc.start, rc.end, rc.kind, &rc.label, needle, depth + 1, path, cancel, tx,
+                counter, found,
             );
             path.pop();
             if bailed {
@@ -190,4 +201,40 @@ fn scan(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pathologically deep document (`[[[…"needle"…]]]`) must not overflow the
+    /// stack when searched — before the depth cap this aborted the process. The
+    /// match sits below MAX_DEPTH so it won't be found; the point is that the
+    /// search *finishes* instead of crashing.
+    #[test]
+    fn deep_nesting_search_does_not_overflow() {
+        let n = 50_000;
+        let mut s = String::with_capacity(n * 2 + 16);
+        for _ in 0..n {
+            s.push('[');
+        }
+        s.push_str("\"needle\"");
+        for _ in 0..n {
+            s.push(']');
+        }
+        let bytes = s.into_bytes();
+        let end = bytes.len();
+        let src = Arc::new(Source::Buffered(bytes));
+
+        let mut search = Search::spawn(src, "needle".to_string(), false, 0, end, Kind::Array);
+        // Drain until the worker reports done (bounded spin so a hang can't wedge CI).
+        for _ in 0..10_000 {
+            search.drain();
+            if search.finished {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(search.finished, "search did not finish (possible hang)");
+    }
 }

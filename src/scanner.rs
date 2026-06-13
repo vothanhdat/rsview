@@ -7,6 +7,13 @@
 //! That's what lets a memory-mapped 1 GB file be browsed without paging it all
 //! in or building a UTF-16 copy.
 
+/// Recursion-depth cap for the (recursive) search scan and flatten/expand walks.
+/// JSON has no nesting limit, so a hostile `[[[…]]]` document could otherwise
+/// drive those recursions past the stack guard page and abort the process. Real
+/// data is rarely deeper than a few dozen levels; 1000 is far beyond that and
+/// far under any stack we run on (the search worker also gets a 32 MiB stack).
+pub const MAX_DEPTH: usize = 1000;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Object,
@@ -277,5 +284,57 @@ impl Cursor {
             kind,
             is_index: self.is_array,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Escapes are expanded: `\"` → `"`, `\\` → `\`, `\n` → newline, `\uXXXX` → char.
+    #[test]
+    fn decode_str_expands_escapes() {
+        let b = br#""a\"b\\c\nA""#; // JSON text for: a"b\c<LF>A
+        assert_eq!(decode_str(b, 0, b.len()), "a\"b\\c\nA");
+    }
+
+    /// A trailing backslash at the very end of a string must not read past the
+    /// buffer (the `i + 1 < len` guard) — it's emitted literally, no panic.
+    #[test]
+    fn decode_str_trailing_backslash_is_safe() {
+        let b = br#""ab\"#; // unterminated: quote, a, b, backslash
+        let _ = decode_str(b, 0, b.len()); // must not panic
+    }
+
+    /// Structural bytes (`]`, `"`) *inside* a string must not fool the scanner:
+    /// the array has exactly two children and the string's real boundary is found.
+    #[test]
+    fn string_with_structural_chars_does_not_break_enumeration() {
+        let b = br#"["x]y\"z", 5]"#;
+        let mut cur = Cursor::new(0, b.len(), true);
+
+        let c0 = cur.next(b).expect("first child");
+        assert_eq!(c0.kind, Kind::Str);
+        assert_eq!(decode_str(b, c0.start, c0.end), "x]y\"z");
+
+        let c1 = cur.next(b).expect("second child");
+        assert_eq!(c1.kind, Kind::Number);
+        assert_eq!(&b[c1.start..c1.end], b"5");
+
+        assert!(cur.next(b).is_none(), "array has exactly two children");
+    }
+
+    /// An unterminated/garbage container must terminate (no infinite loop) and not
+    /// index out of bounds.
+    #[test]
+    fn malformed_input_terminates() {
+        for src in [&b"[,,,,"[..], &b"{\"a\":"[..], &b"["[..], &b"{"[..]] {
+            let mut cur = Cursor::new(0, src.len(), src[0] == b'[');
+            let mut n = 0;
+            while cur.next(src).is_some() {
+                n += 1;
+                assert!(n < 1000, "cursor failed to terminate on {src:?}");
+            }
+        }
     }
 }

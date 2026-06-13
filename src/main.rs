@@ -8,7 +8,9 @@
 mod scanner;
 mod search;
 mod source;
-use scanner::{container_empty, decode_str, skip_value, skip_ws, value_kind, Cursor, Kind, RawChild};
+use scanner::{
+    container_empty, decode_str, skip_value, skip_ws, value_kind, Cursor, Kind, RawChild, MAX_DEPTH,
+};
 use search::Search;
 use source::Source;
 
@@ -37,6 +39,11 @@ use std::{
 const PREVIEW_ITEMS: usize = 5;
 /// Max display width of a collapsed preview before it's truncated with `…`.
 const PREVIEW_WIDTH: usize = 64;
+/// When decoding a scalar for display, only touch this many bytes. A preview/row
+/// truncates to a few dozen chars anyway, so decoding a whole multi-hundred-MB
+/// string (or a bogus run of digits) would just be wasted work and a memory
+/// spike. 512 bytes always covers the truncation width, even for 4-byte chars.
+const PREVIEW_DECODE_BYTES: usize = 512;
 
 /// Pane size weights (a ratatui `Fill` factor). A new pane starts at
 /// `WEIGHT_DEFAULT`; `+`/`-` step it within `[WEIGHT_MIN, WEIGHT_MAX]`. Equal
@@ -162,8 +169,14 @@ impl Node {
                     self.collapsed_preview(b)
                 }
             }
-            Kind::Str => format!("\"{}\"", truncate(&decode_str(b, self.start, self.end), 70)),
-            _ => truncate(&String::from_utf8_lossy(&b[self.start..self.end]), 70),
+            Kind::Str => {
+                let e = decode_cap(self.start, self.end);
+                format!("\"{}\"", truncate(&decode_str(b, self.start, e), 70))
+            }
+            _ => {
+                let e = decode_cap(self.start, self.end);
+                truncate(&String::from_utf8_lossy(&b[self.start..e]), 70)
+            }
         }
     }
 
@@ -200,6 +213,13 @@ impl Node {
     }
 }
 
+/// Upper bound for a display decode: never touch more than `PREVIEW_DECODE_BYTES`
+/// past `start`, so a giant string/number value isn't fully decoded just to show
+/// a truncated preview of it.
+fn decode_cap(start: usize, end: usize) -> usize {
+    end.min(start.saturating_add(PREVIEW_DECODE_BYTES))
+}
+
 /// A brief one-level rendering of a value for use inside a parent's preview:
 /// nested containers collapse to `{…}`/`[…]`, scalars show their literal.
 fn brief(b: &[u8], rc: &RawChild) -> String {
@@ -210,8 +230,14 @@ fn brief(b: &[u8], rc: &RawChild) -> String {
         Kind::Array => {
             if container_empty(b, rc.start, rc.end) { "[]".into() } else { "[…]".into() }
         }
-        Kind::Str => format!("\"{}\"", truncate(&decode_str(b, rc.start, rc.end), 24)),
-        _ => truncate(&String::from_utf8_lossy(&b[rc.start..rc.end]), 24),
+        Kind::Str => {
+            let e = decode_cap(rc.start, rc.end);
+            format!("\"{}\"", truncate(&decode_str(b, rc.start, e), 24))
+        }
+        _ => {
+            let e = decode_cap(rc.start, rc.end);
+            truncate(&String::from_utf8_lossy(&b[rc.start..e]), 24)
+        }
     }
 }
 
@@ -254,7 +280,9 @@ fn flatten(node: &mut Node, b: &[u8], depth: usize, budget: usize, out: &mut Vec
         expanded: node.expanded,
         path: path.clone(),
     });
-    if node.expanded && node.is_container() {
+    // Stop descending past the depth cap so a deeply-nested (possibly hostile)
+    // document can't recurse the stack to a fault. Real data never reaches it.
+    if depth < MAX_DEPTH && node.expanded && node.is_container() {
         let mut i = 0;
         while out.len() < budget {
             node.ensure_child(b, i);
@@ -287,7 +315,10 @@ fn get_mut<'a>(mut n: &'a mut Node, path: &[usize]) -> &'a mut Node {
 /// target node becomes reachable in the flattened rows. The target itself is
 /// left as-is — only the chain above it is opened.
 fn expand_to(n: &mut Node, b: &[u8], path: &[usize]) {
-    if path.is_empty() {
+    // Recursion depth equals the path length; cap it so a deep path can't fault
+    // the stack. (Search matches are already capped at MAX_DEPTH, so this only
+    // bites pathological input — the deepest reachable rows simply aren't opened.)
+    if path.is_empty() || path.len() > MAX_DEPTH {
         return;
     }
     if n.is_container() && n.has_children && !n.expanded {
