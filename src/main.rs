@@ -20,7 +20,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 use std::{
@@ -61,6 +61,11 @@ const WHEEL_STEP: usize = 3;
 /// truncation rather than emit a megabytes-long escape. (To extract a big
 /// subtree wholesale, that's the export-to-file feature's job, not the clipboard.)
 const COPY_MAX_BYTES: usize = 1 << 20; // 1 MiB
+
+/// How many children a `:` goto will scan to resolve an object key. A goto is a
+/// synchronous, page-faulting walk, so this bounds the UI freeze on a giant
+/// level — a key past this many siblings reports "not found" rather than hanging.
+const GOTO_SCAN_CAP: usize = 100_000;
 
 // Syntax-highlight palette (ANSI named colors so it adapts to the terminal theme).
 const C_KEY: Color = Color::Cyan; // object keys
@@ -341,6 +346,10 @@ fn expand_to(n: &mut Node, b: &[u8], path: &[usize]) {
 enum Mode {
     Normal,
     Search,
+    /// Typing a path to jump to (`:` prompt, e.g. `data.users[3].city`).
+    Goto,
+    /// The bookmark picker overlay (`'`): pick a saved node to jump to.
+    Marks,
 }
 
 /// What a key press asks the run loop to do that it can't do itself: quit, or
@@ -392,6 +401,12 @@ struct View {
     indexed: usize,
     /// A pending jump target: the next frame flattens far enough to land on it.
     want_path: Option<Vec<usize>>,
+    /// Live path-input buffer (typed while in `Mode::Goto`).
+    goto: String,
+    /// Saved node paths (`m` toggles), jumped to via the `'` picker overlay.
+    bookmarks: Vec<Vec<usize>>,
+    /// Selected row in the bookmark picker.
+    mark_idx: usize,
 }
 
 /// Build the root node for a buffer. Shared by `App::new` and `App::rebuild`
@@ -482,6 +497,100 @@ fn join_path(base: &str, segs: &[(String, bool)]) -> String {
     }
 }
 
+/// A parsed `goto` path segment: an object key or an array index.
+#[derive(Debug, PartialEq)]
+enum Seg {
+    Key(String),
+    Index(usize),
+}
+
+/// Parse a `goto` path string into segments. Accepts `data.users[3].city`,
+/// `.users[0]`, a leading `$`, and bracketed (optionally quoted) keys that may
+/// themselves contain dots: `["x.y"][2]`. Lenient by design — it's an
+/// interactive jump, not a validator.
+fn parse_path(input: &str) -> Vec<Seg> {
+    let mut segs = Vec::new();
+    let mut cur = String::new();
+    let mut chars = input.trim().chars().peekable();
+    if chars.peek() == Some(&'$') {
+        chars.next();
+    }
+    while let Some(c) = chars.next() {
+        match c {
+            '.' => {
+                if !cur.is_empty() {
+                    segs.push(Seg::Key(std::mem::take(&mut cur)));
+                }
+            }
+            '[' => {
+                if !cur.is_empty() {
+                    segs.push(Seg::Key(std::mem::take(&mut cur)));
+                }
+                let mut inner = String::new();
+                for d in chars.by_ref() {
+                    if d == ']' {
+                        break;
+                    }
+                    inner.push(d);
+                }
+                let inner = inner.trim().trim_matches(|q| q == '"' || q == '\'');
+                match inner.parse::<usize>() {
+                    Ok(i) => segs.push(Seg::Index(i)),
+                    Err(_) => segs.push(Seg::Key(inner.to_string())),
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        segs.push(Seg::Key(cur));
+    }
+    segs
+}
+
+/// Resolve parsed segments to an index-path into `root`, expanding and scanning
+/// each container as it descends (so a collapsed level still resolves). Returns
+/// `None` if a segment doesn't exist (missing key, out-of-range index, or a
+/// scalar hit mid-path). Object-key lookup scans up to `GOTO_SCAN_CAP` children.
+fn resolve_path(root: &mut Node, b: &[u8], segs: &[Seg]) -> Option<Vec<usize>> {
+    let mut out: Vec<usize> = Vec::new();
+    for seg in segs {
+        let node = get_mut(root, &out);
+        if !node.is_container() || !node.has_children {
+            return None;
+        }
+        if !node.expanded {
+            node.toggle(); // create the child cursor so ensure_child can scan
+        }
+        match seg {
+            Seg::Index(i) => {
+                node.ensure_child(b, *i);
+                if *i >= node.children.len() {
+                    return None;
+                }
+                out.push(*i);
+            }
+            Seg::Key(k) => {
+                let mut i = 0;
+                let mut found = None;
+                while i < GOTO_SCAN_CAP {
+                    node.ensure_child(b, i);
+                    if i >= node.children.len() {
+                        break;
+                    }
+                    if node.children[i].label == *k {
+                        found = Some(i);
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push(found?);
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Collect the index-paths of every expanded container in the tree, in DFS
 /// preorder (parents before children). Used to carry expansion state across a
 /// streaming re-parse.
@@ -547,6 +656,9 @@ impl View {
             indexed: 0,
             want_path: None,
             landed: false,
+            goto: String::new(),
+            bookmarks: Vec::new(),
+            mark_idx: 0,
         }
     }
 
@@ -562,6 +674,10 @@ impl View {
         self.rows.clear();
         self.want_path = None;
         self.mode = Mode::Normal;
+        self.goto.clear();
+        // Bookmarked paths refer to the old tree; drop them on re-root.
+        self.bookmarks.clear();
+        self.mark_idx = 0;
         self.clear_search();
     }
 
@@ -654,6 +770,40 @@ impl View {
     fn jump_to(&mut self, path: &[usize], b: &[u8]) {
         expand_to(&mut self.root, b, path);
         self.want_path = Some(path.to_vec());
+    }
+
+    /// Resolve the typed `goto` path and jump to it. Returns a footer status line.
+    fn goto_path(&mut self, b: &[u8]) -> String {
+        let segs = parse_path(&self.goto);
+        if segs.is_empty() {
+            return "empty path".to_string();
+        }
+        match resolve_path(&mut self.root, b, &segs) {
+            Some(path) => {
+                self.jump_to(&path, b);
+                format!("jumped to {}", join_path("", &breadcrumb_segments(&self.root, &path)))
+            }
+            None => format!("path not found: {}", self.goto.trim()),
+        }
+    }
+
+    /// Toggle a bookmark on the focused node (add if absent, else remove).
+    fn toggle_bookmark(&mut self) -> String {
+        let Some(row) = self.rows.get(self.focus) else {
+            return "nothing to bookmark".to_string();
+        };
+        let path = row.path.clone();
+        if let Some(pos) = self.bookmarks.iter().position(|p| *p == path) {
+            self.bookmarks.remove(pos);
+            if self.mark_idx >= self.bookmarks.len() {
+                self.mark_idx = self.bookmarks.len().saturating_sub(1);
+            }
+            "bookmark removed".to_string()
+        } else {
+            let label = join_path("", &breadcrumb_segments(&self.root, &path));
+            self.bookmarks.push(path);
+            format!("bookmarked {label}")
+        }
     }
 
     fn clear_search(&mut self) {
@@ -790,10 +940,9 @@ impl App {
             return "nothing to copy".to_string();
         };
         let segs = breadcrumb_segments(&v.root, &row.path);
-        let path = path_to_string(&segs);
-        let shown = if path.is_empty() { "(root)" } else { &path };
+        let path = join_path("", &segs);
         copy_to_clipboard(path.as_bytes());
-        format!("copied path: {shown}")
+        format!("copied path: {path}")
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -971,25 +1120,6 @@ fn breadcrumb_segments(root: &Node, path: &[usize]) -> Vec<(String, bool)> {
     out
 }
 
-/// Join breadcrumb segments into a dotted/bracketed path string, e.g.
-/// `data.users[3].city` — object keys after a `.`, array indices as `[i]`.
-fn path_to_string(segs: &[(String, bool)]) -> String {
-    let mut s = String::new();
-    for (label, is_index) in segs {
-        if *is_index {
-            s.push('[');
-            s.push_str(label);
-            s.push(']');
-        } else {
-            if !s.is_empty() {
-                s.push('.');
-            }
-            s.push_str(label);
-        }
-    }
-    s
-}
-
 /// Copy `data` to the terminal clipboard via OSC 52. This goes through the
 /// terminal itself (not a system clipboard library), so it works over SSH and
 /// needs no platform-specific dependency. Written straight to stdout and flushed;
@@ -1135,6 +1265,11 @@ fn ui(f: &mut Frame, app: &App, streaming: bool) {
     // One global footer at the very bottom, reflecting the active pane's mode.
     let footer_row = Rect { y: area.y + area.height.saturating_sub(1), height: 1, ..area };
     render_footer(f, footer_row, app.active_view(), app.flash.as_deref());
+
+    // The bookmark picker floats over everything when open.
+    if app.active_view().mode == Mode::Marks {
+        render_marks(f, area, app.active_view());
+    }
 }
 
 /// The single global key/search-status bar, reflecting the active pane. A
@@ -1156,15 +1291,56 @@ fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Option<&str>) {
             format!(" /{}   {} · ↵/↓ next · ⇧↵/↑ prev · esc close", view.query, pos),
             Style::default().fg(Color::Yellow),
         )
+    } else if view.mode == Mode::Goto {
+        Span::styled(
+            format!(" :{}   ↵ jump · esc cancel", view.goto),
+            Style::default().fg(Color::Yellow),
+        )
     } else if let Some(msg) = flash {
         Span::styled(format!(" {msg}"), Style::default().fg(Color::Green))
     } else {
         Span::styled(
-            " ↑/↓ move · enter expand · / search · y copy · Y path · s split · o preview · \\ layout · tab pane · x close · q quit",
+            " ↑/↓ move · enter expand · / search · : goto · m mark · ' marks · y copy · s split · o preview · q quit",
             Style::default().fg(Color::DarkGray),
         )
     };
     f.render_widget(Paragraph::new(Line::from(footer)), area);
+}
+
+/// Draw the bookmark picker as a centered overlay listing each saved node's
+/// path; the selected row is highlighted. Jumped/edited via [`process_key`].
+fn render_marks(f: &mut Frame, area: Rect, view: &View) {
+    let items: Vec<String> = view
+        .bookmarks
+        .iter()
+        .map(|p| join_path("", &breadcrumb_segments(&view.root, p)))
+        .collect();
+    let longest = items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let inner_w = longest.max(24).min(area.width.saturating_sub(4) as usize);
+    let w = inner_w as u16 + 4;
+    let h = (items.len() as u16 + 2).min(area.height.saturating_sub(2)).max(3);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let rect = Rect { x, y, width: w, height: h };
+
+    let lines: Vec<Line> = items
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let st = if i == view.mark_idx {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else {
+                Style::default().fg(C_KEY)
+            };
+            Line::from(Span::styled(format!(" {s} "), st))
+        })
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_PUNCT))
+        .title(" bookmarks · ↵ jump · d delete · esc ");
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 /// Draw one pane (title + breadcrumb, then content rows) into `rect`. The active
@@ -1308,6 +1484,73 @@ fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], 
         return KeyOutcome::Continue;
     }
 
+    // Goto mode: a `:` path prompt. Enter resolves and jumps; Esc cancels.
+    if app.active_view().mode == Mode::Goto {
+        match k.code {
+            KeyCode::Esc => {
+                let v = app.active_mut();
+                v.mode = Mode::Normal;
+                v.goto.clear();
+            }
+            KeyCode::Enter => {
+                let msg = {
+                    let v = app.active_mut();
+                    let msg = v.goto_path(b);
+                    v.mode = Mode::Normal;
+                    v.goto.clear();
+                    msg
+                };
+                app.flash = Some(msg);
+            }
+            KeyCode::Backspace => {
+                app.active_mut().goto.pop();
+            }
+            KeyCode::Char(c) => {
+                app.active_mut().goto.push(c);
+            }
+            _ => {}
+        }
+        return KeyOutcome::Continue;
+    }
+
+    // Marks mode: the bookmark picker overlay. j/k move, Enter jumps, d deletes.
+    if app.active_view().mode == Mode::Marks {
+        let v = app.active_mut();
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('\'') | KeyCode::Char('q') => v.mode = Mode::Normal,
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !v.bookmarks.is_empty() {
+                    v.mark_idx = (v.mark_idx + 1) % v.bookmarks.len();
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if !v.bookmarks.is_empty() {
+                    let n = v.bookmarks.len();
+                    v.mark_idx = (v.mark_idx + n - 1) % n;
+                }
+            }
+            KeyCode::Char('d') => {
+                if v.mark_idx < v.bookmarks.len() {
+                    v.bookmarks.remove(v.mark_idx);
+                    if v.mark_idx >= v.bookmarks.len() {
+                        v.mark_idx = v.bookmarks.len().saturating_sub(1);
+                    }
+                    if v.bookmarks.is_empty() {
+                        v.mode = Mode::Normal;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(p) = v.bookmarks.get(v.mark_idx).cloned() {
+                    v.jump_to(&p, b);
+                }
+                v.mode = Mode::Normal;
+            }
+            _ => {}
+        }
+        return KeyOutcome::Continue;
+    }
+
     // Any normal-mode key dismisses the previous flash (copy status, …); copy
     // keys below set a fresh one.
     app.flash = None;
@@ -1321,6 +1564,28 @@ fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], 
         }
         KeyCode::Char('Y') => {
             app.flash = Some(app.yank_path());
+            return KeyOutcome::Continue;
+        }
+        // `:` opens the path-jump prompt; `m` bookmarks the focused node; `'`
+        // opens the bookmark picker.
+        KeyCode::Char(':') => {
+            let v = app.active_mut();
+            v.mode = Mode::Goto;
+            v.goto.clear();
+            return KeyOutcome::Continue;
+        }
+        KeyCode::Char('m') => {
+            app.flash = Some(app.active_mut().toggle_bookmark());
+            return KeyOutcome::Continue;
+        }
+        KeyCode::Char('\'') => {
+            if app.active_view().bookmarks.is_empty() {
+                app.flash = Some("no bookmarks — press m to add one".to_string());
+            } else {
+                let v = app.active_mut();
+                v.mark_idx = v.mark_idx.min(v.bookmarks.len() - 1);
+                v.mode = Mode::Marks;
+            }
             return KeyOutcome::Continue;
         }
         // q / Esc close the active pane, quitting only when it's the last one.
@@ -1770,15 +2035,41 @@ mod tests {
     }
 
     #[test]
-    fn path_string_dots_keys_and_brackets_indices() {
+    fn join_path_dots_keys_and_brackets_indices() {
         let segs = vec![
             ("data".to_string(), false),
             ("users".to_string(), false),
             ("3".to_string(), true),
             ("city".to_string(), false),
         ];
-        assert_eq!(path_to_string(&segs), "data.users[3].city");
-        assert_eq!(path_to_string(&[("0".to_string(), true)]), "[0]");
-        assert_eq!(path_to_string(&[]), "");
+        assert_eq!(join_path("", &segs), "data.users[3].city");
+        assert_eq!(join_path("", &[("0".to_string(), true)]), "[0]");
+        assert_eq!(join_path("", &[]), "root");
+    }
+
+    #[test]
+    fn parse_path_tokenizes_keys_and_indices() {
+        use Seg::*;
+        assert_eq!(
+            parse_path("data.users[3].city"),
+            vec![Key("data".into()), Key("users".into()), Index(3), Key("city".into())]
+        );
+        // Leading $/. are optional and ignored.
+        assert_eq!(parse_path(".users[0]"), vec![Key("users".into()), Index(0)]);
+        assert_eq!(parse_path("$.a"), vec![Key("a".into())]);
+        // Bracketed (optionally quoted) key holds a literal dot.
+        assert_eq!(parse_path(r#"["x.y"][2]"#), vec![Key("x.y".into()), Index(2)]);
+        assert_eq!(parse_path(""), vec![]);
+    }
+
+    #[test]
+    fn resolve_path_walks_the_lazy_tree() {
+        let b = br#"{"a":{"b":[10,20,30]}}"#;
+        let mut root = make_root(b, "t", false);
+        let path = resolve_path(&mut root, b, &parse_path("a.b[1]")).expect("resolved");
+        let node = get(&root, &path);
+        assert_eq!(&b[node.start..node.end], b"20");
+        // A missing key resolves to None.
+        assert!(resolve_path(&mut root, b, &parse_path("a.nope")).is_none());
     }
 }
