@@ -55,6 +55,13 @@ const WEIGHT_MAX: u16 = 16;
 /// Rows moved per mouse-wheel notch — chunky like tmux, not the 1-row arrow step.
 const WHEEL_STEP: usize = 3;
 
+/// Upper bound on a single clipboard copy. Copying a whole subtree is a raw
+/// byte-range slice (cheap), but OSC 52 carries the payload base64-encoded
+/// through the terminal, which caps how much it'll accept — so we clamp and flag
+/// truncation rather than emit a megabytes-long escape. (To extract a big
+/// subtree wholesale, that's the export-to-file feature's job, not the clipboard.)
+const COPY_MAX_BYTES: usize = 1 << 20; // 1 MiB
+
 // Syntax-highlight palette (ANSI named colors so it adapts to the terminal theme).
 const C_KEY: Color = Color::Cyan; // object keys
 const C_INDEX: Color = Color::DarkGray; // array indices
@@ -734,12 +741,59 @@ struct App {
     stacked: bool,
     /// Monotonic source of pane ids (never reused, so links stay unambiguous).
     next_id: u64,
+    /// Transient status line (e.g. "copied 42 B") shown in the footer until the
+    /// next key press. `None` = show the normal key hint.
+    flash: Option<String>,
 }
 
 impl App {
     fn single(mut view: View) -> App {
         view.id = 0;
-        App { views: vec![view], active: 0, stacked: false, next_id: 1 }
+        App { views: vec![view], active: 0, stacked: false, next_id: 1, flash: None }
+    }
+
+    /// Byte range of the active pane's focused node (its raw JSON value/subtree).
+    fn focused_range(&self) -> Option<(usize, usize)> {
+        let v = self.active_view();
+        let row = v.rows.get(v.focus)?;
+        let node = get(&v.root, &row.path);
+        Some((node.start, node.end))
+    }
+
+    /// Copy the focused node's raw JSON (a scalar literal, or a whole subtree) to
+    /// the terminal clipboard. Clamped to `COPY_MAX_BYTES`. Returns a status line.
+    fn yank_value(&self, b: &[u8]) -> String {
+        match self.focused_range() {
+            Some((s, e)) => {
+                let capped = e.min(s.saturating_add(COPY_MAX_BYTES));
+                let slice = &b[s..capped];
+                // Trim trailing whitespace — the document root's range runs to EOF,
+                // so it would otherwise carry the file's final newline.
+                let cut = slice.iter().rposition(|c| !c.is_ascii_whitespace()).map_or(0, |p| p + 1);
+                let slice = &slice[..cut];
+                copy_to_clipboard(slice);
+                let n = slice.len();
+                if capped < e {
+                    format!("copied {n} B (truncated from {})", e - s)
+                } else {
+                    format!("copied value ({n} B)")
+                }
+            }
+            None => "nothing to copy".to_string(),
+        }
+    }
+
+    /// Copy the path to the focused node (`data.users[3].city`) to the clipboard.
+    fn yank_path(&self) -> String {
+        let v = self.active_view();
+        let Some(row) = v.rows.get(v.focus) else {
+            return "nothing to copy".to_string();
+        };
+        let segs = breadcrumb_segments(&v.root, &row.path);
+        let path = path_to_string(&segs);
+        let shown = if path.is_empty() { "(root)" } else { &path };
+        copy_to_clipboard(path.as_bytes());
+        format!("copied path: {shown}")
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -917,6 +971,56 @@ fn breadcrumb_segments(root: &Node, path: &[usize]) -> Vec<(String, bool)> {
     out
 }
 
+/// Join breadcrumb segments into a dotted/bracketed path string, e.g.
+/// `data.users[3].city` — object keys after a `.`, array indices as `[i]`.
+fn path_to_string(segs: &[(String, bool)]) -> String {
+    let mut s = String::new();
+    for (label, is_index) in segs {
+        if *is_index {
+            s.push('[');
+            s.push_str(label);
+            s.push(']');
+        } else {
+            if !s.is_empty() {
+                s.push('.');
+            }
+            s.push_str(label);
+        }
+    }
+    s
+}
+
+/// Copy `data` to the terminal clipboard via OSC 52. This goes through the
+/// terminal itself (not a system clipboard library), so it works over SSH and
+/// needs no platform-specific dependency. Written straight to stdout and flushed;
+/// it doesn't touch the screen grid, so ratatui repaints normally next frame.
+/// (Inside tmux this needs `set -g set-clipboard on`.)
+fn copy_to_clipboard(data: &[u8]) {
+    use std::io::Write;
+    let seq = format!("\x1b]52;c;{}\x07", base64_encode(data));
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+}
+
+/// Minimal standard-base64 encoder (with `=` padding). Inlined to avoid pulling
+/// in a crate just for the OSC 52 payload.
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
 /// Render the focus breadcrumb (`users › [2] › city`) as styled spans that fit
 /// within `avail` columns, **left-truncating** with a leading `…` so the tail
 /// nearest the focused node always stays visible. Array elements are bracketed;
@@ -1030,11 +1134,12 @@ fn ui(f: &mut Frame, app: &App, streaming: bool) {
     }
     // One global footer at the very bottom, reflecting the active pane's mode.
     let footer_row = Rect { y: area.y + area.height.saturating_sub(1), height: 1, ..area };
-    render_footer(f, footer_row, app.active_view());
+    render_footer(f, footer_row, app.active_view(), app.flash.as_deref());
 }
 
-/// The single global key/search-status bar, reflecting the active pane.
-fn render_footer(f: &mut Frame, area: Rect, view: &View) {
+/// The single global key/search-status bar, reflecting the active pane. A
+/// transient `flash` (e.g. a copy confirmation) takes the bar over the key hint.
+fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Option<&str>) {
     let footer = if view.mode == Mode::Search {
         let count = view.search.as_ref().map_or(0, |s| s.matches.len());
         let more = match &view.search {
@@ -1051,9 +1156,11 @@ fn render_footer(f: &mut Frame, area: Rect, view: &View) {
             format!(" /{}   {} · ↵/↓ next · ⇧↵/↑ prev · esc close", view.query, pos),
             Style::default().fg(Color::Yellow),
         )
+    } else if let Some(msg) = flash {
+        Span::styled(format!(" {msg}"), Style::default().fg(Color::Green))
     } else {
         Span::styled(
-            " ↑/↓ move · enter expand · / search · s split · o preview · \\ layout · +/- size · tab pane · x close · q quit",
+            " ↑/↓ move · enter expand · / search · y copy · Y path · s split · o preview · \\ layout · tab pane · x close · q quit",
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -1201,8 +1308,21 @@ fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], 
         return KeyOutcome::Continue;
     }
 
+    // Any normal-mode key dismisses the previous flash (copy status, …); copy
+    // keys below set a fresh one.
+    app.flash = None;
+
     // Normal mode: workspace-level keys (pane management) first.
     match k.code {
+        // Copy the focused value (raw JSON / subtree) or its path to the clipboard.
+        KeyCode::Char('y') => {
+            app.flash = Some(app.yank_value(b));
+            return KeyOutcome::Continue;
+        }
+        KeyCode::Char('Y') => {
+            app.flash = Some(app.yank_path());
+            return KeyOutcome::Continue;
+        }
         // q / Esc close the active pane, quitting only when it's the last one.
         KeyCode::Char('q') | KeyCode::Esc => {
             if !app.close_active() {
@@ -1620,5 +1740,45 @@ fn main() -> std::io::Result<()> {
             }
             run_stdin()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        let cases = [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(base64_encode(input.as_bytes()), expected, "input={input:?}");
+        }
+    }
+
+    #[test]
+    fn base64_handles_binary() {
+        assert_eq!(base64_encode(&[0xff, 0xfe, 0xfd]), "//79");
+        assert_eq!(base64_encode(&[0x00]), "AA==");
+    }
+
+    #[test]
+    fn path_string_dots_keys_and_brackets_indices() {
+        let segs = vec![
+            ("data".to_string(), false),
+            ("users".to_string(), false),
+            ("3".to_string(), true),
+            ("city".to_string(), false),
+        ];
+        assert_eq!(path_to_string(&segs), "data.users[3].city");
+        assert_eq!(path_to_string(&[("0".to_string(), true)]), "[0]");
+        assert_eq!(path_to_string(&[]), "");
     }
 }

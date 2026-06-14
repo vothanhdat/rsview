@@ -65,6 +65,8 @@ cargo run --release -- path/to/file.json
 | `Enter` / `↓` (in search) | next match |
 | `Shift-Enter` / `↑` (in search) | previous match |
 | `Esc` (in search) | close search (keeps cursor on the match) |
+| `y` | copy the focused value — a scalar, or the whole subtree — to the clipboard |
+| `Y` | copy the path to the focused node (`data.users[3].city`) |
 | `s` | split: open a new pane rooted at the focused node (and switch to it) |
 | `o` | open/re-root a single preview pane at the focused node (stay on parent) |
 | `\` | toggle pane layout (side by side ↔ stacked) |
@@ -81,6 +83,14 @@ explore the tree at the match. `Shift-Enter` needs a terminal that speaks the
 Input is coalesced per frame, so holding a key or spinning the wheel stays
 snappy instead of lagging behind. Capturing the mouse suppresses the terminal's
 own text selection — hold `Shift` to select/copy as usual.
+
+**Copy.** `y` copies the focused node's raw JSON — a scalar literal, or an entire
+subtree — and `Y` copies its path. Copy goes through the terminal itself via the
+[OSC 52](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Operating-System-Commands)
+escape, so it needs no system-clipboard library and **works over SSH**. A single
+copy is capped (~1 MiB) since the payload rides the terminal escape; to pull a
+large subtree out wholesale, that's export's job, not the clipboard. Inside tmux,
+enable `set -g set-clipboard on`.
 
 **Panes.** Press `s` on any container to split off a new pane rooted at that
 node — the same document seen from a different path — and switch to it. `o`
