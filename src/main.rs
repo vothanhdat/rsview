@@ -2366,9 +2366,30 @@ fn run_stdin() -> std::io::Result<()> {
     res
 }
 
+const USAGE: &str = "\
+rsview — browse, navigate and search multi-GB JSON in the terminal
+
+USAGE:
+    rsview <file.json>          open a file
+    cat file.json | rsview      or pipe JSON in (NDJSON auto-detected)
+
+OPTIONS:
+    -h, --help       print this help
+    -V, --version    print version
+
+Keys: ↑/↓ move · enter expand · / search · : goto · y copy · ? help · q quit";
+
 fn main() -> std::io::Result<()> {
-    match std::env::args().nth(1) {
-        Some(path) => run_file(path),
+    match std::env::args().nth(1).as_deref() {
+        Some("-V" | "--version") => {
+            println!("rsview {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("-h" | "--help") => {
+            println!("{USAGE}");
+            Ok(())
+        }
+        Some(_) => run_file(std::env::args().nth(1).unwrap()),
         None => {
             if std::io::stdin().is_terminal() {
                 eprintln!("usage: rsview <file.json>   (or pipe JSON: cat file.json | rsview)");

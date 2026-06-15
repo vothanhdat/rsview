@@ -60,3 +60,16 @@ jobs:
           # → rsview-<target>.tar.gz (.zip on Windows), uploaded to the tag's release.
           archive: $bin-$target
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # The `curl … /stable/install.sh` one-liner in the README is served from the
+  # `stable` branch, not `main`, so users never pipe the dev tip into a shell.
+  # Move `stable` forward to this released (already CI-green) commit. Same-repo
+  # write via the existing GITHUB_TOKEN — no extra permissions, no PAT.
+  promote-stable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # need history back to `stable` so the push has all objects
+      - name: Fast-forward stable to this tag
+        run: git push origin "HEAD:refs/heads/stable"

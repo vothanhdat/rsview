@@ -17,16 +17,22 @@ re-parsed on a throttle; the constant-memory property is the file path's.)
 
 ## Install
 
-Prebuilt binaries for Linux (x86_64/arm64), macOS (Intel/Apple Silicon), and
-Windows are attached to each
-[release](https://github.com/vothanhdat/rsview/releases) — drop one on your
-`PATH`, or fetch it with
-[cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
+No Rust toolchain needed — grab the prebuilt binary for your platform:
 
 ```sh
-cargo binstall rsview      # prebuilt binary
-cargo install  rsview      # or compile from crates.io
+curl -fsSL https://raw.githubusercontent.com/vothanhdat/rsview/stable/install.sh | sh
 ```
+
+It picks the right build (Linux x86_64/arm64, macOS Intel/Apple Silicon) and
+drops it in `~/.local/bin`. Or, if you'd rather:
+
+```sh
+cargo binstall rsview      # prebuilt binary via cargo-binstall
+cargo install  rsview      # compile from crates.io
+```
+
+Windows binaries (and every release archive) are attached to each
+[release](https://github.com/vothanhdat/rsview/releases).
 
 Then:
 
