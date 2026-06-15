@@ -2,3 +2,6 @@
 
 # Generated demo data (huge, reproducible via demo/gen.mjs). Commit docs/demo.gif only.
 /demo/*.json
+
+# Scratch test files (e.g. a.tmp) — never commit these
+*.tmp
