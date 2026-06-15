@@ -2,8 +2,8 @@
 
 # Generated demo data (huge, reproducible via demo/gen.mjs). Commit docs/demo.webp only.
 /demo/*.json
-# Intermediate vhs render — converted to docs/demo.webp, never committed.
-/docs/*.gif
+# Intermediate vhs PNG frames — assembled into docs/demo.webp, never committed.
+/frames/
 
 # Scratch test files (e.g. a.tmp) — never commit these
 *.tmp

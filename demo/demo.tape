@@ -1,17 +1,22 @@
-# rsview demo recording — drives the real binary, renders a GIF, then we
-# convert it to an animated WebP (smaller, sharper) for the README.
+# rsview demo recording — drives the real binary to lossless PNG frames, then
+# assembles a full-color animated WebP for the README. (No GIF: its 256-color
+# palette + dithering wreck the text. img2webp auto-coalesces static runs and
+# stores only changed rectangles, so lossless full-color still lands ~260 KB.)
 #
 # Regenerate:
 #   cargo build --release                         # build the binary
 #   node demo/gen.mjs demo/big.json 1             # ~1 GB sample (the whole pitch)
 #   RSVIEW_NO_ENHANCED_KEYS=1 PATH="target/release:$PATH" vhs demo/demo.tape
-#   gif2webp -q 70 -lossy docs/demo.gif -o docs/demo.webp && rm docs/demo.gif
+#   img2webp -loop 0 -d 20 -lossless -m 6 frames/frame-text-*.png -o docs/demo.webp
+#   rm -rf frames demo/big.json
 #
-# vhs: https://github.com/charmbracelet/vhs  (brew install vhs)
-# gif2webp: brew install webp
-# Tweak Sleep/keys after the first render — timing is best-effort.
+# Tooling: brew install vhs webp
+# Notes:
+#   - Output is PNG frames (frames/). frame-text-* is the content; frame-cursor-*
+#     is a transparent cursor overlay — use frame-text (rsview hides the cursor).
+#   - -d 20 = 50fps. Tweak Sleep/keys after the first render — timing is best-effort.
 
-Output docs/demo.gif
+Output frames/
 
 Require rsview
 
@@ -20,6 +25,7 @@ Set FontSize 15
 Set Width 1180
 Set Height 660
 Set Padding 18
+Set Framerate 50
 Set TypingSpeed 55ms
 Set Theme "Dracula"
 
