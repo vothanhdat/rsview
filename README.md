@@ -55,6 +55,7 @@ cargo run --release -- path/to/file.json
 | Key | Action |
 | --- | --- |
 | `↑`/`↓`, `k`/`j` | move focus |
+| `J`/`K` | next / previous sibling (same level, stepping over the subtree) |
 | `PageUp`/`PageDown`, `Ctrl-F`/`Ctrl-B` | jump a screenful |
 | `Ctrl-D`/`Ctrl-U` | jump half a screenful |
 | mouse wheel | scroll the pane under the pointer (≈3 rows a notch) |

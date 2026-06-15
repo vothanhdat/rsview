@@ -863,6 +863,37 @@ impl View {
         self.want_path = None;
     }
 
+    /// Jump to the next (`forward`) or previous sibling at the focused node's
+    /// level, stepping over its (possibly expanded) subtree. A no-op at either
+    /// end of the level, or on the root (which has no siblings).
+    fn nav_sibling(&mut self, b: &[u8], forward: bool) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let path = self.rows[self.focus].path.clone();
+        let Some((&last, parent)) = path.split_last() else {
+            return; // root has no siblings
+        };
+        let target = if forward {
+            last + 1
+        } else if last == 0 {
+            return; // already the first sibling
+        } else {
+            last - 1
+        };
+        // The parent is expanded (the focused row is one of its children), so
+        // scan one more sibling lazily; bail if there's none (past the end, or
+        // not yet streamed in).
+        let parent_node = get_mut(&mut self.root, parent);
+        parent_node.ensure_child(b, target);
+        if target >= parent_node.children.len() {
+            return;
+        }
+        let mut cand = parent.to_vec();
+        cand.push(target);
+        self.jump_to(&cand, b);
+    }
+
     fn collapse_or_parent(&mut self) {
         if self.rows.is_empty() {
             return;
@@ -1345,7 +1376,7 @@ fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Option<&str>) {
         Span::styled(format!(" {msg}"), Style::default().fg(Color::Green))
     } else {
         Span::styled(
-            " ↑/↓ move · enter expand · / search · : goto · m mark · ' marks · y copy · s split · o preview · q quit",
+            " ↑/↓ move · J/K sibling · enter expand · / search · : goto · m mark · ' marks · y copy · s split · o preview · q quit",
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -1704,6 +1735,10 @@ fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], 
         }
         KeyCode::Down | KeyCode::Char('j') => v.focus += 1,
         KeyCode::Up | KeyCode::Char('k') => v.focus = v.focus.saturating_sub(1),
+        // Same-level navigation: J/K hop to the next/previous sibling, stepping
+        // over the focused node's subtree.
+        KeyCode::Char('J') => v.nav_sibling(b, true),
+        KeyCode::Char('K') => v.nav_sibling(b, false),
         // Paging: PageUp/PageDown plus Ctrl-F/B (full screen) and Ctrl-D/U (half),
         // for keyboards without dedicated Page keys.
         KeyCode::PageDown => v.focus += h,
@@ -2153,6 +2188,33 @@ mod tests {
         assert_eq!(&b[node.start..node.end], b"20");
         // A missing key resolves to None.
         assert!(resolve_path(&mut root, b, &[], &parse_path("a.nope").segs).is_none());
+    }
+
+    #[test]
+    fn nav_sibling_steps_over_subtrees() {
+        let b = br#"{"a":{"x":1},"b":{"y":2},"c":3}"#;
+        let mut v = View::new(b, "t", false);
+        v.flatten_window(b, 40);
+        // Focus key "a" (path [0]) and expand it, so its child sits between it
+        // and the next sibling.
+        v.focus = v.rows.iter().position(|r| r.path == vec![0]).unwrap();
+        v.toggle_focus();
+        v.flatten_window(b, 40);
+        // Forward hops over a.x straight to "b" ([1]), then "c" ([2]).
+        v.nav_sibling(b, true);
+        v.flatten_window(b, 40);
+        assert_eq!(v.rows[v.focus].path, vec![1]);
+        v.nav_sibling(b, true);
+        v.flatten_window(b, 40);
+        assert_eq!(v.rows[v.focus].path, vec![2]);
+        // At the last sibling, forward is a no-op.
+        v.nav_sibling(b, true);
+        v.flatten_window(b, 40);
+        assert_eq!(v.rows[v.focus].path, vec![2]);
+        // Backward walks back to "b".
+        v.nav_sibling(b, false);
+        v.flatten_window(b, 40);
+        assert_eq!(v.rows[v.focus].path, vec![1]);
     }
 
     #[test]
