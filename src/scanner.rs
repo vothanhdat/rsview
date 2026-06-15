@@ -173,6 +173,28 @@ pub struct RawChild {
     pub kind: Kind,
     /// True when the label is an array index (vs. an object key) — used for coloring.
     pub is_index: bool,
+    /// False when `end` is *provisional* — a container child whose closer hasn't
+    /// been scanned yet (`end` is the parent's bound). The child still renders and
+    /// expands correctly (its own cursor stops at the real closer); only raw-range
+    /// uses (copy, split) must resolve the true end first. See `Cursor::emit`.
+    pub end_exact: bool,
+}
+
+/// One outcome of a budgeted [`Cursor::step`]: the next child, a `Yield` (a
+/// deferred end-skip is mid-flight — `budget` bytes were consumed, call again to
+/// resume), or `Done` (level fully enumerated).
+pub enum Step {
+    Child(RawChild),
+    Yield,
+    Done,
+}
+
+/// An in-progress skip over a container child's value, kept so a huge value can
+/// be stepped over a chunk at a time (resumable) rather than blocking the UI.
+/// `i` is the current byte; `depth` the open-bracket nesting (back to 0 = closed).
+struct SkipProgress {
+    i: usize,
+    depth: i32,
 }
 
 /// Resumable cursor over a container's immediate children — the port of
@@ -187,6 +209,10 @@ pub struct Cursor {
     /// NDJSON / JSON-Lines mode: values are whitespace-separated with no
     /// enclosing bracket and no commas (see [`Cursor::lines`]).
     lines: bool,
+    /// A deferred container end-skip: the previously emitted child was a
+    /// container whose closer we haven't scanned yet. Resolved (eagerly by
+    /// `next`, or in chunks by `step`) before the *next* child is produced.
+    pending: Option<SkipProgress>,
 }
 
 impl Cursor {
@@ -199,6 +225,7 @@ impl Cursor {
             index: 0,
             done: false,
             lines: false,
+            pending: None,
         }
     }
 
@@ -213,16 +240,81 @@ impl Cursor {
             index: 0,
             done: false,
             lines: true,
+            pending: None,
         }
     }
 
+    /// Eager enumeration (preview, goto, search): resolve any deferred end-skip
+    /// in one shot, then produce the next child. Same observable behaviour as
+    /// before lazy ends existed — callers that don't drive a budget see no change.
     pub fn next(&mut self, b: &[u8]) -> Option<RawChild> {
+        self.drive_pending(b, usize::MAX);
+        self.emit(b)
+    }
+
+    /// Cooperative enumeration (windowed flatten): resolve a deferred end-skip in
+    /// `budget`-byte chunks. Returns `Yield` while the skip is still in flight so
+    /// the caller can repaint and poll input between chunks (the resumable port of
+    /// "repaint with throttle"); otherwise the next child, or `Done`.
+    pub fn step(&mut self, b: &[u8], budget: usize) -> Step {
+        if !self.drive_pending(b, budget) {
+            return Step::Yield;
+        }
+        match self.emit(b) {
+            Some(c) => Step::Child(c),
+            None => Step::Done,
+        }
+    }
+
+    /// Finish (or advance by `budget` bytes) a deferred container end-skip.
+    /// Returns true once `pos` sits past the value (or there was nothing pending);
+    /// false if the budget ran out before the closer (resume on the next call).
+    fn drive_pending(&mut self, b: &[u8], budget: usize) -> bool {
+        let Some(mut sp) = self.pending.take() else {
+            return true;
+        };
+        let stop = sp.i.saturating_add(budget);
+        while sp.i < self.end {
+            match b[sp.i] {
+                b'"' => {
+                    sp.i = skip_string(b, sp.i, self.end);
+                    continue; // a string can't hold a structural byte
+                }
+                b'{' | b'[' => sp.depth += 1,
+                b'}' | b']' => {
+                    sp.depth -= 1;
+                    if sp.depth == 0 {
+                        self.pos = sp.i + 1; // past the closer
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            sp.i += 1;
+            if sp.i >= stop {
+                self.pending = Some(sp); // budget exhausted mid-value — resume later
+                return false;
+            }
+        }
+        // Ran out of buffer without a closer (truncated / malformed): the value
+        // is everything that's left. Finish so enumeration can't deadlock.
+        self.pos = sp.i;
+        true
+    }
+
+    /// Produce the next child. A *container* child's end is left **provisional**:
+    /// rather than `skip_value` to its closer here (O(value size) — the cost that
+    /// makes opening a 1 GB array slow), record a `pending` skip and hand back the
+    /// parent's bound as `end`. `drive_pending` resolves it before the next child.
+    /// Assumes any prior pending skip is already resolved (see `next`/`step`).
+    fn emit(&mut self, b: &[u8]) -> Option<RawChild> {
         if self.done {
             return None;
         }
         let mut i = skip_ws(b, self.pos, self.end);
         if self.lines {
             // No closer to stop at — EOF ends the stream. Each value is one record.
+            // Records are line-sized, so skip them eagerly (no deferral here).
             if i >= self.end {
                 self.done = true;
                 return None;
@@ -241,6 +333,7 @@ impl Cursor {
                 end: vend,
                 kind,
                 is_index: true,
+                end_exact: true,
             });
         }
         if i >= self.end || b[i] == b'}' || b[i] == b']' {
@@ -279,17 +372,39 @@ impl Cursor {
             self.done = true;
             return None;
         }
-        let vend = skip_value(b, vstart, self.end);
         let kind = value_kind(b, vstart);
-        self.pos = vend;
         self.index += 1;
-        Some(RawChild {
-            label,
-            start: vstart,
-            end: vend,
-            kind,
-            is_index: self.is_array,
-        })
+        if matches!(kind, Kind::Object | Kind::Array) {
+            // Defer the end-skip. `pos` stays at the value start; the next
+            // `next`/`step` resolves `pending` first. The provisional `end` is the
+            // parent's bound — fine for display/expand (the child's own cursor
+            // stops at its real closer), flagged `end_exact: false` for copy/split.
+            self.pending = Some(SkipProgress {
+                i: vstart,
+                depth: 0,
+            });
+            self.pos = vstart;
+            Some(RawChild {
+                label,
+                start: vstart,
+                end: self.end,
+                kind,
+                is_index: self.is_array,
+                end_exact: false,
+            })
+        } else {
+            // Scalars are cheap to skip and small — resolve eagerly.
+            let vend = skip_value(b, vstart, self.end);
+            self.pos = vend;
+            Some(RawChild {
+                label,
+                start: vstart,
+                end: vend,
+                kind,
+                is_index: self.is_array,
+                end_exact: true,
+            })
+        }
     }
 }
 

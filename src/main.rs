@@ -9,7 +9,8 @@ mod scanner;
 mod search;
 mod source;
 use scanner::{
-    container_empty, decode_str, skip_value, skip_ws, value_kind, Cursor, Kind, RawChild, MAX_DEPTH,
+    container_empty, decode_str, skip_value, skip_ws, value_kind, Cursor, Kind, RawChild, Step,
+    MAX_DEPTH,
 };
 use search::Search;
 use source::Source;
@@ -39,6 +40,12 @@ use std::{
 const PREVIEW_ITEMS: usize = 5;
 /// Max display width of a collapsed preview before it's truncated with `…`.
 const PREVIEW_WIDTH: usize = 64;
+/// Bytes the inline preview will step over to reach the *next* sibling before
+/// giving up with `…`. A preview must be cheap to recompute every frame, so it
+/// must never pay a huge `skip_value`: if the next key sits behind a value bigger
+/// than this (e.g. `meta` behind a 1 GB `users`), the preview shows `…` instead
+/// of blocking to scan past it. Generous enough that normal values still appear.
+const PREVIEW_SKIP_BUDGET: usize = 64 << 10; // 64 KiB
 /// When decoding a scalar for display, only touch this many bytes. A preview/row
 /// truncates to a few dozen chars anyway, so decoding a whole multi-hundred-MB
 /// string (or a bogus run of digits) would just be wasted work and a memory
@@ -67,6 +74,18 @@ const COPY_MAX_BYTES: usize = 1 << 20; // 1 MiB
 /// level — a key past this many siblings reports "not found" rather than hanging.
 const GOTO_SCAN_CAP: usize = 100_000;
 
+/// Wall-clock budget for one cooperative `flatten` pass. When reaching the next
+/// on-screen row means skipping over a huge value (e.g. a 1 GB array to find the
+/// sibling after it), `flatten` yields after this long so the loop can paint what
+/// it has and poll input; the skip resumes next frame. Keeps the first paint and
+/// every later frame responsive instead of blocking on one giant `skip_value`.
+const FLATTEN_BUDGET: Duration = Duration::from_millis(8);
+
+/// Bytes a single resumable skip-chunk steps over before re-checking the frame
+/// deadline. Small enough that the deadline is honoured to within a chunk, large
+/// enough that the per-chunk overhead is negligible (~1–2 ms of scanning).
+const SKIP_CHUNK_BYTES: usize = 2 << 20; // 2 MiB
+
 // Syntax-highlight palette (ANSI named colors so it adapts to the terminal theme).
 const C_KEY: Color = Color::Cyan; // object keys
 const C_INDEX: Color = Color::DarkGray; // array indices
@@ -92,6 +111,11 @@ struct Node {
     label: String,
     start: usize,
     end: usize,
+    /// False when `end` is provisional — a container whose closer hasn't been
+    /// scanned yet (`end` is its parent's bound). Display/expand work regardless
+    /// (cursors stop at the real closer); the raw-range consumers (copy `y`, split
+    /// `o`/`O`) check this and skip to the true closer before slicing.
+    end_exact: bool,
     kind: Kind,
     is_index: bool,
     /// Synthetic NDJSON root: children are the documents, enumerated by a
@@ -121,11 +145,14 @@ impl Node {
 
     fn from_raw(rc: RawChild, b: &[u8]) -> Node {
         let is_cont = matches!(rc.kind, Kind::Object | Kind::Array);
+        // `container_empty` only reads just past the opener, so a provisional
+        // (over-long) `end` is harmless here.
         let has = is_cont && !container_empty(b, rc.start, rc.end);
         Node {
             label: rc.label,
             start: rc.start,
             end: rc.end,
+            end_exact: rc.end_exact,
             kind: rc.kind,
             is_index: rc.is_index,
             jsonl: false,
@@ -150,6 +177,8 @@ impl Node {
     }
 
     /// Ensure `children[i]` exists, scanning more from the cursor if needed.
+    /// Eager: a deferred end-skip is resolved in one shot (used by jumps/goto/
+    /// search, which must reach a specific node now).
     fn ensure_child(&mut self, b: &[u8], i: usize) {
         while self.children.len() <= i {
             let nx = match self.cursor.as_mut() {
@@ -164,6 +193,34 @@ impl Node {
                 }
             }
         }
+    }
+
+    /// Cooperative `ensure_child`: drive the cursor in resumable chunks until
+    /// `children[i]` exists or `deadline` passes. Returns `Ready` (available),
+    /// `Done` (level ended before `i`), or `Busy` (deadline hit mid skip — call
+    /// again next frame; cursor state is preserved). This is what lets a huge
+    /// level (or a giant value standing between two on-screen rows) flatten a
+    /// frame's worth at a time instead of blocking.
+    fn ensure_child_until(&mut self, b: &[u8], i: usize, deadline: Instant) -> EnsureChild {
+        while self.children.len() <= i {
+            let Some(c) = self.cursor.as_mut() else {
+                return EnsureChild::Done;
+            };
+            match c.step(b, SKIP_CHUNK_BYTES) {
+                Step::Child(rc) => self.children.push(Node::from_raw(rc, b)),
+                Step::Done => {
+                    self.done = true;
+                    return EnsureChild::Done;
+                }
+                Step::Yield => {
+                    if Instant::now() >= deadline {
+                        return EnsureChild::Busy; // out of frame time, skip in flight
+                    }
+                    // time left — keep stepping the same skip
+                }
+            }
+        }
+        EnsureChild::Ready
     }
 
     /// The value text shown after the label. Collapsed containers get a real
@@ -203,6 +260,12 @@ impl Node {
     /// Scan the first few children of a collapsed container and render them
     /// inline, e.g. `{ version: "0.3.2", deps: {…}, … }`. Uses a fresh resumable
     /// `Cursor`, capped at `PREVIEW_ITEMS`, so it's O(few) regardless of size.
+    ///
+    /// Crucially it scans with a small per-sibling budget (`step`, not the eager
+    /// `next`): if reaching the next child would mean skipping a value bigger than
+    /// `PREVIEW_SKIP_BUDGET` (e.g. `meta` behind a 1 GB `users`), it stops with `…`
+    /// rather than blocking. Without this, the *collapsed* row would re-scan 1 GB
+    /// every frame — which is why collapsing a giant container felt slow.
     fn collapsed_preview(&self, b: &[u8]) -> String {
         let arr = matches!(self.kind, Kind::Array);
         let (open, close) = if arr { ("[", "]") } else { ("{", "}") };
@@ -211,11 +274,13 @@ impl Node {
         let mut more = false;
         loop {
             if parts.len() == PREVIEW_ITEMS {
-                more = cur.next(b).is_some(); // is there at least one more?
+                // Is there at least one more? `Yield` (next child behind a big
+                // value) counts as "yes" without paying the skip.
+                more = !matches!(cur.step(b, PREVIEW_SKIP_BUDGET), Step::Done);
                 break;
             }
-            match cur.next(b) {
-                Some(rc) => {
+            match cur.step(b, PREVIEW_SKIP_BUDGET) {
+                Step::Child(rc) => {
                     let v = brief(b, &rc);
                     parts.push(if arr {
                         v
@@ -223,7 +288,12 @@ impl Node {
                         format!("{}: {}", rc.label, v)
                     });
                 }
-                None => break,
+                // The next sibling is behind a value too big to scan for a preview.
+                Step::Yield => {
+                    more = true;
+                    break;
+                }
+                Step::Done => break,
             }
         }
         if parts.is_empty() {
@@ -293,11 +363,32 @@ struct Row {
     has_children: bool,
     expanded: bool,
     path: Vec<usize>,
+    /// A synthetic, non-navigable placeholder rendered while a huge value is being
+    /// stepped over (the inline "⠋ loading…" line at the spot where the next
+    /// sibling will appear). Always the last row; focus is clamped above it.
+    loading: bool,
 }
 
 /// Windowed flatten: walk the expanded tree DFS, scanning children on demand,
 /// and stop once `budget` rows exist. A pathologically flat level (millions of
 /// keys) therefore only flattens ~a screenful, not the whole thing.
+/// Outcome of a cooperative child-scan (see [`Node::ensure_child_until`]).
+enum EnsureChild {
+    /// `children[i]` is available.
+    Ready,
+    /// The deadline was hit mid-skip — repaint and resume next frame.
+    Busy,
+    /// The level ended before index `i`.
+    Done,
+}
+
+/// Windowed flatten: walk the expanded tree DFS, scanning children on demand,
+/// and stop once `budget` rows exist. With `deadline = Some(_)` it is also
+/// *cooperative*: if reaching the next row means skipping a huge value past the
+/// frame's time budget, it sets `*incomplete = true` and returns early so the
+/// caller can paint what's flattened and resume next frame (the skip is
+/// preserved on the cursor). `deadline = None` drains eagerly (used by jumps,
+/// which must reach a target row synchronously).
 fn flatten(
     node: &mut Node,
     b: &[u8],
@@ -305,8 +396,10 @@ fn flatten(
     budget: usize,
     out: &mut Vec<Row>,
     path: &mut Vec<usize>,
+    deadline: Option<Instant>,
+    incomplete: &mut bool,
 ) {
-    if out.len() >= budget {
+    if *incomplete || out.len() >= budget {
         return;
     }
     out.push(Row {
@@ -318,19 +411,60 @@ fn flatten(
         has_children: node.has_children,
         expanded: node.expanded,
         path: path.clone(),
+        loading: false,
     });
     // Stop descending past the depth cap so a deeply-nested (possibly hostile)
     // document can't recurse the stack to a fault. Real data never reaches it.
     if depth < MAX_DEPTH && node.expanded && node.is_container() {
         let mut i = 0;
         while out.len() < budget {
-            node.ensure_child(b, i);
-            if i >= node.children.len() {
-                break; // level fully enumerated
+            match deadline {
+                Some(dl) => match node.ensure_child_until(b, i, dl) {
+                    EnsureChild::Ready => {}
+                    EnsureChild::Done => break, // level fully enumerated
+                    EnsureChild::Busy => {
+                        *incomplete = true; // skip in flight — paint now, resume next frame
+                        // Inline placeholder at the spot the next child will fill,
+                        // indented to the child level, so the wait reads as "this
+                        // node is still loading" rather than a frozen screen.
+                        if out.len() < budget {
+                            out.push(Row {
+                                depth: depth + 1,
+                                label: String::new(),
+                                value: String::new(),
+                                kind: Kind::Null,
+                                is_index: false,
+                                has_children: false,
+                                expanded: false,
+                                path: Vec::new(),
+                                loading: true,
+                            });
+                        }
+                        return;
+                    }
+                },
+                None => {
+                    node.ensure_child(b, i);
+                    if i >= node.children.len() {
+                        break; // level fully enumerated
+                    }
+                }
             }
             path.push(i);
-            flatten(&mut node.children[i], b, depth + 1, budget, out, path);
+            flatten(
+                &mut node.children[i],
+                b,
+                depth + 1,
+                budget,
+                out,
+                path,
+                deadline,
+                incomplete,
+            );
             path.pop();
+            if *incomplete {
+                return;
+            }
             i += 1;
         }
     }
@@ -430,6 +564,10 @@ struct View {
     indexed: usize,
     /// A pending jump target: the next frame flattens far enough to land on it.
     want_path: Option<Vec<usize>>,
+    /// Set when the last cooperative `flatten_window` yielded mid-skip (a huge
+    /// value still being stepped over). The run loop keeps flattening — without
+    /// blocking on input — until it clears. Always false after a jump.
+    flatten_incomplete: bool,
     /// Live path-input buffer (typed while in `Mode::Goto`).
     goto: String,
     /// Saved node paths (`m` toggles), jumped to via the `'` picker overlay.
@@ -463,6 +601,7 @@ fn make_root(b: &[u8], name: &str, jsonl: bool) -> Node {
         label: name.into(),
         start,
         end: b.len(), // root spans to EOF; the scanner stops at the real closer
+        end_exact: false, // provisional (to EOF) — copy re-resolves bounded by its cap
         kind,
         is_index: false,
         jsonl,
@@ -489,6 +628,7 @@ fn make_subroot(b: &[u8], label: String, start: usize, end: usize, kind: Kind) -
         label,
         start,
         end,
+        end_exact: true, // caller passed the node's already-resolved real end
         kind,
         is_index: false,
         jsonl: false,
@@ -770,6 +910,7 @@ impl View {
             goto: String::new(),
             bookmarks: Vec::new(),
             mark_idx: 0,
+            flatten_incomplete: false,
         }
     }
 
@@ -1004,30 +1145,62 @@ impl View {
             // cycling search matches expands each visited node, pushing later
             // rows down), so grow the budget until the target appears — or the
             // tree is fully walked (target unreachable / not arrived yet).
+            // Eager (`deadline = None`): a jump must resolve its row now.
             let mut budget = target.iter().sum::<usize>() + target.len() + h + 64;
+            let mut ignore = false;
             loop {
                 self.rows.clear();
                 let mut path = Vec::new();
-                flatten(&mut self.root, b, 0, budget, &mut self.rows, &mut path);
+                flatten(
+                    &mut self.root,
+                    b,
+                    0,
+                    budget,
+                    &mut self.rows,
+                    &mut path,
+                    None,
+                    &mut ignore,
+                );
                 let walked_all = self.rows.len() < budget;
                 if self.rows.iter().any(|r| r.path == target) || walked_all {
                     break;
                 }
                 budget = budget.saturating_mul(2);
             }
+            self.flatten_incomplete = false;
             if let Some(idx) = self.rows.iter().position(|r| r.path == target) {
                 self.focus = idx;
             }
         } else {
-            // No jump pending: flatten only as far as the viewport needs.
+            // No jump pending: flatten only as far as the viewport needs, and
+            // cooperatively — if a huge value sits between visible rows, paint
+            // what we have and resume next frame (see `flatten`/the run loop).
             let budget = (self.scroll + h + 64).max(self.focus + 64);
             self.rows.clear();
             let mut path = Vec::new();
-            flatten(&mut self.root, b, 0, budget, &mut self.rows, &mut path);
+            let mut incomplete = false;
+            flatten(
+                &mut self.root,
+                b,
+                0,
+                budget,
+                &mut self.rows,
+                &mut path,
+                Some(Instant::now() + FLATTEN_BUDGET),
+                &mut incomplete,
+            );
+            self.flatten_incomplete = incomplete;
         }
 
-        if self.focus >= self.rows.len() {
-            self.focus = self.rows.len().saturating_sub(1);
+        // Clamp focus to the last *real* row — never the trailing loading
+        // placeholder (it's not a navigable node, and its path is empty).
+        let max_focus = self
+            .rows
+            .iter()
+            .rposition(|r| !r.loading)
+            .unwrap_or(0);
+        if self.focus > max_focus {
+            self.focus = max_focus;
         }
         if self.focus < self.scroll {
             self.scroll = self.focus;
@@ -1078,9 +1251,17 @@ impl App {
     /// the terminal clipboard. Clamped to `COPY_MAX_BYTES`. Returns a status line.
     fn yank_value(&self, b: &[u8]) -> String {
         match self.focused_range() {
-            Some((s, e)) => {
-                let capped = e.min(s.saturating_add(COPY_MAX_BYTES));
-                let slice = &b[s..capped];
+            Some((s, prov_end)) => {
+                // `prov_end` may be provisional (a container whose closer wasn't
+                // scanned — it spans to the parent's bound, so a naive slice would
+                // run into siblings). Find the real closer, but never scan past
+                // what we'd copy anyway: the copy cap. If the scan stops at the cap
+                // rather than a closer, the value is larger than the cap → truncated.
+                let cap = s.saturating_add(COPY_MAX_BYTES);
+                let scan_to = prov_end.min(cap);
+                let e = skip_value(b, s, scan_to);
+                let truncated = e >= cap && cap < prov_end;
+                let slice = &b[s..e];
                 // Trim trailing whitespace — the document root's range runs to EOF,
                 // so it would otherwise carry the file's final newline.
                 let cut = slice
@@ -1090,8 +1271,8 @@ impl App {
                 let slice = &slice[..cut];
                 copy_to_clipboard(slice);
                 let n = slice.len();
-                if capped < e {
-                    format!("copied {n} B (truncated from {})", e - s)
+                if truncated {
+                    format!("copied {n} B (truncated at {} KiB cap)", COPY_MAX_BYTES >> 10)
                 } else {
                     format!("copied value ({n} B)")
                 }
@@ -1128,6 +1309,15 @@ impl App {
 
     fn active_mut(&mut self) -> &mut View {
         &mut self.views[self.active]
+    }
+
+    /// True if any pane's last flatten yielded mid-skip (a huge value still being
+    /// stepped over). The run loop then keeps flattening — polling input at 0 ms
+    /// instead of blocking — until it clears, so a later sibling behind a giant
+    /// value (e.g. `meta` after a 1 GB `users`) still appears on its own, just
+    /// without the giant `skip_value` ever blocking a frame.
+    fn flatten_pending(&self) -> bool {
+        self.views.iter().any(|v| v.flatten_incomplete)
     }
 
     fn toggle_layout(&mut self) {
@@ -1233,7 +1423,16 @@ impl App {
             String::new()
         };
         let origin = join_path(&base, &breadcrumb_segments(&src.root, &path));
-        let root = make_subroot(b, node.label.clone(), node.start, node.end, node.kind);
+        // The subroot is a real bounded container, so it needs the node's *true*
+        // end — `node.end` may be provisional (running to the parent's bound). Pay
+        // the one-shot skip to the real closer here (a split is a deliberate, rare
+        // action); display/scroll never need it.
+        let end = if node.end_exact {
+            node.end
+        } else {
+            skip_value(b, node.start, node.end)
+        };
+        let root = make_subroot(b, node.label.clone(), node.start, end, node.kind);
         Some((root, origin))
     }
 
@@ -1676,29 +1875,35 @@ fn render_help(f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
+/// Braille spinner frames for the inline "still scanning a huge value" row.
+/// Advanced by wall-clock time so it animates across the drain's repaints without
+/// threading a frame counter through the render path.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn spinner_frame() -> &'static str {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    SPINNER[(ms / 80) as usize % SPINNER.len()]
+}
+
 /// Draw one pane (title + breadcrumb, then content rows) into `rect`. The active
 /// pane gets a bright title and is the only one to show its cursor bar; the
 /// key/search footer is global (see [`render_footer`]), not per-pane.
 fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: bool) {
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(rect);
 
-    // Title: `↳ origin   focus/rows+` plus the focus breadcrumb.
+    // Title: `↳ origin   focus/rows+` plus the focus breadcrumb. Count only real
+    // rows (the trailing loading placeholder isn't a node), and clamp the shown
+    // position to that count.
     let marker = if view.derived { "↳ " } else { "" };
-    let prefix = if streaming {
-        format!(
-            " {marker}{}   {}/{}+   ⟳ streaming",
-            view.name,
-            view.focus + 1,
-            view.rows.len()
-        )
-    } else {
-        format!(
-            " {marker}{}   {}/{}+",
-            view.name,
-            view.focus + 1,
-            view.rows.len()
-        )
-    };
+    let n_rows = view.rows.iter().filter(|r| !r.loading).count();
+    let pos = (view.focus + 1).min(n_rows.max(1));
+    let mut prefix = format!(" {marker}{}   {}/{}+", view.name, pos, n_rows);
+    if streaming {
+        prefix.push_str("   ⟳ streaming");
+    }
     let prefix_w = prefix.chars().count();
     let title_style = if active {
         Style::default()
@@ -1735,6 +1940,16 @@ fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: 
     let end = (view.scroll + h).min(view.rows.len());
     for i in view.scroll..end {
         let r = &view.rows[i];
+        if r.loading {
+            // Inline drain indicator: a dim, animated "⠋ loading…" at the child
+            // indent, where the next sibling will appear once it's scanned in.
+            let indent = "  ".repeat(r.depth);
+            lines.push(Line::from(Span::styled(
+                format!("{indent}{} loading…", spinner_frame()),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            )));
+            continue;
+        }
         let marker = if r.has_children {
             if r.expanded {
                 "▼"
@@ -2109,8 +2324,12 @@ fn run(
         }
         render_frame(term, app, b, false)?;
         let h = app.active_height(term_area()?);
-        // Short poll so streaming match counts keep ticking even without input.
-        match pump_input(app, b, h, 100)? {
+        // While a flatten is mid-skip, don't block on input: poll at 0 ms and loop
+        // so the next frame steps the skip another `FLATTEN_BUDGET` (still
+        // dispatching any key pressed meanwhile). Otherwise a short poll so
+        // streaming match counts keep ticking even when idle.
+        let poll_ms = if app.flatten_pending() { 0 } else { 100 };
+        match pump_input(app, b, h, poll_ms)? {
             KeyOutcome::Quit => return Ok(()),
             KeyOutcome::Relaunch => app.active_mut().relaunch(mmap),
             KeyOutcome::Continue => {}
@@ -2174,7 +2393,10 @@ fn run_stream(
             let b: &[u8] = buf;
             render_frame(term, app, b, !done)?;
             let h = app.active_height(term_area()?);
-            pump_input(app, b, h, 100)?
+            // 0 ms while a flatten is mid-skip (resume the skip next frame); 100 ms
+            // otherwise so the buffer-rebuild throttle keeps ticking when idle.
+            let poll_ms = if app.flatten_pending() { 0 } else { 100 };
+            pump_input(app, b, h, poll_ms)?
         };
         match outcome {
             KeyOutcome::Quit => return Ok(()),
@@ -2343,6 +2565,15 @@ fn run_file(path: String) -> std::io::Result<()> {
 
     let mut app = App::single(View::new(b, &path, jsonl));
     let mut term = ratatui::init();
+    // Paint the first frame *before* probing keyboard-enhancement support.
+    // `supports_keyboard_enhancement()` (in enable_enhanced_keys) blocks up to
+    // ~2s on terminals that never answer the query, and the alt-screen is blank
+    // until the first draw — that's the "blank screen for 2s on open". The tree
+    // flattens a windowed screenful instantly (mmap + lazy), so drawing it first
+    // makes the file appear immediately and the probe runs behind rendered
+    // content (it only changes how *later* keypresses are reported, so the delay
+    // is invisible — keys can't arrive before the user has seen the tree).
+    let _ = render_frame(&mut term, &mut app, b, false);
     let enhanced = enable_enhanced_keys();
     enable_mouse();
     let res = run(&mut term, &mut app, b, &mmap);
@@ -2362,6 +2593,9 @@ fn run_stdin() -> std::io::Result<()> {
     let mut jsonl = false;
     let mut app = App::single(View::new(&buf, "stdin", jsonl));
     let mut term = ratatui::init();
+    // Same as run_file: paint before the up-to-2s keyboard-enhancement probe so
+    // the (initially empty) streaming pane shows immediately, not a blank screen.
+    let _ = render_frame(&mut term, &mut app, &buf, true);
     let enhanced = enable_enhanced_keys();
     enable_mouse();
     let res = run_stream(&mut term, &mut app, &mut buf, &mut jsonl, rx);
@@ -2410,6 +2644,89 @@ fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Diagnostic: how long does *opening* big.json take (mmap → root →
+    /// first windowed flatten)? `#[ignore]`d so it never runs in CI and never
+    /// depends on the 1 GB fixture existing. Run explicitly:
+    ///   cargo test --release -- --ignored --nocapture bench_open_big
+    #[test]
+    #[ignore]
+    fn bench_open_big() {
+        let path = "demo/big.json";
+        let Ok(file) = File::open(path) else {
+            eprintln!("skip: {path} not present");
+            return;
+        };
+        let t0 = std::time::Instant::now();
+        let mmap = unsafe { Mmap::map(&file).unwrap() };
+        let t_map = t0.elapsed();
+        let b: &[u8] = &mmap;
+        let t1 = std::time::Instant::now();
+        let mut v = View::new(b, path, false); // make_root auto-expands depth 1
+        let t_root = t1.elapsed();
+        // First frame: cooperative flatten yields within FLATTEN_BUDGET, so it
+        // paints the rows it has (root + the giant `users`) without scanning past
+        // it — the fix for the open-blank. `meta` sits behind the 1 GB skip.
+        let t2 = std::time::Instant::now();
+        v.flatten_window(b, 50);
+        let t_first = t2.elapsed();
+        // Count real rows (a mid-drain flatten also pushes a trailing loading row).
+        let first_rows = v.rows.iter().filter(|r| !r.loading).count();
+        let first_incomplete = v.flatten_incomplete;
+        // Drain: keep flattening (as the run loop does while flatten_pending) until
+        // the skip completes and the rest of the level is in. This is where the
+        // ~700 ms now lives — *after* the first paint, not blocking it.
+        let t3 = std::time::Instant::now();
+        let mut frames = 1;
+        while v.flatten_incomplete {
+            v.flatten_window(b, 50);
+            frames += 1;
+        }
+        let t_drain = t3.elapsed();
+        eprintln!("file size        : {} bytes", b.len());
+        eprintln!("mmap             : {t_map:?}");
+        eprintln!("View::new        : {t_root:?}");
+        eprintln!(
+            "FIRST PAINT      : {t_first:?}   rows={first_rows}  incomplete={first_incomplete}"
+        );
+        let final_rows = v.rows.iter().filter(|r| !r.loading).count();
+        eprintln!("drain to complete: {t_drain:?}   frames={frames}  rows={final_rows}");
+        eprintln!("TOTAL            : {:?}", t0.elapsed());
+        for r in v.rows.iter().filter(|r| !r.loading) {
+            eprintln!("  row d{} {:?}: {}", r.depth, r.label, truncate(&r.value, 60));
+        }
+        // Collapse the root: the collapsed preview must NOT re-scan the 1 GB
+        // `users` to reach `meta` — it stops at `…` (bounded by PREVIEW_SKIP_BUDGET)
+        // and is instant, even though warm-cache pages are already faulted in.
+        v.focus = 0;
+        v.toggle_focus(); // collapse the root
+        let t4 = std::time::Instant::now();
+        v.flatten_window(b, 50);
+        let t_collapse = t4.elapsed();
+        let preview = v.rows.first().map(|r| r.value.clone()).unwrap_or_default();
+        eprintln!("collapse         : {t_collapse:?}   root preview = {preview}");
+
+        // Re-expand: the first drain already enumerated `meta` into `root.children`,
+        // and collapse keeps that cache, so this must NOT re-scan the 1 GB — it just
+        // re-reads the cached child nodes. Instant.
+        v.focus = 0;
+        v.toggle_focus(); // re-expand the root
+        let t5 = std::time::Instant::now();
+        v.flatten_window(b, 50);
+        let t_reexpand = t5.elapsed();
+        let reexpand_rows = v.rows.iter().filter(|r| !r.loading).count();
+        eprintln!(
+            "re-expand        : {t_reexpand:?}   rows={reexpand_rows}  incomplete={}",
+            v.flatten_incomplete
+        );
+
+        // The point of the change: the first paint is fast and bounded, not the
+        // whole skip; collapsing never pays the giant skip; and re-expanding reuses
+        // the cached children instead of re-scanning.
+        assert!(t_first < Duration::from_millis(100), "first paint should be fast");
+        assert!(t_collapse < Duration::from_millis(50), "collapse should be instant");
+        assert!(t_reexpand < Duration::from_millis(50), "re-expand should reuse the cache");
+    }
 
     #[test]
     fn base64_matches_rfc4648_vectors() {
@@ -2758,7 +3075,17 @@ mod tests {
         let budget = 256;
         let mut rows = Vec::new();
         let mut path = Vec::new();
-        flatten(&mut root, b, 0, budget, &mut rows, &mut path);
+        let mut incomplete = false;
+        flatten(
+            &mut root,
+            b,
+            0,
+            budget,
+            &mut rows,
+            &mut path,
+            None,
+            &mut incomplete,
+        );
 
         assert!(
             rows.len() <= budget,
@@ -2790,7 +3117,17 @@ mod tests {
                 let mut root = make_root(b, "x", jsonl);
                 let mut rows = Vec::new();
                 let mut path = Vec::new();
-                flatten(&mut root, b, 0, 128, &mut rows, &mut path);
+                let mut incomplete = false;
+                flatten(
+                    &mut root,
+                    b,
+                    0,
+                    128,
+                    &mut rows,
+                    &mut path,
+                    None,
+                    &mut incomplete,
+                );
                 let parsed = parse_path(GOTO[(rng.next() as usize) % GOTO.len()]);
                 let focus = rows.last().map(|r| r.path.clone()).unwrap_or_default();
                 let _ = resolve_with_climb(&mut root, b, &focus, &parsed);
