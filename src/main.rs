@@ -1315,30 +1315,47 @@ fn render_marks(f: &mut Frame, area: Rect, view: &View) {
         .iter()
         .map(|p| join_path("", &breadcrumb_segments(&view.root, p)))
         .collect();
+    // Size to the wider of the longest bookmark or the title, so the title can't
+    // be truncated to "… d de" on a narrow box.
+    let title = " bookmarks · ↵ jump · d delete · esc ";
+    let title_w = title.chars().count();
     let longest = items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
-    let inner_w = longest.max(24).min(area.width.saturating_sub(4) as usize);
+    let inner_w = longest.max(title_w).min(area.width.saturating_sub(4) as usize);
     let w = inner_w as u16 + 4;
     let h = (items.len() as u16 + 2).min(area.height.saturating_sub(2)).max(3);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
     let rect = Rect { x, y, width: w, height: h };
 
+    // Read as a floating card above the dimmed content: a solid dark fill with a
+    // bright, bold border/title, and a full-width selection bar (padded out so the
+    // highlight spans the row instead of clipping to the label).
+    let panel_bg = Color::Indexed(236); // dark gray; degrades gracefully on 16-color terms
     let lines: Vec<Line> = items
         .iter()
         .enumerate()
         .map(|(i, s)| {
+            let pad = " ".repeat(inner_w.saturating_sub(s.chars().count()));
+            let text = format!(" {s}{pad} ");
             let st = if i == view.mark_idx {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(C_KEY)
+                Style::default().fg(Color::Gray).bg(panel_bg)
             };
-            Line::from(Span::styled(format!(" {s} "), st))
+            Line::from(Span::styled(text, st))
         })
         .collect();
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(C_PUNCT))
-        .title(" bookmarks · ↵ jump · d delete · esc ");
+        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(panel_bg))
+        .title(Span::styled(
+            title,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
