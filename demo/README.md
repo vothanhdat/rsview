@@ -21,8 +21,8 @@ rm -rf frames demo/big.json
 - **No GIF — lossless PNG frames → WebP.** A GIF's 256-color palette + dithering
   wreck terminal text. We render to full-color PNG frames (`frames/`) and assemble
   a lossless animated WebP with `img2webp`. It auto-coalesces static runs and
-  stores only changed rectangles, so full-color lossless still lands ~260 KB —
-  smaller *and* sharper than the GIF route. `-d 20` = 50fps. GitHub renders
+  stores only changed rectangles, so full-color lossless stays ~700 KB even at
+  3x render — sharper than the GIF route. `-d 20` = 50fps. GitHub renders
   animated WebP inline. Use `frame-text-*` (content); `frame-cursor-*` is just a
   transparent cursor overlay (rsview hides the cursor anyway).
 - **`RSVIEW_NO_ENHANCED_KEYS=1` is required** on the vhs invocation. vhs records

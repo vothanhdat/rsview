@@ -1,7 +1,7 @@
 # rsview demo recording — drives the real binary to lossless PNG frames, then
 # assembles a full-color animated WebP for the README. (No GIF: its 256-color
 # palette + dithering wreck the text. img2webp auto-coalesces static runs and
-# stores only changed rectangles, so lossless full-color still lands ~260 KB.)
+# stores only changed rectangles, so lossless full-color stays ~700 KB at 3x.)
 #
 # Regenerate:
 #   cargo build --release                         # build the binary
@@ -21,10 +21,12 @@ Output frames/
 Require rsview
 
 Set Shell bash
-Set FontSize 15
-Set Width 1180
-Set Height 660
-Set Padding 18
+# Grid is ~2/3 the cols/rows (bigger, more readable text), rendered at 3x pixel
+# density (FontSize, Width, Height, Padding all 3x) for crispness on hi-DPI.
+Set FontSize 45
+Set Width 2360
+Set Height 1320
+Set Padding 54
 Set Framerate 50
 Set TypingSpeed 55ms
 Set Theme "Dracula"
