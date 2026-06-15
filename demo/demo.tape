@@ -1,11 +1,14 @@
-# rsview demo recording — drives the real binary and renders docs/demo.gif.
+# rsview demo recording — drives the real binary, renders a GIF, then we
+# convert it to an animated WebP (smaller, sharper) for the README.
 #
 # Regenerate:
-#   cargo build --release                 # build the binary
-#   node demo/gen.mjs demo/big.json 1     # ~1 GB sample (the whole pitch)
-#   PATH="target/release:$PATH" vhs demo/demo.tape
+#   cargo build --release                         # build the binary
+#   node demo/gen.mjs demo/big.json 1             # ~1 GB sample (the whole pitch)
+#   RSVIEW_NO_ENHANCED_KEYS=1 PATH="target/release:$PATH" vhs demo/demo.tape
+#   gif2webp -q 70 -lossy docs/demo.gif -o docs/demo.webp && rm docs/demo.gif
 #
 # vhs: https://github.com/charmbracelet/vhs  (brew install vhs)
+# gif2webp: brew install webp
 # Tweak Sleep/keys after the first render — timing is best-effort.
 
 Output docs/demo.gif
@@ -20,6 +23,12 @@ Set Padding 18
 Set TypingSpeed 55ms
 Set Theme "Dracula"
 
+# This tape MUST be invoked with RSVIEW_NO_ENHANCED_KEYS=1 (see header). vhs
+# passes its own env down to the recorded shell, so rsview skips its keyboard-
+# enhancement probe — a headless ttyd terminal never answers that probe, so
+# otherwise rsview stalls ~2s on a blank screen at startup (real terminals
+# reply instantly, so this never affects actual users).
+
 # 1 GB on disk...
 Type "ls -lh demo/big.json"
 Enter
@@ -28,7 +37,7 @@ Sleep 1.5s
 # ...opens instantly.
 Type "rsview demo/big.json"
 Enter
-Sleep 2.5s
+Sleep 1.5s
 
 # Expand the users array and scroll through it.
 Down@200ms 1

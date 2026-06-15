@@ -2290,6 +2290,13 @@ fn enable_enhanced_keys() -> bool {
     use ratatui::crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
     use ratatui::crossterm::execute;
     use ratatui::crossterm::terminal::supports_keyboard_enhancement;
+    // `supports_keyboard_enhancement()` sends a query and blocks until the
+    // terminal replies (or a ~2s timeout). Terminals that never answer — ttyd,
+    // some multiplexers/pty wrappers — stall startup for that whole window.
+    // RSVIEW_NO_ENHANCED_KEYS=1 skips the probe (used by the demo recording).
+    if std::env::var_os("RSVIEW_NO_ENHANCED_KEYS").is_some() {
+        return false;
+    }
     if supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             std::io::stdout(),

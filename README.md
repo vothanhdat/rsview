@@ -2,7 +2,7 @@
 
 **Browse, navigate, and search multi-GB JSON in the terminal at near-constant memory.**
 
-![rsview opening a 1 GB JSON file instantly](docs/demo.gif)
+![rsview opening a 1 GB JSON file instantly](docs/demo.webp)
 
 rsview memory-maps a JSON file and parses it *on expand* — subtrees are byte
 ranges into the mmap, never materialized — so opening a 1 GB document sits around
