@@ -624,6 +624,46 @@ fn resolve_path(root: &mut Node, b: &[u8], base: &[usize], segs: &[Seg]) -> Opti
     Some(out)
 }
 
+/// Resolve `parsed`, climbing toward the root on a miss so a path that doesn't
+/// exist where it was typed still lands if it exists higher up. The candidate
+/// bases, tried in order, are:
+/// - **absolute / bare** (`up == None`): the root first (the literal reading),
+///   then the focused node's ancestry from the cursor up — `.seg`, `..seg`,
+///   `...seg`, … — so `:city` falls back to `..city`, then `...city`, and so on.
+/// - **relative** (`up == Some(n)`): the cursor climbed `n` levels (the level you
+///   asked for), then each ancestor above it up to the root.
+///
+/// Returns the first base at which every segment resolves, or `None` if none do.
+fn resolve_with_climb(
+    root: &mut Node,
+    b: &[u8],
+    focus_path: &[usize],
+    parsed: &ParsedPath,
+) -> Option<Vec<usize>> {
+    let mut bases: Vec<Vec<usize>> = Vec::new();
+    if parsed.up.is_none() {
+        bases.push(Vec::new()); // literal absolute, from the root
+    }
+    // Climb the focus ancestry from the requested level up to the root. For an
+    // absolute path that's the whole chain (cursor → root); for a relative one it
+    // starts `up` levels above the cursor.
+    let start = focus_path.len().saturating_sub(parsed.up.unwrap_or(0));
+    for keep in (0..=start).rev() {
+        bases.push(focus_path[..keep].to_vec());
+    }
+    let mut tried: Vec<Vec<usize>> = Vec::new();
+    for base in bases {
+        if tried.contains(&base) {
+            continue; // root can appear twice (absolute case); resolve it once
+        }
+        if let Some(path) = resolve_path(root, b, &base, &parsed.segs) {
+            return Some(path);
+        }
+        tried.push(base);
+    }
+    None
+}
+
 /// Collect the index-paths of every expanded container in the tree, in DFS
 /// preorder (parents before children). Used to carry expansion state across a
 /// streaming re-parse.
@@ -806,24 +846,17 @@ impl View {
     }
 
     /// Resolve the typed `goto` path and jump to it. Returns a footer status line.
-    /// Absolute paths resolve from the root; relative ones (leading dots) start
-    /// at the focused node and climb `up` levels before descending.
+    /// Absolute paths resolve from the root; relative ones (leading dots) start at
+    /// the focused node, climbed `up` levels. On a miss the resolution climbs
+    /// toward the root and retries (see [`resolve_with_climb`]), so `:city` falls
+    /// back to `..city`, `...city`, … relative to the cursor.
     fn goto_path(&mut self, b: &[u8]) -> String {
         let parsed = parse_path(&self.goto);
         if parsed.up.is_none() && parsed.segs.is_empty() {
             return "empty path".to_string();
         }
-        // A relative path's base is the focused node's path with `up` levels
-        // trimmed off the end (climbing past the root just clamps to the root).
-        let base: Vec<usize> = match parsed.up {
-            None => Vec::new(),
-            Some(up) => {
-                let focused = self.rows.get(self.focus).map(|r| r.path.clone()).unwrap_or_default();
-                let keep = focused.len().saturating_sub(up);
-                focused[..keep].to_vec()
-            }
-        };
-        match resolve_path(&mut self.root, b, &base, &parsed.segs) {
+        let focus_path = self.rows.get(self.focus).map(|r| r.path.clone()).unwrap_or_default();
+        match resolve_with_climb(&mut self.root, b, &focus_path, &parsed) {
             Some(path) => {
                 self.jump_to(&path, b);
                 format!("jumped to {}", join_path("", &breadcrumb_segments(&self.root, &path)))
@@ -2215,6 +2248,23 @@ mod tests {
         v.nav_sibling(b, false);
         v.flatten_window(b, 40);
         assert_eq!(v.rows[v.focus].path, vec![1]);
+    }
+
+    #[test]
+    fn resolve_with_climb_falls_back_to_ancestors() {
+        let b = br#"{"a":{"b":{"city":"X","id":1},"c":{"city":"Y"}}}"#;
+        let mut root = make_root(b, "t", false);
+        // Focus deep on a.b.id (a scalar leaf).
+        let focus = resolve_path(&mut root, b, &[], &parse_path("a.b.id").segs).expect("focus");
+        // Bare `city` is absent at the root and a.b.id is a scalar, so it climbs
+        // to a.b → a.b.city = "X" (the nearest ancestor that has it).
+        let p = resolve_with_climb(&mut root, b, &focus, &parse_path("city")).expect("climbed");
+        assert_eq!(&b[get(&root, &p).start..get(&root, &p).end], b"\"X\"");
+        // An explicit absolute path still resolves from the root first.
+        let p = resolve_with_climb(&mut root, b, &focus, &parse_path("a.c.city")).expect("abs");
+        assert_eq!(&b[get(&root, &p).start..get(&root, &p).end], b"\"Y\"");
+        // A genuinely-absent key resolves nowhere, even after climbing.
+        assert!(resolve_with_climb(&mut root, b, &focus, &parse_path("nope")).is_none());
     }
 
     #[test]

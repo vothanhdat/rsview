@@ -96,7 +96,10 @@ leading dots, Python-import style: `.actor.login` descends from the cursor,
 `..city` climbs to the parent first (so you can hop to a sibling), `...x` climbs
 two levels, and a bare `.`/`..` just jumps to the focus/parent. `Enter` jumps,
 expanding what it needs on the way; resolution is lazy like everything else, so
-object keys are matched within the first ~100k siblings of a level. `m` bookmarks
+object keys are matched within the first ~100k siblings of a level. **If a path
+isn't found where you typed it, resolution climbs toward the root and retries** —
+so `:city` falls back to `..city`, then `...city`, and so on, landing on the
+nearest ancestor that has it (the footer shows the full path it reached). `m` bookmarks
 the focused node; `'` opens a picker listing your bookmarks by path, where `↵`
 jumps, `d` deletes, and `Esc` closes. Bookmarks are per-pane and live for the
 session.
