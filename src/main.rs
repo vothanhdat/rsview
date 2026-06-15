@@ -350,6 +350,8 @@ enum Mode {
     Goto,
     /// The bookmark picker overlay (`'`): pick a saved node to jump to.
     Marks,
+    /// The keyboard-shortcut cheatsheet overlay (`?`): any key closes it.
+    Help,
 }
 
 /// What a key press asks the run loop to do that it can't do itself: quit, or
@@ -1375,9 +1377,11 @@ fn ui(f: &mut Frame, app: &App, streaming: bool) {
     let footer_row = Rect { y: area.y + area.height.saturating_sub(1), height: 1, ..area };
     render_footer(f, footer_row, app.active_view(), app.flash.as_deref());
 
-    // The bookmark picker floats over everything when open.
-    if app.active_view().mode == Mode::Marks {
-        render_marks(f, area, app.active_view());
+    // An overlay floats over everything when open (only one at a time).
+    match app.active_view().mode {
+        Mode::Marks => render_marks(f, area, app.active_view()),
+        Mode::Help => render_help(f, area),
+        _ => {}
     }
 }
 
@@ -1409,7 +1413,7 @@ fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Option<&str>) {
         Span::styled(format!(" {msg}"), Style::default().fg(Color::Green))
     } else {
         Span::styled(
-            " ↑/↓ move · J/K sibling · enter expand · / search · : goto · m mark · ' marks · y copy · s split · o preview · q quit",
+            " ↑/↓ move · enter expand · / search · : goto · y copy · ? help · q quit",
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -1465,6 +1469,82 @@ fn render_marks(f: &mut Frame, area: Rect, view: &View) {
             title,
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// Draw the keyboard-shortcut cheatsheet as a centered overlay (opened with `?`,
+/// closed by any key). Two columns of key → action in the same floating-card
+/// style as the bookmark picker — this is where the keys trimmed off the footer
+/// live.
+fn render_help(f: &mut Frame, area: Rect) {
+    const ENTRIES: &[(&str, &str)] = &[
+        ("↑/↓  k/j", "move focus"),
+        ("J / K", "next / prev sibling"),
+        ("PgUp/PgDn", "page up / down"),
+        ("Ctrl-D/U", "half page"),
+        ("g  Home", "jump to top"),
+        ("Enter  →", "expand / collapse"),
+        ("←", "collapse / parent"),
+        ("wheel", "scroll the pane"),
+        ("/", "search (live)"),
+        ("↵  ⇧↵", "next / prev match"),
+        (":", "jump to a path"),
+        ("m", "toggle bookmark"),
+        ("'", "bookmark picker"),
+        ("y / Y", "copy value / path"),
+        ("s", "split pane at node"),
+        ("o", "preview pane"),
+        ("\\", "toggle pane layout"),
+        ("+ / -", "grow / shrink pane"),
+        ("Tab/⇧Tab", "switch pane"),
+        ("x", "close pane"),
+        ("?", "toggle this help"),
+        ("q  Esc", "close pane / quit"),
+    ];
+    let key_w = ENTRIES.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
+    let desc_w = ENTRIES.iter().map(|(_, d)| d.chars().count()).max().unwrap_or(0);
+    let rows = ENTRIES.len().div_ceil(2);
+
+    let key_st = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let desc_st = Style::default().fg(Color::Gray);
+    let panel_bg = Color::Indexed(236);
+
+    // One "key  description" cell, key right-aligned so the columns line up.
+    let cell = |k: &str, d: &str| -> Vec<Span<'static>> {
+        vec![
+            Span::styled(format!(" {k:>key_w$}  "), key_st),
+            Span::styled(format!("{d:<desc_w$} "), desc_st),
+        ]
+    };
+
+    // Pair entry i with entry i+rows, so the list reads top-to-bottom per column.
+    let lines: Vec<Line> = (0..rows)
+        .map(|r| {
+            let (k1, d1) = ENTRIES[r];
+            let mut spans = cell(k1, d1);
+            if let Some(&(k2, d2)) = ENTRIES.get(r + rows) {
+                spans.push(Span::styled("  ", desc_st));
+                spans.extend(cell(k2, d2));
+            }
+            Line::from(spans)
+        })
+        .collect();
+
+    let title = " keyboard shortcuts · any key to close ";
+    let col_w = key_w + desc_w + 4; // " " + key + "  " + desc + " "
+    let inner_w = (col_w * 2 + 2).max(title.chars().count()).min(area.width.saturating_sub(2) as usize);
+    let w = inner_w as u16 + 2;
+    let h = (rows as u16 + 2).min(area.height);
+    let x = area.x + area.width.saturating_sub(w) / 2;
+    let y = area.y + area.height.saturating_sub(h) / 2;
+    let rect = Rect { x, y, width: w, height: h };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(Style::default().bg(panel_bg))
+        .title(Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
@@ -1677,6 +1757,12 @@ fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], 
         return KeyOutcome::Continue;
     }
 
+    // Help mode: the shortcut cheatsheet. Any key dismisses it.
+    if app.active_view().mode == Mode::Help {
+        app.active_mut().mode = Mode::Normal;
+        return KeyOutcome::Continue;
+    }
+
     // Any normal-mode key dismisses the previous flash (copy status, …); copy
     // keys below set a fresh one.
     app.flash = None;
@@ -1702,6 +1788,11 @@ fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], 
         }
         KeyCode::Char('m') => {
             app.flash = Some(app.active_mut().toggle_bookmark());
+            return KeyOutcome::Continue;
+        }
+        // `?` opens the full keyboard-shortcut cheatsheet.
+        KeyCode::Char('?') => {
+            app.active_mut().mode = Mode::Help;
             return KeyOutcome::Continue;
         }
         KeyCode::Char('\'') => {

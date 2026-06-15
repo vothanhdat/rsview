@@ -77,9 +77,12 @@ cargo run --release -- path/to/file.json
 | `+` / `-` | grow / shrink the active pane |
 | `Tab` / `Shift-Tab` | switch the active pane |
 | `x` | close the active pane (and any panes split from it) |
+| `?` | show the keyboard-shortcut cheatsheet (any key closes it) |
 | `q`, `Esc` | close the active pane and its children (quit on the last) |
 
-The search box stays open so you can cycle matches in place, then `Esc` to
+The footer shows only the core keys; press `?` for the full cheatsheet of
+everything in this table. The search box stays open so you can cycle matches in
+place, then `Esc` to
 explore the tree at the match. `Shift-Enter` needs a terminal that speaks the
 [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
 (Kitty, WezTerm, foot, Ghostty, recent iTerm2/Konsole/VTE); elsewhere use `↑`.
