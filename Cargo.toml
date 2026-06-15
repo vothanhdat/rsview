@@ -1,6 +1,6 @@
 [package]
 name = "rsview"
-version = "0.6.1"
+version = "0.7.0"
 edition = "2021"
 description = "Browse, navigate and search multi-GB JSON in the terminal at near-constant memory (mmap + lazy byte-range parsing)"
 authors = ["Dat Vo <datvogpt@gmail.com>"]

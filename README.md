@@ -65,7 +65,7 @@ cargo run --release -- path/to/file.json
 | `Enter` / `↓` (in search) | next match |
 | `Shift-Enter` / `↑` (in search) | previous match |
 | `Esc` (in search) | close search (keeps cursor on the match) |
-| `:` | jump to a path — type `data.users[3].city`, `Enter` to go |
+| `:` | jump to a path — absolute (`data.users[3].city`) or relative to the cursor (`.actor`, `..sibling`); `Enter` to go |
 | `m` | bookmark the focused node (press again to remove) |
 | `'` | open the bookmark picker (`↵` jump · `d` delete · `Esc` close) |
 | `y` | copy the focused value — a scalar, or the whole subtree — to the clipboard |
@@ -87,13 +87,18 @@ Input is coalesced per frame, so holding a key or spinning the wheel stays
 snappy instead of lagging behind. Capturing the mouse suppresses the terminal's
 own text selection — hold `Shift` to select/copy as usual.
 
-**Jump & bookmarks.** `:` opens a path prompt — type `data.users[3].city` (a
-leading `$`/`.` is fine, and bracketed keys like `["odd.key"]` work) and `Enter`
-jumps straight there, expanding what it needs on the way. Resolution is lazy like
-everything else, so object keys are matched within the first ~100k siblings of a
-level. `m` bookmarks the focused node; `'` opens a picker listing your bookmarks
-by path, where `↵` jumps, `d` deletes, and `Esc` closes. Bookmarks are per-pane
-and live for the session.
+**Jump & bookmarks.** `:` opens a path prompt that takes two kinds of path. An
+**absolute** path resolves from the document root — `data.users[3].city`, or with
+an explicit leading `$` (`$.data`); bracketed keys like `["odd.key"]` work and may
+hold dots. A **relative** path starts at the focused node and is written with
+leading dots, Python-import style: `.actor.login` descends from the cursor,
+`..city` climbs to the parent first (so you can hop to a sibling), `...x` climbs
+two levels, and a bare `.`/`..` just jumps to the focus/parent. `Enter` jumps,
+expanding what it needs on the way; resolution is lazy like everything else, so
+object keys are matched within the first ~100k siblings of a level. `m` bookmarks
+the focused node; `'` opens a picker listing your bookmarks by path, where `↵`
+jumps, `d` deletes, and `Esc` closes. Bookmarks are per-pane and live for the
+session.
 
 **Copy.** `y` copies the focused node's raw JSON — a scalar literal, or an entire
 subtree — and `Y` copies its path. Copy goes through the terminal itself via the

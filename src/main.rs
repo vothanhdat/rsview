@@ -504,17 +504,48 @@ enum Seg {
     Index(usize),
 }
 
-/// Parse a `goto` path string into segments. Accepts `data.users[3].city`,
-/// `.users[0]`, a leading `$`, and bracketed (optionally quoted) keys that may
-/// themselves contain dots: `["x.y"][2]`. Lenient by design — it's an
-/// interactive jump, not a validator.
-fn parse_path(input: &str) -> Vec<Seg> {
+/// A parsed `goto` path: where resolution starts, then the segments to descend.
+#[derive(Debug, PartialEq)]
+struct ParsedPath {
+    /// `None` → **absolute**: resolve from the document root.
+    /// `Some(up)` → **relative**: start at the focused node and climb `up` levels
+    /// first (0 = the focused node itself, 1 = its parent, …), then descend `segs`.
+    up: Option<usize>,
+    segs: Vec<Seg>,
+}
+
+/// Parse a `goto` path string. Three forms, all lenient (it's an interactive
+/// jump, not a validator):
+/// - **absolute** — a bare path (`data.users[3].city`) or a `$`-prefixed one
+///   (`$.data`, the dot after `$` optional) resolves from the document root.
+/// - **relative** — a leading run of dots resolves from the focused node,
+///   Python-import style: `.child` (from the focus), `..sibling` (climb to the
+///   parent first), `...x` (climb two), and bare `.`/`..` jump to the
+///   focus/parent with no descent.
+///
+/// Bracketed (optionally quoted) keys may hold literal dots: `["x.y"][2]`.
+fn parse_path(input: &str) -> ParsedPath {
+    let s = input.trim();
+    if let Some(rest) = s.strip_prefix('$') {
+        // Explicit absolute. Drop one optional separating dot (`$.a` == `$a`).
+        let rest = rest.strip_prefix('.').unwrap_or(rest);
+        return ParsedPath { up: None, segs: tokenize_segments(rest) };
+    }
+    if s.starts_with('.') {
+        // Relative: the leading dots say how far up to climb (d dots → up d-1).
+        // Dots are ASCII, so the count is also a byte offset into `s`.
+        let dots = s.chars().take_while(|&c| c == '.').count();
+        return ParsedPath { up: Some(dots - 1), segs: tokenize_segments(&s[dots..]) };
+    }
+    ParsedPath { up: None, segs: tokenize_segments(s) }
+}
+
+/// Split a path *body* (after any `$`/leading-dot prefix is stripped) into
+/// key/index segments on `.` and `[…]`.
+fn tokenize_segments(input: &str) -> Vec<Seg> {
     let mut segs = Vec::new();
     let mut cur = String::new();
-    let mut chars = input.trim().chars().peekable();
-    if chars.peek() == Some(&'$') {
-        chars.next();
-    }
+    let mut chars = input.chars();
     while let Some(c) = chars.next() {
         match c {
             '.' => {
@@ -548,12 +579,14 @@ fn parse_path(input: &str) -> Vec<Seg> {
     segs
 }
 
-/// Resolve parsed segments to an index-path into `root`, expanding and scanning
-/// each container as it descends (so a collapsed level still resolves). Returns
-/// `None` if a segment doesn't exist (missing key, out-of-range index, or a
-/// scalar hit mid-path). Object-key lookup scans up to `GOTO_SCAN_CAP` children.
-fn resolve_path(root: &mut Node, b: &[u8], segs: &[Seg]) -> Option<Vec<usize>> {
-    let mut out: Vec<usize> = Vec::new();
+/// Resolve parsed segments to an index-path into `root`, starting from `base`
+/// (the empty slice for an absolute path; the focused node's path, already
+/// climbed, for a relative one), expanding and scanning each container as it
+/// descends (so a collapsed level still resolves). Returns `None` if a segment
+/// doesn't exist (missing key, out-of-range index, or a scalar hit mid-path).
+/// Object-key lookup scans up to `GOTO_SCAN_CAP` children.
+fn resolve_path(root: &mut Node, b: &[u8], base: &[usize], segs: &[Seg]) -> Option<Vec<usize>> {
+    let mut out: Vec<usize> = base.to_vec();
     for seg in segs {
         let node = get_mut(root, &out);
         if !node.is_container() || !node.has_children {
@@ -773,12 +806,24 @@ impl View {
     }
 
     /// Resolve the typed `goto` path and jump to it. Returns a footer status line.
+    /// Absolute paths resolve from the root; relative ones (leading dots) start
+    /// at the focused node and climb `up` levels before descending.
     fn goto_path(&mut self, b: &[u8]) -> String {
-        let segs = parse_path(&self.goto);
-        if segs.is_empty() {
+        let parsed = parse_path(&self.goto);
+        if parsed.up.is_none() && parsed.segs.is_empty() {
             return "empty path".to_string();
         }
-        match resolve_path(&mut self.root, b, &segs) {
+        // A relative path's base is the focused node's path with `up` levels
+        // trimmed off the end (climbing past the root just clamps to the root).
+        let base: Vec<usize> = match parsed.up {
+            None => Vec::new(),
+            Some(up) => {
+                let focused = self.rows.get(self.focus).map(|r| r.path.clone()).unwrap_or_default();
+                let keep = focused.len().saturating_sub(up);
+                focused[..keep].to_vec()
+            }
+        };
+        match resolve_path(&mut self.root, b, &base, &parsed.segs) {
             Some(path) => {
                 self.jump_to(&path, b);
                 format!("jumped to {}", join_path("", &breadcrumb_segments(&self.root, &path)))
@@ -2067,26 +2112,59 @@ mod tests {
     #[test]
     fn parse_path_tokenizes_keys_and_indices() {
         use Seg::*;
+        // A bare path is absolute (no climb).
+        let p = parse_path("data.users[3].city");
+        assert_eq!(p.up, None);
         assert_eq!(
-            parse_path("data.users[3].city"),
+            p.segs,
             vec![Key("data".into()), Key("users".into()), Index(3), Key("city".into())]
         );
-        // Leading $/. are optional and ignored.
-        assert_eq!(parse_path(".users[0]"), vec![Key("users".into()), Index(0)]);
-        assert_eq!(parse_path("$.a"), vec![Key("a".into())]);
+        // `$` marks absolute; the dot right after `$` is optional.
+        assert_eq!(parse_path("$.a"), ParsedPath { up: None, segs: vec![Key("a".into())] });
         // Bracketed (optionally quoted) key holds a literal dot.
-        assert_eq!(parse_path(r#"["x.y"][2]"#), vec![Key("x.y".into()), Index(2)]);
-        assert_eq!(parse_path(""), vec![]);
+        assert_eq!(parse_path(r#"["x.y"][2]"#).segs, vec![Key("x.y".into()), Index(2)]);
+        assert_eq!(parse_path(""), ParsedPath { up: None, segs: vec![] });
+    }
+
+    #[test]
+    fn parse_path_relative_leading_dots() {
+        use Seg::*;
+        // One dot → from the focused node (climb 0).
+        assert_eq!(
+            parse_path(".actor.login"),
+            ParsedPath { up: Some(0), segs: vec![Key("actor".into()), Key("login".into())] }
+        );
+        // Two dots → climb to the parent first (sibling access); three → climb two.
+        assert_eq!(parse_path("..sibling").up, Some(1));
+        assert_eq!(parse_path("...x").up, Some(2));
+        // Bare `.`/`..` are valid jumps with no descent.
+        assert_eq!(parse_path("."), ParsedPath { up: Some(0), segs: vec![] });
+        assert_eq!(parse_path(".."), ParsedPath { up: Some(1), segs: vec![] });
+        // A relative path can lead straight into a bracket: `.[0]`.
+        assert_eq!(parse_path(".[0]"), ParsedPath { up: Some(0), segs: vec![Index(0)] });
     }
 
     #[test]
     fn resolve_path_walks_the_lazy_tree() {
         let b = br#"{"a":{"b":[10,20,30]}}"#;
         let mut root = make_root(b, "t", false);
-        let path = resolve_path(&mut root, b, &parse_path("a.b[1]")).expect("resolved");
+        let path = resolve_path(&mut root, b, &[], &parse_path("a.b[1]").segs).expect("resolved");
         let node = get(&root, &path);
         assert_eq!(&b[node.start..node.end], b"20");
         // A missing key resolves to None.
-        assert!(resolve_path(&mut root, b, &parse_path("a.nope")).is_none());
+        assert!(resolve_path(&mut root, b, &[], &parse_path("a.nope").segs).is_none());
+    }
+
+    #[test]
+    fn resolve_path_descends_from_a_base() {
+        let b = br#"{"a":{"b":[10,20,30],"c":99}}"#;
+        let mut root = make_root(b, "t", false);
+        // Establish a base path (`a`), then descend relatively from it.
+        let base = resolve_path(&mut root, b, &[], &parse_path("a").segs).expect("base");
+        let p = resolve_path(&mut root, b, &base, &parse_path(".b[2]").segs).expect("relative");
+        let node = get(&root, &p);
+        assert_eq!(&b[node.start..node.end], b"30");
+        // Empty segments from a base resolve to the base node itself.
+        assert_eq!(resolve_path(&mut root, b, &base, &[]).expect("base itself"), base);
     }
 }
