@@ -29,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: cargo build --release --locked
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
       - run: pip install pyte
