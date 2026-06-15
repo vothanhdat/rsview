@@ -74,8 +74,18 @@ impl Search {
                         }
                         path.push(i);
                         let bailed = scan(
-                            b, rc.start, rc.end, rc.kind, &rc.label, &needle, 1, &mut path,
-                            &cancel_w, &tx, &mut counter, &mut found,
+                            b,
+                            rc.start,
+                            rc.end,
+                            rc.kind,
+                            &rc.label,
+                            &needle,
+                            1,
+                            &mut path,
+                            &cancel_w,
+                            &tx,
+                            &mut counter,
+                            &mut found,
                         );
                         path.pop();
                         if bailed {
@@ -85,8 +95,18 @@ impl Search {
                     }
                 } else if start < end {
                     scan(
-                        b, start, end, kind, "", &needle, 0, &mut path, &cancel_w, &tx,
-                        &mut counter, &mut found,
+                        b,
+                        start,
+                        end,
+                        kind,
+                        "",
+                        &needle,
+                        0,
+                        &mut path,
+                        &cancel_w,
+                        &tx,
+                        &mut counter,
+                        &mut found,
                     );
                 }
                 done_w.store(true, Ordering::Relaxed);
@@ -190,8 +210,18 @@ fn scan(
         while let Some(rc) = cur.next(b) {
             path.push(i);
             let bailed = scan(
-                b, rc.start, rc.end, rc.kind, &rc.label, needle, depth + 1, path, cancel, tx,
-                counter, found,
+                b,
+                rc.start,
+                rc.end,
+                rc.kind,
+                &rc.label,
+                needle,
+                depth + 1,
+                path,
+                cancel,
+                tx,
+                counter,
+                found,
             );
             path.pop();
             if bailed {

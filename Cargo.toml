@@ -21,6 +21,12 @@ ratatui = "0.29"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Test-only oracle: the property test parses the same bytes with serde_json and
+# asserts our lazy byte-range tree reconstructs an identical value. Not linked
+# into the shipped binary.
+[dev-dependencies]
+serde_json = "1"
+
 [profile.release]
 opt-level = 3
 lto = true

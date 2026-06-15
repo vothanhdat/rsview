@@ -174,9 +174,17 @@ impl Node {
             Kind::Object | Kind::Array => {
                 let arr = matches!(self.kind, Kind::Array);
                 if !self.has_children {
-                    if arr { "[]".into() } else { "{}".into() }
+                    if arr {
+                        "[]".into()
+                    } else {
+                        "{}".into()
+                    }
                 } else if self.expanded {
-                    if arr { "[".into() } else { "{".into() }
+                    if arr {
+                        "[".into()
+                    } else {
+                        "{".into()
+                    }
                 } else {
                     self.collapsed_preview(b)
                 }
@@ -209,7 +217,11 @@ impl Node {
             match cur.next(b) {
                 Some(rc) => {
                     let v = brief(b, &rc);
-                    parts.push(if arr { v } else { format!("{}: {}", rc.label, v) });
+                    parts.push(if arr {
+                        v
+                    } else {
+                        format!("{}: {}", rc.label, v)
+                    });
                 }
                 None => break,
             }
@@ -237,10 +249,18 @@ fn decode_cap(start: usize, end: usize) -> usize {
 fn brief(b: &[u8], rc: &RawChild) -> String {
     match rc.kind {
         Kind::Object => {
-            if container_empty(b, rc.start, rc.end) { "{}".into() } else { "{…}".into() }
+            if container_empty(b, rc.start, rc.end) {
+                "{}".into()
+            } else {
+                "{…}".into()
+            }
         }
         Kind::Array => {
-            if container_empty(b, rc.start, rc.end) { "[]".into() } else { "[…]".into() }
+            if container_empty(b, rc.start, rc.end) {
+                "[]".into()
+            } else {
+                "[…]".into()
+            }
         }
         Kind::Str => {
             let e = decode_cap(rc.start, rc.end);
@@ -278,7 +298,14 @@ struct Row {
 /// Windowed flatten: walk the expanded tree DFS, scanning children on demand,
 /// and stop once `budget` rows exist. A pathologically flat level (millions of
 /// keys) therefore only flattens ~a screenful, not the whole thing.
-fn flatten(node: &mut Node, b: &[u8], depth: usize, budget: usize, out: &mut Vec<Row>, path: &mut Vec<usize>) {
+fn flatten(
+    node: &mut Node,
+    b: &[u8],
+    depth: usize,
+    budget: usize,
+    out: &mut Vec<Row>,
+    path: &mut Vec<usize>,
+) {
     if out.len() >= budget {
         return;
     }
@@ -531,15 +558,24 @@ fn parse_path(input: &str) -> ParsedPath {
     if let Some(rest) = s.strip_prefix('$') {
         // Explicit absolute. Drop one optional separating dot (`$.a` == `$a`).
         let rest = rest.strip_prefix('.').unwrap_or(rest);
-        return ParsedPath { up: None, segs: tokenize_segments(rest) };
+        return ParsedPath {
+            up: None,
+            segs: tokenize_segments(rest),
+        };
     }
     if s.starts_with('.') {
         // Relative: the leading dots say how far up to climb (d dots → up d-1).
         // Dots are ASCII, so the count is also a byte offset into `s`.
         let dots = s.chars().take_while(|&c| c == '.').count();
-        return ParsedPath { up: Some(dots - 1), segs: tokenize_segments(&s[dots..]) };
+        return ParsedPath {
+            up: Some(dots - 1),
+            segs: tokenize_segments(&s[dots..]),
+        };
     }
-    ParsedPath { up: None, segs: tokenize_segments(s) }
+    ParsedPath {
+        up: None,
+        segs: tokenize_segments(s),
+    }
 }
 
 /// Split a path *body* (after any `$`/leading-dot prefix is stripped) into
@@ -831,7 +867,11 @@ impl View {
         }
         self.match_idx = if !self.landed {
             self.landed = true;
-            if dir >= 0 { 0 } else { n - 1 }
+            if dir >= 0 {
+                0
+            } else {
+                n - 1
+            }
         } else if dir >= 0 {
             (self.match_idx + 1) % n
         } else {
@@ -857,11 +897,18 @@ impl View {
         if parsed.up.is_none() && parsed.segs.is_empty() {
             return "empty path".to_string();
         }
-        let focus_path = self.rows.get(self.focus).map(|r| r.path.clone()).unwrap_or_default();
+        let focus_path = self
+            .rows
+            .get(self.focus)
+            .map(|r| r.path.clone())
+            .unwrap_or_default();
         match resolve_with_climb(&mut self.root, b, &focus_path, &parsed) {
             Some(path) => {
                 self.jump_to(&path, b);
-                format!("jumped to {}", join_path("", &breadcrumb_segments(&self.root, &path)))
+                format!(
+                    "jumped to {}",
+                    join_path("", &breadcrumb_segments(&self.root, &path))
+                )
             }
             None => format!("path not found: {}", self.goto.trim()),
         }
@@ -1010,7 +1057,13 @@ struct App {
 impl App {
     fn single(mut view: View) -> App {
         view.id = 0;
-        App { views: vec![view], active: 0, stacked: false, next_id: 1, flash: None }
+        App {
+            views: vec![view],
+            active: 0,
+            stacked: false,
+            next_id: 1,
+            flash: None,
+        }
     }
 
     /// Byte range of the active pane's focused node (its raw JSON value/subtree).
@@ -1030,7 +1083,10 @@ impl App {
                 let slice = &b[s..capped];
                 // Trim trailing whitespace — the document root's range runs to EOF,
                 // so it would otherwise carry the file's final newline.
-                let cut = slice.iter().rposition(|c| !c.is_ascii_whitespace()).map_or(0, |p| p + 1);
+                let cut = slice
+                    .iter()
+                    .rposition(|c| !c.is_ascii_whitespace())
+                    .map_or(0, |p| p + 1);
                 let slice = &slice[..cut];
                 copy_to_clipboard(slice);
                 let n = slice.len();
@@ -1098,7 +1154,9 @@ impl App {
     /// size paging jumps, since each pane reserves a title + footer row.
     fn active_height(&self, area: Rect) -> usize {
         let rects = pane_layout(panes_area(area), &self.weights(), self.stacked);
-        (rects[self.active * 2].height as usize).saturating_sub(1).max(1)
+        (rects[self.active * 2].height as usize)
+            .saturating_sub(1)
+            .max(1)
     }
 
     fn next_pane(&mut self) {
@@ -1169,7 +1227,11 @@ impl App {
         }
         // Chain the origin label off a derived pane's own name; start fresh
         // (no filename prefix) for the document pane.
-        let base = if src.derived { src.name.clone() } else { String::new() };
+        let base = if src.derived {
+            src.name.clone()
+        } else {
+            String::new()
+        };
         let origin = join_path(&base, &breadcrumb_segments(&src.root, &path));
         let root = make_subroot(b, node.label.clone(), node.start, node.end, node.kind);
         Some((root, origin))
@@ -1256,8 +1318,16 @@ fn base64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(T[(n >> 18 & 63) as usize] as char);
         out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -1356,7 +1426,10 @@ fn render_separator(f: &mut Frame, sep: Rect, stacked: bool) {
 /// rule. `streaming` only affects the (non-derived) document pane's title.
 /// The vertical span used for panes: everything above the global footer row.
 fn panes_area(area: Rect) -> Rect {
-    Rect { height: area.height.saturating_sub(1), ..area }
+    Rect {
+        height: area.height.saturating_sub(1),
+        ..area
+    }
 }
 
 /// Draw every pane (side by side or stacked) above a single global footer that
@@ -1371,10 +1444,20 @@ fn ui(f: &mut Frame, app: &App, streaming: bool) {
             render_separator(f, rects[i * 2 - 1], app.stacked);
         }
         let view = &app.views[i];
-        render_pane(f, rects[i * 2], view, i == app.active, streaming && !view.derived);
+        render_pane(
+            f,
+            rects[i * 2],
+            view,
+            i == app.active,
+            streaming && !view.derived,
+        );
     }
     // One global footer at the very bottom, reflecting the active pane's mode.
-    let footer_row = Rect { y: area.y + area.height.saturating_sub(1), height: 1, ..area };
+    let footer_row = Rect {
+        y: area.y + area.height.saturating_sub(1),
+        height: 1,
+        ..area
+    };
     render_footer(f, footer_row, app.active_view(), app.flash.as_deref());
 
     // An overlay floats over everything when open (only one at a time).
@@ -1401,7 +1484,10 @@ fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Option<&str>) {
             format!("{}{} matches", count, more)
         };
         Span::styled(
-            format!(" /{}   {} · ↵/↓ next · ⇧↵/↑ prev · esc close", view.query, pos),
+            format!(
+                " /{}   {} · ↵/↓ next · ⇧↵/↑ prev · esc close",
+                view.query, pos
+            ),
             Style::default().fg(Color::Yellow),
         )
     } else if view.mode == Mode::Goto {
@@ -1433,12 +1519,21 @@ fn render_marks(f: &mut Frame, area: Rect, view: &View) {
     let title = " bookmarks · ↵ jump · d delete · esc ";
     let title_w = title.chars().count();
     let longest = items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
-    let inner_w = longest.max(title_w).min(area.width.saturating_sub(4) as usize);
+    let inner_w = longest
+        .max(title_w)
+        .min(area.width.saturating_sub(4) as usize);
     let w = inner_w as u16 + 4;
-    let h = (items.len() as u16 + 2).min(area.height.saturating_sub(2)).max(3);
+    let h = (items.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
-    let rect = Rect { x, y, width: w, height: h };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     // Read as a floating card above the dimmed content: a solid dark fill with a
     // bright, bold border/title, and a full-width selection bar (padded out so the
@@ -1463,11 +1558,17 @@ fn render_marks(f: &mut Frame, area: Rect, view: &View) {
         .collect();
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .style(Style::default().bg(panel_bg))
         .title(Span::styled(
             title,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
@@ -1502,11 +1603,21 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("?", "toggle this help"),
         ("q  Esc", "close pane / quit"),
     ];
-    let key_w = ENTRIES.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
-    let desc_w = ENTRIES.iter().map(|(_, d)| d.chars().count()).max().unwrap_or(0);
+    let key_w = ENTRIES
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0);
+    let desc_w = ENTRIES
+        .iter()
+        .map(|(_, d)| d.chars().count())
+        .max()
+        .unwrap_or(0);
     let rows = ENTRIES.len().div_ceil(2);
 
-    let key_st = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let key_st = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let desc_st = Style::default().fg(Color::Gray);
     let panel_bg = Color::Indexed(236);
 
@@ -1533,18 +1644,34 @@ fn render_help(f: &mut Frame, area: Rect) {
 
     let title = " keyboard shortcuts · any key to close ";
     let col_w = key_w + desc_w + 4; // " " + key + "  " + desc + " "
-    let inner_w = (col_w * 2 + 2).max(title.chars().count()).min(area.width.saturating_sub(2) as usize);
+    let inner_w = (col_w * 2 + 2)
+        .max(title.chars().count())
+        .min(area.width.saturating_sub(2) as usize);
     let w = inner_w as u16 + 2;
     let h = (rows as u16 + 2).min(area.height);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
-    let rect = Rect { x, y, width: w, height: h };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .style(Style::default().bg(panel_bg))
-        .title(Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
     f.render_widget(Clear, rect);
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
@@ -1558,13 +1685,25 @@ fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: 
     // Title: `↳ origin   focus/rows+` plus the focus breadcrumb.
     let marker = if view.derived { "↳ " } else { "" };
     let prefix = if streaming {
-        format!(" {marker}{}   {}/{}+   ⟳ streaming", view.name, view.focus + 1, view.rows.len())
+        format!(
+            " {marker}{}   {}/{}+   ⟳ streaming",
+            view.name,
+            view.focus + 1,
+            view.rows.len()
+        )
     } else {
-        format!(" {marker}{}   {}/{}+", view.name, view.focus + 1, view.rows.len())
+        format!(
+            " {marker}{}   {}/{}+",
+            view.name,
+            view.focus + 1,
+            view.rows.len()
+        )
     };
     let prefix_w = prefix.chars().count();
     let title_style = if active {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
@@ -1586,7 +1725,10 @@ fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: 
     }
     f.render_widget(Paragraph::new(Line::from(title)), chunks[0]);
 
-    let cur_match = view.search.as_ref().and_then(|s| s.matches.get(view.match_idx));
+    let cur_match = view
+        .search
+        .as_ref()
+        .and_then(|s| s.matches.get(view.match_idx));
 
     let h = chunks[1].height as usize;
     let mut lines = Vec::new();
@@ -1610,7 +1752,10 @@ fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: 
             // panes keep their focus (it returns on Tab) but draw it as a normal
             // row.
             let text = format!("{indent}{marker} {}: {}", r.label, r.value);
-            Line::from(Span::styled(text, Style::default().add_modifier(Modifier::REVERSED)))
+            Line::from(Span::styled(
+                text,
+                Style::default().add_modifier(Modifier::REVERSED),
+            ))
         } else if cur_match == Some(&r.path) || view.match_set.contains(&r.path) {
             // A search hit: whole row yellow (current match also bold).
             let text = format!("{indent}{marker} {}: {}", r.label, r.value);
@@ -1659,7 +1804,12 @@ fn render_frame(
 /// Apply one key press. Everything self-contained happens here; search
 /// (re)launch is deferred to the caller via `KeyOutcome::Relaunch` because it
 /// needs a byte `Source`.
-fn process_key(app: &mut App, k: ratatui::crossterm::event::KeyEvent, b: &[u8], h: usize) -> KeyOutcome {
+fn process_key(
+    app: &mut App,
+    k: ratatui::crossterm::event::KeyEvent,
+    b: &[u8],
+    h: usize,
+) -> KeyOutcome {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let shift = k.modifiers.contains(KeyModifiers::SHIFT);
 
@@ -2276,13 +2426,33 @@ mod tests {
         assert_eq!(p.up, None);
         assert_eq!(
             p.segs,
-            vec![Key("data".into()), Key("users".into()), Index(3), Key("city".into())]
+            vec![
+                Key("data".into()),
+                Key("users".into()),
+                Index(3),
+                Key("city".into())
+            ]
         );
         // `$` marks absolute; the dot right after `$` is optional.
-        assert_eq!(parse_path("$.a"), ParsedPath { up: None, segs: vec![Key("a".into())] });
+        assert_eq!(
+            parse_path("$.a"),
+            ParsedPath {
+                up: None,
+                segs: vec![Key("a".into())]
+            }
+        );
         // Bracketed (optionally quoted) key holds a literal dot.
-        assert_eq!(parse_path(r#"["x.y"][2]"#).segs, vec![Key("x.y".into()), Index(2)]);
-        assert_eq!(parse_path(""), ParsedPath { up: None, segs: vec![] });
+        assert_eq!(
+            parse_path(r#"["x.y"][2]"#).segs,
+            vec![Key("x.y".into()), Index(2)]
+        );
+        assert_eq!(
+            parse_path(""),
+            ParsedPath {
+                up: None,
+                segs: vec![]
+            }
+        );
     }
 
     #[test]
@@ -2291,16 +2461,37 @@ mod tests {
         // One dot → from the focused node (climb 0).
         assert_eq!(
             parse_path(".actor.login"),
-            ParsedPath { up: Some(0), segs: vec![Key("actor".into()), Key("login".into())] }
+            ParsedPath {
+                up: Some(0),
+                segs: vec![Key("actor".into()), Key("login".into())]
+            }
         );
         // Two dots → climb to the parent first (sibling access); three → climb two.
         assert_eq!(parse_path("..sibling").up, Some(1));
         assert_eq!(parse_path("...x").up, Some(2));
         // Bare `.`/`..` are valid jumps with no descent.
-        assert_eq!(parse_path("."), ParsedPath { up: Some(0), segs: vec![] });
-        assert_eq!(parse_path(".."), ParsedPath { up: Some(1), segs: vec![] });
+        assert_eq!(
+            parse_path("."),
+            ParsedPath {
+                up: Some(0),
+                segs: vec![]
+            }
+        );
+        assert_eq!(
+            parse_path(".."),
+            ParsedPath {
+                up: Some(1),
+                segs: vec![]
+            }
+        );
         // A relative path can lead straight into a bracket: `.[0]`.
-        assert_eq!(parse_path(".[0]"), ParsedPath { up: Some(0), segs: vec![Index(0)] });
+        assert_eq!(
+            parse_path(".[0]"),
+            ParsedPath {
+                up: Some(0),
+                segs: vec![Index(0)]
+            }
+        );
     }
 
     #[test]
@@ -2368,6 +2559,214 @@ mod tests {
         let node = get(&root, &p);
         assert_eq!(&b[node.start..node.end], b"30");
         // Empty segments from a base resolve to the base node itself.
-        assert_eq!(resolve_path(&mut root, b, &base, &[]).expect("base itself"), base);
+        assert_eq!(
+            resolve_path(&mut root, b, &base, &[]).expect("base itself"),
+            base
+        );
+    }
+
+    // --- robustness & correctness guards ---
+
+    /// Deterministic xorshift64* PRNG — reproducible, and no `rand` dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// A short random string spanning the bytes that stress JSON decoding —
+    /// quotes, backslashes, control chars, and multi-byte UTF-8 — all of which
+    /// serde_json escapes on the way out and our `decode_str` must restore.
+    fn gen_string(rng: &mut Rng) -> String {
+        const POOL: &[char] = &[
+            'a', 'Z', '0', '"', '\\', '/', '\n', '\t', '\u{1}', ' ', ':', '{', '[', ']', ',', 'é',
+            '☃', '🦀',
+        ];
+        (0..rng.below(8))
+            .map(|_| POOL[(rng.next() as usize) % POOL.len()])
+            .collect()
+    }
+
+    /// Build a random JSON value, depth-limited. Object keys are index-prefixed so
+    /// they're unique — otherwise serde_json's last-wins map would disagree with
+    /// our tree, which keeps every child.
+    fn gen_json(rng: &mut Rng, depth: u32) -> serde_json::Value {
+        use serde_json::Value;
+        // At depth 0 emit a scalar only (arms 4..=8 below).
+        let pick = if depth == 0 {
+            rng.below(5) + 4
+        } else {
+            rng.below(9)
+        };
+        match pick {
+            0 => Value::Array(
+                (0..rng.below(5))
+                    .map(|_| gen_json(rng, depth - 1))
+                    .collect(),
+            ),
+            1 => {
+                let mut m = serde_json::Map::new();
+                for i in 0..rng.below(5) {
+                    m.insert(
+                        format!("k{i}_{}", gen_string(rng)),
+                        gen_json(rng, depth - 1),
+                    );
+                }
+                Value::Object(m)
+            }
+            2 | 3 => Value::Bool(rng.next() & 1 == 0),
+            4 => Value::Null,
+            5 | 6 => Value::from((rng.next() as i64).wrapping_sub(i64::MAX / 2)),
+            7 => {
+                // Use the float only if serde_json round-trips it bit-for-bit.
+                // (A few extreme denormals don't — that's the oracle's float
+                // fidelity, not our scanner, and would make the test flaky.)
+                let f = f64::from_bits(rng.next());
+                let round_trips = f.is_finite()
+                    && serde_json::from_str::<f64>(&serde_json::to_string(&f).unwrap())
+                        .is_ok_and(|g| g.to_bits() == f.to_bits());
+                if round_trips {
+                    Value::from(f)
+                } else {
+                    Value::from((rng.next() as i64).wrapping_sub(i64::MAX / 2))
+                }
+            }
+            _ => Value::String(gen_string(rng)),
+        }
+    }
+
+    /// Fully materialize the lazy tree into a serde_json::Value: walk every child
+    /// (scanning each container on the way) and re-parse scalar byte ranges with
+    /// serde_json. So this exercises *our* structural scan and boundary-finding;
+    /// scalar decoding is delegated to the oracle on the exact range we located.
+    fn materialize(node: &mut Node, b: &[u8]) -> serde_json::Value {
+        use serde_json::Value;
+        if !node.is_container() {
+            return serde_json::from_slice(&b[node.start..node.end]).expect("scalar slice parses");
+        }
+        if node.has_children && !node.expanded {
+            node.toggle();
+        }
+        if node.has_children {
+            let mut i = 0;
+            loop {
+                node.ensure_child(b, i);
+                if i >= node.children.len() {
+                    break;
+                }
+                i += 1;
+            }
+        }
+        if matches!(node.kind, Kind::Array) {
+            Value::Array(
+                node.children
+                    .iter_mut()
+                    .map(|c| materialize(c, b))
+                    .collect(),
+            )
+        } else {
+            let mut m = serde_json::Map::new();
+            for c in node.children.iter_mut() {
+                let k = c.label.clone();
+                m.insert(k, materialize(c, b));
+            }
+            Value::Object(m)
+        }
+    }
+
+    /// **Oracle test.** For thousands of random documents — in both compact and
+    /// pretty (whitespace-heavy) encodings — our lazy byte-range tree must
+    /// reconstruct exactly what serde_json parses from the same bytes. This is the
+    /// correctness backbone of the lazy parser: if a boundary is off by a byte,
+    /// this fails.
+    #[test]
+    fn lazy_tree_matches_serde_json() {
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
+        for _ in 0..2000 {
+            let expected = gen_json(&mut rng, 4);
+            for encoded in [
+                serde_json::to_string(&expected).unwrap(),
+                serde_json::to_string_pretty(&expected).unwrap(),
+            ] {
+                let b = encoded.as_bytes();
+                let mut root = make_root(b, "t", false);
+                assert_eq!(
+                    materialize(&mut root, b),
+                    expected,
+                    "mismatch on: {encoded}"
+                );
+            }
+        }
+    }
+
+    /// **Laziness guard.** Opening a level with a million children must flatten
+    /// only ~a screenful and scan only that many children — never enumerate the
+    /// whole thing. This is the invariant that keeps memory and first-paint
+    /// constant on a huge file; a non-windowed flatten would blow it up.
+    #[test]
+    fn windowed_flatten_stays_bounded_on_a_huge_level() {
+        let n = 1_000_000;
+        let mut s = String::with_capacity(n * 2 + 2);
+        s.push('[');
+        for i in 0..n {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push('0');
+        }
+        s.push(']');
+        let b = s.as_bytes();
+
+        let mut root = make_root(b, "t", false); // the array, auto-expanded
+        let budget = 256;
+        let mut rows = Vec::new();
+        let mut path = Vec::new();
+        flatten(&mut root, b, 0, budget, &mut rows, &mut path);
+
+        assert!(
+            rows.len() <= budget,
+            "flatten exceeded its row budget: {}",
+            rows.len()
+        );
+        assert!(
+            root.children.len() <= budget,
+            "enumerated the level eagerly: scanned {} of {n}",
+            root.children.len()
+        );
+    }
+
+    /// The high-level navigation path must also survive arbitrary bytes: building
+    /// a root, flattening a window, and resolving random goto paths against the
+    /// result may never panic. (Pairs with the scanner-level fuzz.)
+    #[test]
+    fn fuzz_make_root_and_navigation_never_panic() {
+        const ALPHABET: &[u8] = b"{}[]\":,\\ \t\n0123456789.-eEtfnul";
+        const GOTO: &[&str] = &["a", ".a", "..a", "a.b[0]", "$.x", "[3]", "...z", "k0_", ""];
+        let mut rng = Rng(0x1234_5678_9ABC_DEF0);
+        for _ in 0..3000 {
+            let len = (rng.next() % 120) as usize;
+            let buf: Vec<u8> = (0..len)
+                .map(|_| ALPHABET[(rng.next() as usize) % ALPHABET.len()])
+                .collect();
+            let b = &buf[..];
+            for jsonl in [false, true] {
+                let mut root = make_root(b, "x", jsonl);
+                let mut rows = Vec::new();
+                let mut path = Vec::new();
+                flatten(&mut root, b, 0, 128, &mut rows, &mut path);
+                let parsed = parse_path(GOTO[(rng.next() as usize) % GOTO.len()]);
+                let focus = rows.last().map(|r| r.path.clone()).unwrap_or_default();
+                let _ = resolve_with_climb(&mut root, b, &focus, &parsed);
+            }
+        }
     }
 }

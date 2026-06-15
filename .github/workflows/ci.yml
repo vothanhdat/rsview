@@ -1,0 +1,36 @@
+name: ci
+
+# Quality gate on every push to main and every PR: format, lint (warnings are
+# errors), unit/fuzz/property tests, and the pty-driven end-to-end suite. The
+# release workflow only builds binaries — this is what keeps regressions out.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only token: this workflow only reads the checkout, nothing else.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Add clippy + rustfmt (rustup is preinstalled on the runner)
+        run: rustup component add clippy rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: cargo build --release --locked
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - run: pip install pyte
+      - run: python tests/e2e/tui_e2e.py target/release/rsview

@@ -37,17 +37,20 @@ pub fn skip_ws(b: &[u8], mut i: usize, end: usize) -> usize {
     i
 }
 
-/// `i` points at the opening quote; returns the index just past the closing quote.
+/// `i` points at the opening quote; returns the index just past the closing
+/// quote. Never returns past `end`: a trailing backslash (`"\` at the buffer
+/// edge) would otherwise make the `+= 2` overshoot, and callers treat the result
+/// as a byte range — an end past the buffer reads out of bounds later.
 pub fn skip_string(b: &[u8], mut i: usize, end: usize) -> usize {
     i += 1; // past opening quote
     while i < end {
         match b[i] {
-            b'\\' => i += 2,    // escaped char (incl. \" and \uXXXX) — never a closer
+            b'\\' => i += 2, // escaped char (incl. \" and \uXXXX) — never a closer
             b'"' => return i + 1,
             _ => i += 1,
         }
     }
-    i
+    i.min(end) // clamp a trailing-backslash overshoot back to the buffer end
 }
 
 /// `i` points at `{` or `[`; returns the index just past the matching closer,
@@ -225,7 +228,10 @@ impl Cursor {
                 return None;
             }
             let label = self.index.to_string();
-            let vend = skip_value(b, i, self.end);
+            // `.max(i + 1)`: a stray byte that isn't the start of a value (e.g. a
+            // `,`/`]` in malformed NDJSON) wouldn't advance `skip_value`, so step
+            // over it — the stream must always progress or it loops forever.
+            let vend = skip_value(b, i, self.end).max(i + 1);
             let kind = value_kind(b, i);
             self.pos = vend;
             self.index += 1;
@@ -334,6 +340,82 @@ mod tests {
             while cur.next(src).is_some() {
                 n += 1;
                 assert!(n < 1000, "cursor failed to terminate on {src:?}");
+            }
+        }
+    }
+
+    /// A tiny deterministic PRNG (xorshift64*) so the fuzz tests are reproducible
+    /// and need no `rand` dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next() & 0xFF) as u8
+        }
+    }
+
+    /// Throw pseudo-random bytes — biased toward JSON's structural characters so
+    /// the scanner actually exercises its branches — at every byte-level entry
+    /// point. None may panic, index out of bounds, or fail to terminate. This is
+    /// the property the whole multi-GB promise rests on: no input crashes us.
+    #[test]
+    fn fuzz_scanner_never_panics_or_hangs() {
+        // The alphabet the scanner cares about, plus a couple of multi-byte
+        // UTF-8 lead/continuation bytes to prove the >= 0x80 assumption holds.
+        const ALPHABET: &[u8] = b"{}[]\":,\\ \t\n0123456789.-+eEtfnaul\xc3\xa9\xe2\x82";
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..4000 {
+            let len = (rng.next() % 80) as usize;
+            let buf: Vec<u8> = (0..len)
+                .map(|_| {
+                    if rng.byte() < 200 {
+                        ALPHABET[(rng.next() as usize) % ALPHABET.len()]
+                    } else {
+                        rng.byte()
+                    }
+                })
+                .collect();
+            let b = &buf[..];
+
+            // Bracketed-container, array, and NDJSON-line cursors all over the
+            // whole buffer; each `next()` must make progress and eventually stop.
+            for mut cur in [
+                Cursor::new(0, b.len(), false),
+                Cursor::new(0, b.len(), true),
+            ] {
+                let mut steps = 0;
+                while cur.next(b).is_some() {
+                    steps += 1;
+                    assert!(steps <= b.len() + 2, "cursor did not terminate");
+                }
+            }
+            let mut lines = Cursor::lines(0, b.len());
+            let mut steps = 0;
+            while lines.next(b).is_some() {
+                steps += 1;
+                assert!(steps <= b.len() + 2, "line cursor did not terminate");
+            }
+
+            // Range-taking helpers over random sub-ranges (incl. empty / reversed-
+            // looking / past-end starts, which callers must never produce but the
+            // primitives should still survive).
+            for _ in 0..8 {
+                let i = (rng.next() as usize) % (b.len() + 1);
+                let j = (rng.next() as usize) % (b.len() + 1);
+                let (lo, hi) = (i.min(j), i.max(j));
+                let _ = skip_ws(b, lo, hi);
+                let _ = skip_value(b, lo, hi);
+                let _ = skip_string(b, lo, hi);
+                let _ = skip_container(b, lo, hi);
+                let _ = container_empty(b, lo, hi);
+                let _ = decode_str(b, lo, hi);
             }
         }
     }
