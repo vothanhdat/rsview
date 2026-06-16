@@ -389,6 +389,7 @@ enum EnsureChild {
 /// caller can paint what's flattened and resume next frame (the skip is
 /// preserved on the cursor). `deadline = None` drains eagerly (used by jumps,
 /// which must reach a target row synchronously).
+#[allow(clippy::too_many_arguments)]
 fn flatten(
     node: &mut Node,
     b: &[u8],
