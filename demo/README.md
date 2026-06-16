@@ -6,9 +6,9 @@ so it can be refreshed whenever the UI changes.
 ```sh
 cargo build --release                 # 1. build the binary
 node demo/gen.mjs demo/big.json 1     # 2. generate a ~1 GB sample (deterministic)
-brew install vhs webp                 # 3. one-time: recorder (vhs) + img2webp (webp)
-RSVIEW_NO_ENHANCED_KEYS=1 PATH="target/release:$PATH" vhs demo/demo.tape   # 4. -> frames/
-img2webp -loop 0 -d 20 -lossless -m 6 frames/frame-text-*.png -o docs/demo.webp   # 5. -> webp
+brew install vhs ffmpeg webp          # 3. one-time: recorder + ffmpeg + img2webp
+RSVIEW_NO_ENHANCED_KEYS=1 PATH="$PWD/target/release:$PATH" vhs demo/demo.tape   # 4. -> frames/
+node demo/assemble-webp.mjs           # 5. frames/ -> docs/demo.webp
 rm -rf frames demo/big.json
 ```
 
@@ -18,13 +18,18 @@ rm -rf frames demo/big.json
 - **`demo.tape`** is a [vhs](https://github.com/charmbracelet/vhs) script: it
   types real keystrokes into the real binary and captures the result. Adjust the
   `Sleep`/key lines after the first render to taste.
-- **No GIF — lossless PNG frames → WebP.** A GIF's 256-color palette + dithering
-  wreck terminal text. We render to full-color PNG frames (`frames/`) and assemble
-  a lossless animated WebP with `img2webp`. It auto-coalesces static runs and
-  stores only changed rectangles, so full-color lossless stays ~700 KB even at
-  3x render — sharper than the GIF route. `-d 20` = 50fps. GitHub renders
-  animated WebP inline. Use `frame-text-*` (content); `frame-cursor-*` is just a
-  transparent cursor overlay (rsview hides the cursor anyway).
+- **No GIF — lossless PNG frames → animated WebP.** GIF's 256-color palette +
+  dithering wreck terminal text; a `.webm` intermediate looks fine but VP9
+  quantization perturbs static stretches enough that img2webp can no longer
+  coalesce them, blowing the file size up. vhs's PNG-sequence output is
+  byte-identical between unchanged frames, so img2webp lossless collapses every
+  Sleep to a single stored frame. GitHub renders animated WebP inline.
+- **`assemble-webp.mjs`** does the PNG → WebP conversion. vhs writes two
+  parallel sequences into `frames/`: `frame-text-*.png` (terminal content, no
+  cursor) and `frame-cursor-*.png` (transparent cursor overlay). The script
+  composites them with ffmpeg's `overlay` filter, then runs img2webp lossless
+  with `-d <ms>` matched to the tape's `Set Framerate`. End result keeps the
+  blinking cursor at the shell prompt that the cursor-less path was dropping.
 - **`RSVIEW_NO_ENHANCED_KEYS=1` is required** on the vhs invocation. vhs records
   through a headless `ttyd` terminal that never answers rsview's keyboard-
   enhancement probe, so without it rsview stalls ~2s on a blank screen at startup
