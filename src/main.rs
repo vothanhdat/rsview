@@ -424,9 +424,9 @@ fn flatten(
                     EnsureChild::Done => break, // level fully enumerated
                     EnsureChild::Busy => {
                         *incomplete = true; // skip in flight — paint now, resume next frame
-                        // Inline placeholder at the spot the next child will fill,
-                        // indented to the child level, so the wait reads as "this
-                        // node is still loading" rather than a frozen screen.
+                                            // Inline placeholder at the spot the next child will fill,
+                                            // indented to the child level, so the wait reads as "this
+                                            // node is still loading" rather than a frozen screen.
                         if out.len() < budget {
                             out.push(Row {
                                 depth: depth + 1,
@@ -603,7 +603,7 @@ fn make_root(b: &[u8], name: &str, jsonl: bool) -> Node {
     let mut root = Node {
         label: name.into(),
         start,
-        end: b.len(), // root spans to EOF; the scanner stops at the real closer
+        end: b.len(),     // root spans to EOF; the scanner stops at the real closer
         end_exact: false, // provisional (to EOF) — copy re-resolves bounded by its cap
         kind,
         is_index: false,
@@ -1229,11 +1229,7 @@ impl View {
 
         // Clamp focus to the last *real* row — never the trailing loading
         // placeholder (it's not a navigable node, and its path is empty).
-        let max_focus = self
-            .rows
-            .iter()
-            .rposition(|r| !r.loading)
-            .unwrap_or(0);
+        let max_focus = self.rows.iter().rposition(|r| !r.loading).unwrap_or(0);
         if self.focus > max_focus {
             self.focus = max_focus;
         }
@@ -1307,7 +1303,10 @@ impl App {
                 copy_to_clipboard(slice);
                 let n = slice.len();
                 if truncated {
-                    format!("copied {n} B (truncated at {} KiB cap)", COPY_MAX_BYTES >> 10)
+                    format!(
+                        "copied {n} B (truncated at {} KiB cap)",
+                        COPY_MAX_BYTES >> 10
+                    )
                 } else {
                     format!("copied value ({n} B)")
                 }
@@ -1985,7 +1984,9 @@ fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: 
             let indent = "  ".repeat(r.depth);
             lines.push(Line::from(Span::styled(
                 format!("{indent}{} loading…", spinner_frame()),
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
             )));
             continue;
         }
@@ -2732,7 +2733,12 @@ mod tests {
         eprintln!("drain to complete: {t_drain:?}   frames={frames}  rows={final_rows}");
         eprintln!("TOTAL            : {:?}", t0.elapsed());
         for r in v.rows.iter().filter(|r| !r.loading) {
-            eprintln!("  row d{} {:?}: {}", r.depth, r.label, truncate(&r.value, 60));
+            eprintln!(
+                "  row d{} {:?}: {}",
+                r.depth,
+                r.label,
+                truncate(&r.value, 60)
+            );
         }
         // Collapse the root: the collapsed preview must NOT re-scan the 1 GB
         // `users` to reach `meta` — it stops at `…` (bounded by PREVIEW_SKIP_BUDGET)
@@ -2762,9 +2768,18 @@ mod tests {
         // The point of the change: the first paint is fast and bounded, not the
         // whole skip; collapsing never pays the giant skip; and re-expanding reuses
         // the cached children instead of re-scanning.
-        assert!(t_first < Duration::from_millis(100), "first paint should be fast");
-        assert!(t_collapse < Duration::from_millis(50), "collapse should be instant");
-        assert!(t_reexpand < Duration::from_millis(50), "re-expand should reuse the cache");
+        assert!(
+            t_first < Duration::from_millis(100),
+            "first paint should be fast"
+        );
+        assert!(
+            t_collapse < Duration::from_millis(50),
+            "collapse should be instant"
+        );
+        assert!(
+            t_reexpand < Duration::from_millis(50),
+            "re-expand should reuse the cache"
+        );
     }
 
     #[test]
