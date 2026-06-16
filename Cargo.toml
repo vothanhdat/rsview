@@ -27,12 +27,6 @@ libc = "0.2"
 [dev-dependencies]
 serde_json = "1"
 
-# rsview is a binary-only crate (no src/lib.rs), so docs.rs's default `cargo
-# rustdoc --lib` fails with "no library targets found". An empty targets list
-# tells docs.rs not to attempt the build — no red badge, no useless docs page.
-[package.metadata.docs.rs]
-targets = []
-
 [profile.release]
 opt-level = 3
 lto = true
