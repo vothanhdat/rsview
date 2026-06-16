@@ -41,7 +41,7 @@ Then:
 ```sh
 rsview path/to/file.json
 cat file.json | rsview                            # pipe it (NDJSON auto-detected)
-curl -s https://api.example.com/big.json | rsview # streams as it downloads
+curl -s https://raw.githubusercontent.com/json-iterator/test-data/refs/heads/master/large-file.json | rsview # streams as it downloads
 ```
 
 From a checkout: `cargo run --release -- file.json`.
