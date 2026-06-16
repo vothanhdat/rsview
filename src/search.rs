@@ -8,6 +8,7 @@
 
 use crate::scanner::{decode_str, Cursor, Kind, MAX_DEPTH};
 use crate::source::Source;
+use regex::{Regex, RegexBuilder};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, Sender},
@@ -18,6 +19,65 @@ use std::thread::{self, JoinHandle};
 /// Cap on collected matches — bounds memory and keeps a pathological "every key
 /// matches" query from running forever.
 const MAX_MATCHES: usize = 5000;
+
+/// What the user typed in the `/` prompt, compiled into something the worker
+/// can match against. Three flavours:
+/// - `re:<regex>` → full Rust regex, case-insensitive
+/// - `g:<glob>`  → `*` (any chars), `?` (one char); everything else literal
+/// - anything else → case-insensitive substring (the default since v0.1.0)
+pub enum Pattern {
+    /// Lowercased needle; match via `hay.to_lowercase().contains(needle)`.
+    Literal(String),
+    /// Compiled regex (already case-insensitive).
+    Regex(Regex),
+}
+
+impl Pattern {
+    /// Compile the typed query. Returns the parsed pattern, or a footer-ready
+    /// error string when `re:`/`g:` was used and the inner expression is bad.
+    pub fn parse(s: &str) -> Result<Pattern, String> {
+        if let Some(inner) = s.strip_prefix("re:") {
+            build_regex(inner).map(Pattern::Regex)
+        } else if let Some(inner) = s.strip_prefix("g:") {
+            build_regex(&glob_to_regex(inner)).map(Pattern::Regex)
+        } else {
+            Ok(Pattern::Literal(s.to_lowercase()))
+        }
+    }
+
+    fn is_match(&self, hay: &str) -> bool {
+        match self {
+            Pattern::Literal(n) => hay.to_lowercase().contains(n.as_str()),
+            Pattern::Regex(r) => r.is_match(hay),
+        }
+    }
+}
+
+fn build_regex(src: &str) -> Result<Regex, String> {
+    RegexBuilder::new(src)
+        .case_insensitive(true)
+        .build()
+        .map_err(|e| format!("bad pattern: {e}"))
+}
+
+/// Translate a shell-style glob (`*` = any run, `?` = one char) into an
+/// unanchored regex. All other regex metacharacters are escaped, so a glob
+/// behaves intuitively (`foo.bar` matches the literal dot).
+pub fn glob_to_regex(g: &str) -> String {
+    let mut out = String::with_capacity(g.len() + 4);
+    for c in g.chars() {
+        match c {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            '.' | '+' | '(' | ')' | '|' | '^' | '$' | '\\' | '{' | '}' | '[' | ']' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
 
 /// One running (or finished) search. Owns the worker thread's cancel flag and
 /// the receiving end of its match stream.
@@ -34,13 +94,14 @@ pub struct Search {
 
 impl Search {
     /// Spawn a worker that scans the subtree rooted at byte range `[start, end)`
-    /// for `term` (case-insensitive) and streams the path of every matching node
-    /// back over a channel. Paths are relative to that root, so a pane viewing a
-    /// sub-range gets matches that line up with its own rows. For the whole
-    /// document pass the document root's range; for NDJSON, the whole buffer.
+    /// for `pattern` (case-insensitive) and streams the path of every matching
+    /// node back over a channel. Paths are relative to that root, so a pane
+    /// viewing a sub-range gets matches that line up with its own rows. For the
+    /// whole document pass the document root's range; for NDJSON, the whole
+    /// buffer.
     pub fn spawn(
         mmap: Arc<Source>,
-        term: String,
+        pattern: Pattern,
         jsonl: bool,
         start: usize,
         end: usize,
@@ -51,7 +112,6 @@ impl Search {
         let (tx, rx) = mpsc::channel();
         let cancel_w = cancel.clone();
         let done_w = done.clone();
-        let needle = term.to_lowercase();
 
         // A generous stack for the worker: `scan` recurses per nesting level, and
         // while MAX_DEPTH caps that, a roomy stack keeps margin regardless of how
@@ -79,7 +139,7 @@ impl Search {
                             rc.end,
                             rc.kind,
                             &rc.label,
-                            &needle,
+                            &pattern,
                             1,
                             &mut path,
                             &cancel_w,
@@ -100,7 +160,7 @@ impl Search {
                         end,
                         kind,
                         "",
-                        &needle,
+                        &pattern,
                         0,
                         &mut path,
                         &cancel_w,
@@ -162,7 +222,7 @@ fn scan(
     end: usize,
     kind: Kind,
     label: &str,
-    needle: &str,
+    pattern: &Pattern,
     depth: usize,
     path: &mut Vec<usize>,
     cancel: &AtomicBool,
@@ -180,16 +240,16 @@ fn scan(
         return true;
     }
 
-    // A node matches if its key contains the needle, or (for a scalar) its value
-    // does. Containers match only via their key.
-    let mut hit = !label.is_empty() && label.to_lowercase().contains(needle);
+    // A node matches if its key matches the pattern, or (for a scalar) its
+    // value does. Containers match only via their key.
+    let mut hit = !label.is_empty() && pattern.is_match(label);
     if !hit {
         match kind {
             Kind::Object | Kind::Array => {}
-            Kind::Str => hit = decode_str(b, start, end).to_lowercase().contains(needle),
+            Kind::Str => hit = pattern.is_match(&decode_str(b, start, end)),
             _ => {
                 if let Ok(s) = std::str::from_utf8(&b[start..end]) {
-                    hit = s.to_lowercase().contains(needle);
+                    hit = pattern.is_match(s);
                 }
             }
         }
@@ -215,7 +275,7 @@ fn scan(
                 rc.end,
                 rc.kind,
                 &rc.label,
-                needle,
+                pattern,
                 depth + 1,
                 path,
                 cancel,
@@ -256,7 +316,8 @@ mod tests {
         let end = bytes.len();
         let src = Arc::new(Source::Buffered(bytes));
 
-        let mut search = Search::spawn(src, "needle".to_string(), false, 0, end, Kind::Array);
+        let pat = Pattern::parse("needle").unwrap();
+        let mut search = Search::spawn(src, pat, false, 0, end, Kind::Array);
         // Drain until the worker reports done (bounded spin so a hang can't wedge CI).
         for _ in 0..10_000 {
             search.drain();
@@ -266,5 +327,32 @@ mod tests {
             thread::sleep(std::time::Duration::from_millis(1));
         }
         assert!(search.finished, "search did not finish (possible hang)");
+    }
+
+    /// End-to-end: a `re:` pattern actually filters the worker's emitted paths.
+    /// `^id_\d+$` matches the two `id_42`/`id_99` string values but not the
+    /// numeric `id` keys, so we should see exactly the two matches in `meta`.
+    #[test]
+    fn regex_pattern_filters_string_values() {
+        let bytes =
+            br#"{"items":[{"id":1,"tag":"id_42"},{"id":2,"tag":"id_99"},{"id":3,"tag":"x"}]}"#
+                .to_vec();
+        let end = bytes.len();
+        let src = Arc::new(Source::Buffered(bytes));
+        let pat = Pattern::parse(r"re:^id_\d+$").expect("regex");
+        let mut search = Search::spawn(src, pat, false, 0, end, Kind::Object);
+        for _ in 0..10_000 {
+            search.drain();
+            if search.finished {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(search.finished);
+        // Each match's last index is the `tag` field (index 1 inside its object).
+        assert_eq!(search.matches.len(), 2, "matches: {:?}", search.matches);
+        for m in &search.matches {
+            assert_eq!(m.last(), Some(&1));
+        }
     }
 }

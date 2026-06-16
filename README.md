@@ -76,7 +76,14 @@ the richer ones:
   Python-import style: `.actor` descends, `..sibling` climbs to the parent, `...x`
   two levels. If a path isn't found where you typed it, resolution climbs toward
   the root and retries — `:city` falls back to `..city`, `...city`, … — landing on
-  the nearest ancestor that has it (the footer shows where it reached).
+  the nearest ancestor that has it (the footer shows where it reached). Object key
+  segments accept `*`/`?` wildcards (`data.user*`, `data.*name*`) when you only
+  remember part of the key — the first child whose label matches the whole
+  pattern wins.
+- **Search (`/`)** — plain queries are case-insensitive substring matches (the
+  default). Prefix with `re:` for a full regex (`re:^id_\w+$`) or `g:` for a
+  glob (`g:user*`); a bad pattern shows `(bad pattern: …)` in the footer so you
+  can fix it without losing what you typed.
 - **Bookmarks (`m`/`'`)** — `m` toggles one on the focused node; `'` opens a picker
   (`↵` jump, `d` delete). Per-pane, session-lived.
 - **Copy (`y`/`Y`)** — goes through the terminal via

@@ -15,6 +15,7 @@ exclude = ["/.github"]
 [dependencies]
 memmap2 = "0.9"
 ratatui = "0.29"
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
 
 # Only for the piped-stdin path: reopen the real terminal device onto fd 0 so
 # crossterm reads keys from it (see reattach_terminal_to_stdin in main.rs).

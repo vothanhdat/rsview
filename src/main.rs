@@ -12,7 +12,7 @@ use scanner::{
     container_empty, decode_str, skip_value, skip_ws, value_kind, Cursor, Kind, RawChild, Step,
     MAX_DEPTH,
 };
-use search::Search;
+use search::{glob_to_regex, Pattern, Search};
 use source::Source;
 
 use memmap2::Mmap;
@@ -551,6 +551,9 @@ struct View {
     mode: Mode,
     /// Live search-input buffer (typed while in `Mode::Search`).
     query: String,
+    /// Set when the typed `re:`/`g:` query failed to compile, so the footer can
+    /// surface "(bad pattern)" without re-parsing. Cleared on a clean compile.
+    query_error: Option<String>,
     /// The running search, if any. `None` once cleared/cancelled.
     search: Option<Search>,
     /// Which match the cursor is currently on.
@@ -782,6 +785,20 @@ fn resolve_path(root: &mut Node, b: &[u8], base: &[usize], segs: &[Seg]) -> Opti
                 out.push(*i);
             }
             Seg::Key(k) => {
+                // Glob keys (`*`, `?`) widen the lookup to "first child whose
+                // label matches the whole pattern", letting the user jump with
+                // partial recall (`data.user*` / `data.*name*`). Plain keys
+                // keep the exact-match fast path.
+                let re = if k.contains('*') || k.contains('?') {
+                    Some(
+                        regex::RegexBuilder::new(&format!("^{}$", glob_to_regex(k)))
+                            .case_insensitive(true)
+                            .build()
+                            .ok()?,
+                    )
+                } else {
+                    None
+                };
                 let mut i = 0;
                 let mut found = None;
                 while i < GOTO_SCAN_CAP {
@@ -789,7 +806,12 @@ fn resolve_path(root: &mut Node, b: &[u8], base: &[usize], segs: &[Seg]) -> Opti
                     if i >= node.children.len() {
                         break;
                     }
-                    if node.children[i].label == *k {
+                    let label = &node.children[i].label;
+                    let hit = match &re {
+                        Some(re) => re.is_match(label),
+                        None => label == k,
+                    };
+                    if hit {
                         found = Some(i);
                         break;
                     }
@@ -901,6 +923,7 @@ impl View {
             rows: Vec::new(),
             mode: Mode::Normal,
             query: String::new(),
+            query_error: None,
             search: None,
             match_idx: 0,
             match_set: HashSet::new(),
@@ -963,6 +986,9 @@ impl View {
 
     /// (Re)launch the live search for the current `query`. Dropping the previous
     /// `Search` cancels its worker thread; an empty query just clears results.
+    /// A `re:`/`g:` query that fails to compile is treated as zero-matches —
+    /// the footer surfaces the parse error so the user can fix the expression
+    /// without losing what they've typed.
     fn relaunch(&mut self, mmap: &Arc<Source>) {
         if let Some(old) = self.search.take() {
             old.cancel(); // belt-and-suspenders; Drop also flips the flag
@@ -972,12 +998,20 @@ impl View {
         self.match_idx = 0;
         self.landed = false;
         self.want_path = None;
+        self.query_error = None;
         if self.query.is_empty() {
             return;
         }
+        let pattern = match Pattern::parse(&self.query) {
+            Ok(p) => p,
+            Err(e) => {
+                self.query_error = Some(e);
+                return;
+            }
+        };
         self.search = Some(Search::spawn(
             Arc::clone(mmap),
-            self.query.clone(),
+            pattern,
             self.root.jsonl,
             self.root.start,
             self.root.end,
@@ -1079,6 +1113,7 @@ impl View {
             s.cancel();
         }
         self.query.clear();
+        self.query_error = None;
         self.match_set.clear();
         self.indexed = 0;
         self.match_idx = 0;
@@ -1676,8 +1711,12 @@ fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Option<&str>) {
             Some(s) if !s.finished => "+",
             _ => "",
         };
-        // Show position once we've landed on a match, else the running total.
-        let pos = if view.landed && count > 0 {
+        // Show pattern-parse failures verbatim so the user can fix the typed
+        // `re:`/`g:` expression. Else show position (after landing) or running
+        // total.
+        let pos = if let Some(err) = view.query_error.as_deref() {
+            format!("({err})")
+        } else if view.landed && count > 0 {
             format!("{}/{}{}", view.match_idx + 1, count, more)
         } else {
             format!("{}{} matches", count, more)
@@ -1787,9 +1826,9 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("Enter  →", "expand / collapse"),
         ("←", "collapse / parent"),
         ("wheel", "scroll the pane"),
-        ("/", "search (live)"),
+        ("/", "search · re:rx · g:glob"),
         ("↵  ⇧↵", "next / prev match"),
-        (":", "jump to a path"),
+        (":", "jump to a path · *? in keys"),
         ("m", "toggle bookmark"),
         ("'", "bookmark picker"),
         ("y / Y", "copy value / path"),
@@ -2892,6 +2931,50 @@ mod tests {
         assert_eq!(&b[get(&root, &p).start..get(&root, &p).end], b"\"Y\"");
         // A genuinely-absent key resolves nowhere, even after climbing.
         assert!(resolve_with_climb(&mut root, b, &focus, &parse_path("nope")).is_none());
+    }
+
+    #[test]
+    fn resolve_path_globs_keys() {
+        // `*`/`?` in a key segment match the whole label, case-insensitively,
+        // and take the first child that fits. Plain keys still need an exact hit.
+        let b = br#"{"users":{"firstName":"Ada","lastName":"L","age":36}}"#;
+        let mut root = make_root(b, "t", false);
+        let p = resolve_path(&mut root, b, &[], &parse_path("users.first*").segs).expect("glob *");
+        assert_eq!(&b[get(&root, &p).start..get(&root, &p).end], b"\"Ada\"");
+        let p =
+            resolve_path(&mut root, b, &[], &parse_path("users.*Name").segs).expect("glob suffix");
+        // *Name matches firstName (the first child that fits the whole pattern).
+        assert_eq!(&b[get(&root, &p).start..get(&root, &p).end], b"\"Ada\"");
+        let p = resolve_path(&mut root, b, &[], &parse_path("users.a?e").segs).expect("glob ?");
+        assert_eq!(&b[get(&root, &p).start..get(&root, &p).end], b"36");
+        // Globs are anchored at both ends — `first` (without `*`) is exact, so it misses.
+        assert!(resolve_path(&mut root, b, &[], &parse_path("users.first").segs).is_none());
+        // A glob with no child matching the whole pattern resolves to None.
+        assert!(resolve_path(&mut root, b, &[], &parse_path("users.zz*").segs).is_none());
+    }
+
+    #[test]
+    fn search_pattern_parses_re_glob_and_literal() {
+        // re: compiles a regex (case-insensitive).
+        let p = Pattern::parse("re:^foo.*bar$").expect("regex");
+        match p {
+            Pattern::Regex(_) => {}
+            _ => panic!("expected Regex"),
+        }
+        // Bad regex returns a footer-ready error.
+        assert!(Pattern::parse("re:[unclosed").is_err());
+        // g: turns into a regex (the `.` is escaped so it matches literal dot).
+        let p = Pattern::parse("g:foo.*bar").expect("glob");
+        match p {
+            Pattern::Regex(_) => {}
+            _ => panic!("expected Regex"),
+        }
+        // Plain query is literal substring (the default).
+        let p = Pattern::parse("Hello").expect("literal");
+        match p {
+            Pattern::Literal(n) => assert_eq!(n, "hello"),
+            _ => panic!("expected Literal"),
+        }
     }
 
     #[test]
