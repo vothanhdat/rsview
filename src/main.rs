@@ -1257,6 +1257,13 @@ struct App {
     /// Transient status line (e.g. "copied 42 B") shown in the footer until the
     /// next key press. `None` = show the normal key hint.
     flash: Option<String>,
+    /// True when stdout was redirected (a pipe or file), so `p` can extract the
+    /// focused node into it. Set by `run_file`/`run_stdin` after reserving
+    /// stdout; into a terminal there's nowhere to pipe, so `p` is a hint instead.
+    can_extract: bool,
+    /// Set by `p` to the focused node's byte range; the viewer quits and the
+    /// caller writes that slice to the reserved stdout on the way out.
+    extract: Option<(usize, usize)>,
 }
 
 impl App {
@@ -1268,6 +1275,8 @@ impl App {
             stacked: false,
             next_id: 1,
             flash: None,
+            can_extract: false,
+            extract: None,
         }
     }
 
@@ -1832,6 +1841,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("m", "toggle bookmark"),
         ("'", "bookmark picker"),
         ("y / Y", "copy value / path"),
+        ("p", "pipe node to stdout"),
         ("s", "split pane at node"),
         ("o", "preview pane"),
         ("\\", "toggle pane layout"),
@@ -2183,6 +2193,27 @@ fn process_key(
         KeyCode::Char('Y') => {
             app.flash = Some(app.yank_path());
             return KeyOutcome::Continue;
+        }
+        // `p` pipes the focused node's raw JSON out: it records the range and
+        // quits, and the caller writes that slice to the reserved stdout. Only
+        // meaningful when stdout is redirected (`rsview … | jq`) — into a
+        // terminal there's nowhere to pipe, so show a hint instead of quitting.
+        KeyCode::Char('p') => {
+            if !app.can_extract {
+                app.flash =
+                    Some("pipe rsview into a command (e.g. | jq) to extract a node".to_string());
+                return KeyOutcome::Continue;
+            }
+            match app.focused_range() {
+                Some(range) => {
+                    app.extract = Some(range);
+                    return KeyOutcome::Quit;
+                }
+                None => {
+                    app.flash = Some("nothing to extract".to_string());
+                    return KeyOutcome::Continue;
+                }
+            }
         }
         // `:` opens the path-jump prompt; `m` bookmarks the focused node; `'`
         // opens the bookmark picker.
@@ -2591,6 +2622,120 @@ fn disable_mouse() {
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
 }
 
+/// First-run footer hint shown when stdout is piped, so the `p` extract key is
+/// discoverable; it clears on the first keypress like any other flash.
+const EXTRACT_HINT: &str = "output piped — press p to extract the focused node into it";
+
+/// Where an extracted node's JSON goes when the viewer exits after `p`.
+///
+/// A full-screen TUI and clean piped data can't share fd 1. When stdout is
+/// redirected (`rsview f.json | jq`, `> out.json`) we dup the real stdout aside
+/// here and point fd 1 at the controlling terminal, so every existing
+/// `stdout()` render/escape lands on the tty while the pipe stays pristine for
+/// the payload. When stdout is already a terminal there's nothing to pipe into,
+/// so `enabled` is false and `p` shows a hint instead of extracting.
+struct Payload {
+    enabled: bool,
+    /// The dup'd real stdout (unix, redirected case). `None` means "write to the
+    /// process's own stdout" — the terminal case, or non-unix.
+    file: Option<File>,
+}
+
+impl Payload {
+    /// Write a node's raw JSON to the reserved sink, with a trailing newline so
+    /// the output is a clean line for `jq` / a shell / a file. Uncapped, unlike
+    /// the clipboard copy: piping a large subtree is the whole point, and the
+    /// slice is a zero-copy view into the mmap.
+    fn emit(self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut w: Box<dyn Write> = match self.file {
+            Some(f) => Box::new(f),
+            None => Box::new(std::io::stdout()),
+        };
+        w.write_all(bytes)?;
+        w.write_all(b"\n")?;
+        w.flush()
+    }
+}
+
+/// Reserve stdout for an extracted node's JSON, repointing the TUI at the tty
+/// when stdout is redirected. See [`Payload`].
+#[cfg(unix)]
+fn reserve_stdout_for_payload() -> Payload {
+    use std::os::fd::FromRawFd;
+    unsafe {
+        // stdout is a terminal → nothing to pipe into; render there as usual.
+        if libc::isatty(libc::STDOUT_FILENO) == 1 {
+            return Payload {
+                enabled: false,
+                file: None,
+            };
+        }
+        // stdout is a pipe/file: save it for the payload, then repoint fd 1 at
+        // the controlling terminal (found via an fd that still points at it —
+        // stdin is the terminal here for a file arg, or reattached for a pipe).
+        let saved = libc::dup(libc::STDOUT_FILENO);
+        if saved >= 0 {
+            for fd in [libc::STDIN_FILENO, libc::STDERR_FILENO] {
+                if libc::isatty(fd) != 1 {
+                    continue;
+                }
+                let name = libc::ttyname(fd);
+                if name.is_null() {
+                    continue;
+                }
+                let tty = libc::open(name, libc::O_WRONLY);
+                if tty >= 0 {
+                    libc::dup2(tty, libc::STDOUT_FILENO);
+                    if tty != libc::STDOUT_FILENO {
+                        libc::close(tty);
+                    }
+                    return Payload {
+                        enabled: true,
+                        file: Some(File::from_raw_fd(saved)),
+                    };
+                }
+            }
+            // No tty to render to (output redirected *and* no controlling
+            // terminal): the viewer can't run usefully anyway. Drop the dup and
+            // leave stdout as-is.
+            libc::close(saved);
+        }
+        Payload {
+            enabled: false,
+            file: None,
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn reserve_stdout_for_payload() -> Payload {
+    // On Windows crossterm renders to the console handle, separate from a
+    // redirected stdout pipe, so fd 1 can stay put and still carry clean output.
+    Payload {
+        enabled: !std::io::stdout().is_terminal(),
+        file: None,
+    }
+}
+
+/// Resolve the focused node's real byte range (a collapsed container's end is
+/// provisional) and write its whitespace-trimmed JSON to the payload sink.
+fn write_extract(
+    b: &[u8],
+    (start, prov_end): (usize, usize),
+    sink: Payload,
+) -> std::io::Result<()> {
+    let end = skip_value(b, start, prov_end);
+    let slice = &b[start..end];
+    // The document root's range runs to EOF; trim so a trailing file newline
+    // (or container padding) doesn't ride along before our own newline.
+    let cut = slice
+        .iter()
+        .rposition(|c| !c.is_ascii_whitespace())
+        .map_or(0, |p| p + 1);
+    sink.emit(&slice[..cut])
+}
+
 /// Open a file via mmap (zero-copy, near-constant memory) and run the viewer.
 fn run_file(path: String) -> std::io::Result<()> {
     // NDJSON / JSON Lines detected by extension (cheap — a content sniff would
@@ -2605,6 +2750,14 @@ fn run_file(path: String) -> std::io::Result<()> {
     let b: &[u8] = &mmap;
 
     let mut app = App::single(View::new(b, &path, jsonl));
+    // Steal fd 1 for the TUI (repointing it at the tty) before ratatui grabs
+    // stdout, so a redirected stdout stays clean for a `p` extract on exit.
+    let payload = reserve_stdout_for_payload();
+    app.can_extract = payload.enabled;
+    if app.can_extract {
+        // Make `p` discoverable: this first-frame hint clears on any keypress.
+        app.flash = Some(EXTRACT_HINT.to_string());
+    }
     let mut term = ratatui::init();
     // Paint the first frame *before* probing keyboard-enhancement support.
     // `supports_keyboard_enhancement()` (in enable_enhanced_keys) blocks up to
@@ -2623,6 +2776,10 @@ fn run_file(path: String) -> std::io::Result<()> {
         disable_enhanced_keys();
     }
     ratatui::restore();
+    // After restoring the terminal, hand the chosen node to the reserved stdout.
+    if let Some(range) = app.extract {
+        write_extract(b, range, payload)?;
+    }
     res
 }
 
@@ -2630,9 +2787,16 @@ fn run_file(path: String) -> std::io::Result<()> {
 /// can't be mmap'd, so it's buffered in RAM and re-parsed on a throttle).
 fn run_stdin() -> std::io::Result<()> {
     let rx = spawn_reader(take_pipe_reader());
+    // stdin was the pipe; fd 0 is now the terminal (reattached above). Reserve
+    // stdout so `… | rsview | jq` can extract a node into the downstream pipe.
+    let payload = reserve_stdout_for_payload();
     let mut buf: Vec<u8> = Vec::new();
     let mut jsonl = false;
     let mut app = App::single(View::new(&buf, "stdin", jsonl));
+    app.can_extract = payload.enabled;
+    if app.can_extract {
+        app.flash = Some(EXTRACT_HINT.to_string());
+    }
     let mut term = ratatui::init();
     // Same as run_file: paint before the up-to-2s keyboard-enhancement probe so
     // the (initially empty) streaming pane shows immediately, not a blank screen.
@@ -2645,6 +2809,9 @@ fn run_stdin() -> std::io::Result<()> {
         disable_enhanced_keys();
     }
     ratatui::restore();
+    if let Some(range) = app.extract {
+        write_extract(&buf, range, payload)?;
+    }
     res
 }
 
@@ -2991,6 +3158,29 @@ mod tests {
             Pattern::Literal(n) => assert_eq!(n, "hello"),
             _ => panic!("expected Literal"),
         }
+    }
+
+    #[test]
+    fn write_extract_slices_the_subtree_with_trailing_newline() {
+        // `p` records a node's (start, end), but end can be provisional — for a
+        // collapsed container it runs to the parent's bound. write_extract must
+        // re-resolve the real closer so it emits just the node, not its trailing
+        // siblings, plus one newline for a clean pipe line.
+        let b = br#"{"a":{"b":[1,2,3]},"c":9}"#;
+        let inner = b[1..].iter().position(|&c| c == b'{').unwrap() + 1; // second `{`
+        assert_eq!(inner, 5, "inner object starts at the second brace");
+        // Pass a deliberately over-long provisional end (whole doc) to prove
+        // skip_value stops at the inner `}` rather than slicing into `,"c":9}`.
+        let path = std::env::temp_dir().join(format!("rsview-extract-{}.json", std::process::id()));
+        let f = File::create(&path).expect("temp file");
+        let sink = Payload {
+            enabled: true,
+            file: Some(f),
+        };
+        write_extract(b, (inner, b.len()), sink).expect("write");
+        let got = std::fs::read(&path).expect("read back");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, b"{\"b\":[1,2,3]}\n");
     }
 
     #[test]

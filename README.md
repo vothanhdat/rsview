@@ -63,6 +63,7 @@ From a checkout: `cargo run --release -- file.json`.
 | `:` | jump to a path — absolute or relative to the cursor |
 | `m` · `'` | bookmark the focused node · open the bookmark picker |
 | `y` · `Y` | copy the focused value/subtree · copy its path |
+| `p` | pipe the focused node's JSON to stdout (when output is redirected) |
 | `s` · `o` | split a new pane at the node · open a preview pane |
 | `\` · `+`/`-` · `Tab` | toggle layout · resize · switch pane |
 | `x` · `q`/`Esc` | close the active pane · close (quit on the last) |
@@ -90,6 +91,13 @@ the richer ones:
   [OSC 52](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Operating-System-Commands),
   so it needs no clipboard library and **works over SSH** (capped ~1 MiB; in tmux
   set `set -g set-clipboard on`).
+- **Pipe out (`p`)** — when you redirect rsview's output
+  (`rsview big.json | jq …`, or `> node.json`), the UI renders on your terminal
+  and `p` writes the focused node's raw JSON to that pipe/file, then quits. The
+  payload is a zero-copy slice of the mmap and **uncapped**, so it's the way to
+  carve one subtree out of a file too big for `jq` to open and hand just that
+  piece downstream. Into a plain terminal (no redirect) there's nowhere to pipe,
+  so `p` shows a hint instead.
 - **Panes (`s`/`o`)** — `s` splits a new pane rooted at the focused node; `o` opens
   one *preview* pane that follows your cursor (master/detail). Panes share the one
   mmap (a split costs nothing), each keeps its own focus/expansion/search, and
@@ -134,7 +142,8 @@ multi-GB file interactively, at near-constant memory.** It is deliberately *not*
 transform tool — constructing new values means materializing them, forfeiting the
 very property that makes it useful on a huge file. Reach for `jq` or DuckDB to
 *produce* data; reach for rsview to *read* a file too big to open comfortably
-anywhere else.
+anywhere else — then `p` hands the one subtree you navigated to straight to `jq`,
+which could never have opened the whole file itself.
 
 ## Layout
 
