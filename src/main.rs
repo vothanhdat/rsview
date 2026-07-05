@@ -53,6 +53,11 @@ const PREVIEW_SKIP_BUDGET: usize = 64 << 10; // 64 KiB
 /// string (or a bogus run of digits) would just be wasted work and a memory
 /// spike. 512 bytes always covers the truncation width, even for 4-byte chars.
 const PREVIEW_DECODE_BYTES: usize = 512;
+/// Upper bound on the bytes the peek overlay decodes for a single scalar. Peek is
+/// on-demand (one keypress, not per-frame), so this is far more generous than the
+/// row cap — enough to read a big embedded blob — while still bounding the decode
+/// and wrap of a pathological multi-hundred-MB string.
+const PEEK_MAX_BYTES: usize = 8 << 20; // 8 MiB
 
 /// Pane size weights (a ratatui `Fill` factor). A new pane starts at
 /// `WEIGHT_DEFAULT`; `+`/`-` step it within `[WEIGHT_MIN, WEIGHT_MAX]`. Equal
@@ -518,6 +523,24 @@ enum Mode {
     Marks,
     /// The keyboard-shortcut cheatsheet overlay (`?`): any key closes it.
     Help,
+    /// The value-peek overlay (`Enter`/`Space` on a scalar leaf): the focused
+    /// value decoded in full and scrollable. See [`View::peek`].
+    Peek,
+}
+
+/// The state behind a [`Mode::Peek`] overlay: one scalar's full value, decoded
+/// once when the overlay opens (with JSON escapes rendered — `\n` becomes a real
+/// line break) so it can be read wrapped and scrolled without touching the source
+/// again. `scroll` is the top wrapped-line offset.
+struct Peek {
+    /// The focused node's label, shown in the card title.
+    title: String,
+    /// The decoded value; may be capped at `PEEK_MAX_BYTES` of source.
+    text: String,
+    /// True when the decode hit the cap, so the title can flag it.
+    truncated: bool,
+    /// Top visible wrapped line (advanced by the scroll keys).
+    scroll: usize,
 }
 
 /// What a key press asks the run loop to do that it can't do itself: quit, or
@@ -596,6 +619,8 @@ struct View {
     filter: Option<Filter>,
     /// How many of `filter.hits` are already materialized as root children.
     filter_added: usize,
+    /// The open value-peek overlay, if any (`Mode::Peek`).
+    peek: Option<Peek>,
 }
 
 /// Build the root node for a buffer. Shared by `App::new` and `App::rebuild`
@@ -957,6 +982,7 @@ impl View {
             filter_error: None,
             filter: None,
             filter_added: 0,
+            peek: None,
         }
     }
 
@@ -972,6 +998,7 @@ impl View {
         self.rows.clear();
         self.want_path = None;
         self.mode = Mode::Normal;
+        self.peek = None;
         self.goto.clear();
         // Bookmarked paths refer to the old tree; drop them on re-root.
         self.bookmarks.clear();
@@ -1012,6 +1039,37 @@ impl View {
         }
         let path = self.rows[self.focus].path.clone();
         get_mut(&mut self.root, &path).toggle();
+    }
+
+    /// If the focused row is a scalar leaf, open the value-peek overlay on it and
+    /// return `true`; containers return `false` so the caller expands/collapses
+    /// instead. The full value is decoded once here (bounded by `PEEK_MAX_BYTES`,
+    /// escapes rendered) so the overlay reads and scrolls without re-touching the
+    /// source.
+    fn peek_focused(&mut self, b: &[u8]) -> bool {
+        let Some(row) = self.rows.get(self.focus) else {
+            return false;
+        };
+        if matches!(row.kind, Kind::Object | Kind::Array) {
+            return false; // a container — let Enter toggle it
+        }
+        let node = get(&self.root, &row.path);
+        let cap = node.start.saturating_add(PEEK_MAX_BYTES);
+        let e = node.end.min(cap);
+        let truncated = node.end > cap;
+        let text = match node.kind {
+            Kind::Str => decode_str(b, node.start, e),
+            // Other scalars are their literal bytes (a long bignum, say).
+            _ => String::from_utf8_lossy(&b[node.start..e]).into_owned(),
+        };
+        self.peek = Some(Peek {
+            title: row.label.clone(),
+            text,
+            truncated,
+            scroll: 0,
+        });
+        self.mode = Mode::Peek;
+        true
     }
 
     /// (Re)launch the live search for the current `query`. Dropping the previous
@@ -1840,6 +1898,7 @@ fn ui(f: &mut Frame, app: &App, streaming: bool) {
     match app.active_view().mode {
         Mode::Marks => render_marks(f, area, app.active_view()),
         Mode::Help => render_help(f, area),
+        Mode::Peek => render_peek(f, area, app.active_view()),
         _ => {}
     }
 }
@@ -1974,7 +2033,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("PgUp/PgDn", "page up / down"),
         ("Ctrl-D/U", "half page"),
         ("g  Home", "jump to top"),
-        ("Enter  →", "expand / collapse"),
+        ("Enter  →", "expand · peek a leaf"),
         ("←", "collapse / parent"),
         ("wheel", "scroll the pane"),
         ("/", "search · re:rx · g:glob"),
@@ -2049,6 +2108,117 @@ fn render_help(f: &mut Frame, area: Rect) {
         height: h,
     };
 
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(panel_bg))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// The centered peek card and its inner (text) dimensions `(rect, inner_w,
+/// inner_h)`. A near-full-screen box so a long value has room to breathe. Shared
+/// by [`render_peek`] and the peek scroll handler so the scroll clamp matches what
+/// is actually drawn.
+fn peek_layout(area: Rect) -> (Rect, usize, usize) {
+    let w = area.width.saturating_sub(6).clamp(8, area.width.max(8));
+    let h = area.height.saturating_sub(4).clamp(3, area.height.max(3));
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    (
+        rect,
+        w.saturating_sub(2) as usize,
+        h.saturating_sub(2) as usize,
+    )
+}
+
+/// Lay a decoded value out for the peek overlay: hard-break on `\n`, expand tabs,
+/// drop other control chars, and char-wrap each logical line to `width` columns.
+/// Char counts (not display columns) mirror the width accounting the rest of the
+/// UI uses (`truncate`, breadcrumbs), so wide glyphs are treated the same here.
+fn wrap_for_peek(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    for logical in text.split('\n') {
+        // Sanitize: tabs to spaces, strip other control chars (a raw \r or NUL
+        // would garble the terminal).
+        let mut clean = String::with_capacity(logical.len());
+        for c in logical.chars() {
+            match c {
+                '\t' => clean.push_str("    "),
+                c if c.is_control() => {}
+                c => clean.push(c),
+            }
+        }
+        if clean.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut cur = String::new();
+        let mut n = 0;
+        for c in clean.chars() {
+            cur.push(c);
+            n += 1;
+            if n == width {
+                out.push(std::mem::take(&mut cur));
+                n = 0;
+            }
+        }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Draw the value-peek overlay: the focused scalar's full value, wrapped and
+/// vertically scrolled to `peek.scroll`, in the same floating-card style as the
+/// other overlays. Opened by `Enter`/`Space` on a leaf; closed by `esc`/`q`.
+fn render_peek(f: &mut Frame, area: Rect, view: &View) {
+    let Some(pk) = view.peek.as_ref() else {
+        return;
+    };
+    let (rect, inner_w, inner_h) = peek_layout(area);
+    let all = wrap_for_peek(&pk.text, inner_w);
+    let total = all.len();
+    let top = pk.scroll.min(total.saturating_sub(inner_h));
+    let bottom = (top + inner_h).min(total);
+
+    let panel_bg = Color::Indexed(236);
+    let lines: Vec<Line> = all[top..bottom]
+        .iter()
+        .map(|s| Line::from(Span::styled(s.clone(), Style::default().fg(Color::Gray))))
+        .collect();
+
+    // Title carries the label and a position readout so a long value shows how far
+    // down you are; the `⚠ capped` flag marks a value clipped at PEEK_MAX_BYTES.
+    let cap = if pk.truncated { " · ⚠ capped" } else { "" };
+    let title = format!(
+        " peek · {} · lines {}–{}/{}{cap} · j/k scroll · esc ",
+        pk.title,
+        top + 1,
+        bottom,
+        total,
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(
@@ -2384,6 +2554,39 @@ fn process_key(
         return KeyOutcome::Continue;
     }
 
+    // Peek mode: the full-value overlay. Scroll keys move within it; Esc/q/Enter
+    // close. Clamp against the same wrap the renderer uses so `k` after the bottom
+    // reacts immediately instead of eating dead presses.
+    if app.active_view().mode == Mode::Peek {
+        let (_, inner_w, inner_h) = peek_layout(term_area().unwrap_or(Rect::new(0, 0, 80, 24)));
+        let v = app.active_mut();
+        if let Some(pk) = v.peek.as_mut() {
+            let max = wrap_for_peek(&pk.text, inner_w)
+                .len()
+                .saturating_sub(inner_h);
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                    v.mode = Mode::Normal;
+                    v.peek = None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => pk.scroll = (pk.scroll + 1).min(max),
+                KeyCode::Up | KeyCode::Char('k') => pk.scroll = pk.scroll.saturating_sub(1),
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    pk.scroll = (pk.scroll + inner_h).min(max)
+                }
+                KeyCode::PageUp => pk.scroll = pk.scroll.saturating_sub(inner_h),
+                KeyCode::Char('f') if ctrl => pk.scroll = (pk.scroll + inner_h).min(max),
+                KeyCode::Char('b') if ctrl => pk.scroll = pk.scroll.saturating_sub(inner_h),
+                KeyCode::Home | KeyCode::Char('g') => pk.scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => pk.scroll = max,
+                _ => {}
+            }
+        } else {
+            v.mode = Mode::Normal; // defensive: no state → nothing to show
+        }
+        return KeyOutcome::Continue;
+    }
+
     // Any normal-mode key dismisses the previous flash (copy status, …); copy
     // keys below set a fresh one.
     app.flash = None;
@@ -2525,7 +2728,13 @@ fn process_key(
             v.focus = 0;
             v.scroll = 0;
         }
-        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => v.toggle_focus(),
+        // Enter/Space/→ expands a container; on a scalar leaf it opens the
+        // value-peek overlay (there's nothing to expand).
+        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => {
+            if !v.peek_focused(b) {
+                v.toggle_focus();
+            }
+        }
         KeyCode::Left => v.collapse_or_parent(),
         _ => {}
     }

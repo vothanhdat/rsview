@@ -56,7 +56,7 @@ From a checkout: `cargo run --release -- file.json`.
 | `Ctrl-D`/`Ctrl-U` | jump half a screenful |
 | mouse wheel | scroll the pane under the pointer |
 | `g`, `Home` | top |
-| `Enter`/`→`/`Space` | expand / collapse focused node |
+| `Enter`/`→`/`Space` | expand / collapse a container — or peek a leaf's full value |
 | `←` | collapse, or jump to parent if already collapsed |
 | `/` | search (live — results stream as you type) |
 | `Enter`/`↓` · `Shift-Enter`/`↑` (in search) | next / previous match |
@@ -117,6 +117,15 @@ the richer ones:
   intentional divergences from jq keep it zero-copy: a slice yields its elements
   as a stream rather than a new sub-array, and cross-type comparisons are simply
   unequal/unordered.
+- **Peek (`Enter` on a leaf)** — rows truncate a value to keep one line each, so a
+  long string, a URL, an embedded-JSON blob, or a multi-line log line gets cut off
+  with `…`. Press `Enter`/`Space` on a scalar (there's nothing to expand) to open a
+  near-full-screen overlay with the **whole value**, word-wrapped, with `\n`/`\t`
+  and `\uXXXX` escapes rendered as real characters so multi-line text is readable.
+  Scroll it with `j`/`k`, `PageUp`/`PageDown` (or `Ctrl-F`/`Ctrl-B`), `g`/`G` for
+  top/bottom; `esc`/`q` closes. The decode is bounded (8 MiB) and the title flags
+  `⚠ capped` if the value was longer; to get an uncapped copy use `y`, or `p` to
+  pipe the raw bytes out.
 - **Bookmarks (`m`/`'`)** — `m` toggles one on the focused node; `'` opens a picker
   (`↵` jump, `d` delete). Per-pane, session-lived.
 - **Copy (`y`/`Y`)** — goes through the terminal via

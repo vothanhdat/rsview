@@ -222,6 +222,48 @@ def scenario_filter(binary):
         t.close()
 
 
+def scenario_peek(binary):
+    print("peek: Enter on a leaf opens a scrollable full-value overlay")
+    # A string far longer than the ~70-char inline truncation, with a marker only
+    # the peek overlay can reveal.
+    long = "A" * 60 + "-MID-" + "B" * 400 + "-ENDMARK-"
+    t = Tui(binary, {"bio": long})
+    try:
+        t.send(":"); t.send("bio"); t.send("\r")   # focus the string leaf
+        check("inline row truncates the long value (no end marker)",
+              "-ENDMARK-" not in t.dump(), t)
+        t.send("\r")  # Enter on a scalar → peek
+        scr = t.dump()
+        check("peek overlay opens with a titled card",
+              "peek" in scr and "bio" in scr, t)
+        check("peek reveals content past the inline truncation",
+              "-ENDMARK-" in scr, t)
+        t.send("\x1b")  # esc
+        check("esc closes the peek overlay",
+              "j/k scroll" not in t.dump(), t)
+    finally:
+        t.close()
+
+    # A multi-line value taller than the box: newlines render as separate lines
+    # and G/g scroll to the end and back.
+    doc = "\n".join(f"row{n:02d}" for n in range(40))
+    t = Tui(binary, {"log": doc})
+    try:
+        t.send(":"); t.send("log"); t.send("\r")
+        t.send("\r")  # peek
+        scr = t.dump()
+        check("embedded newlines render as separate lines",
+              "row00" in scr and "row01" in scr, t)
+        check("a value taller than the box isn't all shown at once",
+              "row39" not in scr, t)
+        t.send("G")
+        check("G scrolls to the end of a long value", "row39" in t.dump(), t)
+        t.send("g")
+        check("g scrolls back to the top", "row00" in t.dump(), t)
+    finally:
+        t.close()
+
+
 def scenario_help_overlay(binary):
     print("help: ? overlay + trimmed footer")
     t = Tui(binary, {"a": {"b": 1}, "c": [1, 2, 3]})
@@ -249,6 +291,7 @@ def main():
     scenario_jump_relative_and_climb(binary)
     scenario_sibling_nav(binary)
     scenario_filter(binary)
+    scenario_peek(binary)
     scenario_help_overlay(binary)
 
     print()
