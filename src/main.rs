@@ -9,7 +9,7 @@ mod filter;
 mod scanner;
 mod search;
 mod source;
-use filter::{parse_pipeline, Filter, Op};
+use filter::{parse_pipeline, Filter, Program};
 use scanner::{
     container_empty, decode_str, skip_value, skip_ws, value_kind, Cursor, Kind, RawChild, Step,
     MAX_DEPTH,
@@ -1342,7 +1342,7 @@ struct App {
 
 /// A parsed, ready-to-run filter plus the pane range it should evaluate over.
 struct PendingFilter {
-    ops: Vec<Op>,
+    program: Program,
     /// The raw expression, kept for the result pane's title.
     expr: String,
     start: usize,
@@ -1613,7 +1613,14 @@ impl App {
         let Some(pf) = self.pending_filter.take() else {
             return;
         };
-        let filter = Filter::spawn(Arc::clone(src), pf.ops, pf.jsonl, pf.start, pf.end, pf.kind);
+        let filter = Filter::spawn(
+            Arc::clone(src),
+            pf.program,
+            pf.jsonl,
+            pf.start,
+            pf.end,
+            pf.kind,
+        );
         // Keep the title compact so the live `N hits` count stays visible even in
         // a narrow split pane; the full expression is what the user just typed.
         let name = format!("| {}", truncate(&pf.expr, 28));
@@ -2296,13 +2303,13 @@ fn process_key(
                     return KeyOutcome::Continue;
                 }
                 match parse_pipeline(&expr) {
-                    Ok(ops) => {
+                    Ok(program) => {
                         let (start, end, kind, jsonl) = {
                             let r = &app.active_view().root;
                             (r.start, r.end, r.kind, r.jsonl)
                         };
                         app.pending_filter = Some(PendingFilter {
-                            ops,
+                            program,
                             expr,
                             start,
                             end,

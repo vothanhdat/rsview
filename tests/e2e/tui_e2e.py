@@ -157,10 +157,12 @@ def scenario_filter(binary):
         {"name": "cara", "age": 60},
     ]})
     try:
-        # A bad expression reports the reason and keeps the prompt open.
+        # A bad expression reports the reason (parenthesized) and keeps the prompt
+        # open with the typed text intact.
         t.send("|"); t.send("select(.a >)"); t.send("\r")
+        foot = t.footer()
         check("malformed filter shows the parse error in the footer",
-              "not a value to compare" in t.footer(), t)
+              "select(.a >)" in foot and foot.rstrip().endswith(")"), t)
         t.send("\x1b")  # esc out of the prompt
         # A real selection pipeline opens a result pane of the picked nodes.
         t.send("|"); t.send(".users[] | select(.age > 30) | .name"); t.send("\r")
@@ -174,6 +176,32 @@ def scenario_filter(binary):
               "2 hit" in t.title(), t)
         check("result labels carry the origin path",
               "users[1].name" in scr, t)
+    finally:
+        t.close()
+
+    # Boolean 'or' inside select.
+    t = Tui(binary, {"team": [
+        {"name": "amy", "age": 20, "vip": False},
+        {"name": "bob", "age": 70, "vip": False},
+        {"name": "cara", "age": 18, "vip": True},
+    ]})
+    try:
+        t.send("|"); t.send(".team[] | select(.age > 65 or .vip) | .name"); t.send("\r")
+        t.pump(0.8)
+        scr = t.dump()
+        check("boolean 'or' in select keeps both matches",
+              '"bob"' in scr and '"cara"' in scr and '"amy"' not in scr, t)
+    finally:
+        t.close()
+
+    # Recursive descent reaches a key at any depth.
+    t = Tui(binary, {"nested": {"a": {"id": 1}, "b": [{"id": 2}, {"id": 3}]}})
+    try:
+        t.send("|"); t.send(".. | .id"); t.send("\r")
+        t.pump(0.8)
+        scr = t.dump()
+        check("recursive descent finds .id at every depth",
+              all(f": {n}" in scr for n in (1, 2, 3)), t)
     finally:
         t.close()
 

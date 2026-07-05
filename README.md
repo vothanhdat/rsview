@@ -87,18 +87,32 @@ the richer ones:
   glob (`g:user*`); a bad pattern shows `(bad pattern: …)` in the footer so you
   can fix it without losing what you typed.
 - **Filter (`|`)** — a jq-style **selection** pipeline that opens a new pane
-  listing the nodes it picks out (`.users[] | select(.age > 30) | .name`). It
-  supports field access (`.foo.bar`, `["odd.key"]`), indexing (`.[3]`),
-  iteration (`.[]` over an array's elements or an object's values), `select(…)`
-  with a comparison (`== != < <= > >=` against a number / `"string"` / `true` /
-  `false` / `null`) or a bare truthy path, and `|` pipes. Because it only
-  *selects* sub-values that already exist — it never builds new ones — each
-  result is a zero-copy byte range into the file, so filtering a multi-GB
-  document collects offsets rather than materializing values, and results stream
-  into the pane as the worker scans (the title shows a live `N hits` count).
-  Missing paths are skipped rather than erroring (jq's `?`); a malformed
-  expression shows the reason in the footer without closing the prompt. NDJSON
-  feeds each document through the pipeline in turn.
+  listing the nodes it picks out (`.users[] | select(.age > 30) | .name`).
+  Supported:
+  - **paths** — field access (`.foo.bar`, `["odd.key"]`), indexing with
+    negatives (`.[3]`, `.[-1]`), array **slices** streamed as elements
+    (`.[1:3]`, `.[-2:]`), and iteration (`.[]` over an array's elements or an
+    object's values);
+  - **recursive descent** — `..` yields the value and every descendant, so
+    `.. | .id` pulls every `id` at any depth;
+  - **`select(…)`** — comparisons (`== != < <= > >=`) between two operands, where
+    an operand is a path (`.a.b`) or a literal (number / `"string"` / `true` /
+    `false` / `null`), combined with `and` / `or` and `( … )` grouping, or a bare
+    path as a truthiness test (`select(.active)`);
+  - **`,` and `|`** — the comma unions outputs (`.name, .email`, binding tighter
+    than the pipe) and `|` chains stages.
+
+  Because it only *selects* sub-values that already exist — it never builds new
+  ones — each result is a zero-copy byte range into the file, so filtering a
+  multi-GB document collects offsets rather than materializing values, and
+  results stream into the pane as the worker scans (the title shows a live
+  `N hits` count, capped at 5000). Missing paths are skipped rather than
+  erroring (jq's `?`; inside `select` a missing path reads as `null`); a
+  malformed expression shows the reason in the footer without closing the
+  prompt. NDJSON feeds each document through the pipeline in turn. Two
+  intentional divergences from jq keep it zero-copy: a slice yields its elements
+  as a stream rather than a new sub-array, and cross-type comparisons are simply
+  unequal/unordered.
 - **Bookmarks (`m`/`'`)** — `m` toggles one on the focused node; `'` opens a picker
   (`↵` jump, `d` delete). Per-pane, session-lived.
 - **Copy (`y`/`Y`)** — goes through the terminal via
