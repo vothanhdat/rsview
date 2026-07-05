@@ -97,8 +97,12 @@ the richer ones:
     `.. | .id` pulls every `id` at any depth;
   - **`select(…)`** — comparisons (`== != < <= > >=`) between two operands, where
     an operand is a path (`.a.b`) or a literal (number / `"string"` / `true` /
-    `false` / `null`), combined with `and` / `or` and `( … )` grouping, or a bare
-    path as a truthiness test (`select(.active)`);
+    `false` / `null`); string **matches** `~` / `!~` against a path
+    (`select(.name ~ "re:^a")`), where the pattern speaks the same dialect as `/`
+    search — plain text is a case-insensitive substring, `re:` a regex, `g:` a
+    `*`/`?` glob, and only string values ever match; all combined with `and` /
+    `or` and `( … )` grouping, or a bare path as a truthiness test
+    (`select(.active)`);
   - **`,` and `|`** — the comma unions outputs (`.name, .email`, binding tighter
     than the pipe) and `|` chains stages.
 

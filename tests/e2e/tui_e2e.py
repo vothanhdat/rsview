@@ -205,6 +205,22 @@ def scenario_filter(binary):
     finally:
         t.close()
 
+    # Regex string match with the ~ operator inside select.
+    t = Tui(binary, {"files": [
+        {"name": "report.pdf"},
+        {"name": "notes.txt"},
+        {"name": "scan.pdf"},
+    ]})
+    try:
+        t.send("|"); t.send('.files[] | select(.name ~ "re:\\.pdf$") | .name'); t.send("\r")
+        t.pump(0.8)
+        scr = t.dump()
+        check("~ regex match keeps only the .pdf names",
+              '"report.pdf"' in scr and '"scan.pdf"' in scr
+              and '"notes.txt"' not in scr, t)
+    finally:
+        t.close()
+
 
 def scenario_help_overlay(binary):
     print("help: ? overlay + trimmed footer")

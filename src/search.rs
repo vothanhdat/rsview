@@ -25,6 +25,10 @@ const MAX_MATCHES: usize = 5000;
 /// - `re:<regex>` → full Rust regex, case-insensitive
 /// - `g:<glob>`  → `*` (any chars), `?` (one char); everything else literal
 /// - anything else → case-insensitive substring (the default since v0.1.0)
+///
+/// The filter's `~` / `!~` match operators reuse this same compiler, so a
+/// `select` pattern speaks the identical `re:` / `g:` dialect as `/`.
+#[derive(Clone, Debug)]
 pub enum Pattern {
     /// Lowercased needle; match via `hay.to_lowercase().contains(needle)`.
     Literal(String),
@@ -45,7 +49,7 @@ impl Pattern {
         }
     }
 
-    fn is_match(&self, hay: &str) -> bool {
+    pub fn is_match(&self, hay: &str) -> bool {
         match self {
             Pattern::Literal(n) => hay.to_lowercase().contains(n.as_str()),
             Pattern::Regex(r) => r.is_match(hay),

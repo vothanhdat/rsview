@@ -20,9 +20,12 @@
 //!   - `a, b`              comma — union of the outputs of `a` and `b`
 //!   - `select(<cond>)`    keep the value when `<cond>` holds. `<cond>` is built
 //!     from comparisons (`<operand> <op> <operand>`, `op` one of `== != < <= > >=`),
-//!     bare operands (kept when truthy), `and` / `or`, and `( … )` grouping. An
-//!     operand is a path (`.a.b`) or a literal (number / "string" / true / false
-//!     / null).
+//!     string matches (`<path> ~ "pattern"` / `!~`), bare operands (kept when
+//!     truthy), `and` / `or`, and `( … )` grouping. An operand is a path (`.a.b`)
+//!     or a literal (number / "string" / true / false / null). The `~` pattern
+//!     speaks the same dialect as `/` search — plain text is a case-insensitive
+//!     substring, `re:` a regex, `g:` a `*`/`?` glob — and matches only string
+//!     values (anything else is a non-match, never an error).
 //!
 //! Everything is lenient (jq's `?`): a path that doesn't exist on a value simply
 //! produces no output rather than erroring, so `.a.b` over a mixed array yields
@@ -35,6 +38,7 @@
 //! unequal-and-unordered rather than following jq's total type order.
 
 use crate::scanner::{decode_str, Cursor, Kind, MAX_DEPTH};
+use crate::search::Pattern;
 use crate::source::Source;
 use std::cmp::Ordering;
 use std::sync::{
@@ -91,6 +95,14 @@ enum Cond {
     Truthy(Operand),
     /// `<operand> <op> <operand>`.
     Cmp(Operand, CmpOp, Operand),
+    /// `<operand> ~ "pattern"` (or `!~`) — string match against a compiled
+    /// pattern. Holds iff the operand resolves to a string that matches
+    /// (XORed with `negated`); a non-string operand never matches.
+    Match {
+        lhs: Operand,
+        pattern: Pattern,
+        negated: bool,
+    },
     And(Box<Cond>, Box<Cond>),
     Or(Box<Cond>, Box<Cond>),
 }
@@ -398,11 +410,37 @@ fn parse_primary(cs: &[char], i: &mut usize) -> Result<Cond, String> {
     }
     let left = parse_operand(cs, i)?;
     skip_ws(cs, i);
-    if let Some(op) = match_cmp_op(cs, i) {
+    if let Some(negated) = match_tilde(cs, i) {
+        skip_ws(cs, i);
+        let pattern = match parse_operand(cs, i)? {
+            Operand::Lit(Literal::Str(s)) => Pattern::parse(&s)?,
+            _ => return Err("~ needs a \"pattern\" string on its right".into()),
+        };
+        Ok(Cond::Match {
+            lhs: left,
+            pattern,
+            negated,
+        })
+    } else if let Some(op) = match_cmp_op(cs, i) {
         let right = parse_operand(cs, i)?;
         Ok(Cond::Cmp(left, op, right))
     } else {
         Ok(Cond::Truthy(left))
+    }
+}
+
+/// Match a `~` (regex/substring/glob match) or `!~` (negated), advancing past it.
+/// Returns `Some(negated)` on success. `!=` is handled by [`match_cmp_op`] and
+/// won't be mistaken for `!~` since its second char differs.
+fn match_tilde(cs: &[char], i: &mut usize) -> Option<bool> {
+    if *i + 1 < cs.len() && cs[*i] == '!' && cs[*i + 1] == '~' {
+        *i += 2;
+        Some(true)
+    } else if *i < cs.len() && cs[*i] == '~' {
+        *i += 1;
+        Some(false)
+    } else {
+        None
     }
 }
 
@@ -471,7 +509,7 @@ fn parse_operand(cs: &[char], i: &mut usize) -> Result<Operand, String> {
             let start = *i;
             while *i < cs.len()
                 && !cs[*i].is_whitespace()
-                && !matches!(cs[*i], '(' | ')' | ',' | '<' | '>' | '=' | '!')
+                && !matches!(cs[*i], '(' | ')' | ',' | '<' | '>' | '=' | '!' | '~')
             {
                 *i += 1;
             }
@@ -949,6 +987,19 @@ fn cond_holds(b: &[u8], s: usize, e: usize, k: Kind, cond: &Cond) -> bool {
             *op,
             &operand_val(b, s, e, k, c),
         ),
+        Cond::Match {
+            lhs,
+            pattern,
+            negated,
+        } => {
+            // Only a string value can match; anything else (number, container,
+            // missing → null) is a non-match, never an error.
+            let matched = match operand_val(b, s, e, k, lhs) {
+                Val::Str(hay) => pattern.is_match(&hay),
+                _ => false,
+            };
+            matched ^ negated
+        }
         Cond::And(x, y) => cond_holds(b, s, e, k, x) && cond_holds(b, s, e, k, y),
         Cond::Or(x, y) => cond_holds(b, s, e, k, x) || cond_holds(b, s, e, k, y),
     }
@@ -1228,10 +1279,62 @@ mod tests {
     }
 
     #[test]
+    fn select_regex_match() {
+        let b = br#"[{"name":"amy"},{"name":"bob"},{"name":"al"}]"#;
+        // `re:` anchors a real regex: names starting with 'a'.
+        assert_eq!(
+            run(b, r#".[] | select(.name ~ "re:^a") | .name"#, false),
+            vec!["\"amy\"", "\"al\""]
+        );
+    }
+
+    #[test]
+    fn select_substring_and_glob_match() {
+        let b = br#"[{"f":"report.pdf"},{"f":"notes.txt"},{"f":"scan.pdf"}]"#;
+        // Plain text is a case-insensitive substring (same as `/`).
+        assert_eq!(
+            run(b, r#".[] | select(.f ~ "PDF") | .f"#, false),
+            vec!["\"report.pdf\"", "\"scan.pdf\""]
+        );
+        // `g:` is a shell-style glob, so the literal dot must match.
+        assert_eq!(
+            run(b, r#".[] | select(.f ~ "g:*.txt") | .f"#, false),
+            vec!["\"notes.txt\""]
+        );
+    }
+
+    #[test]
+    fn select_negated_match_and_non_strings() {
+        let b = br#"[{"t":"aa"},{"t":"bb"},{"t":7},{"x":1}]"#;
+        // `!~` keeps strings that don't match; the number and the missing field
+        // are non-strings, so they never match and `!~` keeps them too.
+        assert_eq!(
+            run(b, r#".[] | select(.t !~ "aa")"#, false),
+            vec![r#"{"t":"bb"}"#, r#"{"t":7}"#, r#"{"x":1}"#]
+        );
+    }
+
+    #[test]
+    fn select_match_composes_with_boolean_ops() {
+        let b = br#"[{"name":"amy","age":40},{"name":"al","age":10},{"name":"bo","age":50}]"#;
+        assert_eq!(
+            run(
+                b,
+                r#".[] | select(.name ~ "re:^a" and .age > 30) | .name"#,
+                false
+            ),
+            vec!["\"amy\""]
+        );
+    }
+
+    #[test]
     fn parse_errors_are_reported() {
         assert!(parse_pipeline(".foo[").is_err());
         assert!(parse_pipeline("select(.a >)").is_err());
         assert!(parse_pipeline("select(.a and)").is_err());
         assert!(parse_pipeline("select((.a)").is_err());
+        // `~` needs a string pattern, and a bad regex is reported at parse time.
+        assert!(parse_pipeline("select(.a ~ 3)").is_err());
+        assert!(parse_pipeline(r#"select(.a ~ "re:(")"#).is_err());
     }
 }
