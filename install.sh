@@ -1,12 +1,12 @@
 #!/bin/sh
-# rsview installer — downloads the prebuilt binary for your platform and drops it
+# jview installer — downloads the prebuilt binary for your platform and drops it
 # on your PATH. No Rust toolchain required.
 #
 #   curl -fsSL https://raw.githubusercontent.com/vothanhdat/rsview/stable/install.sh | sh
 #
 # Env overrides:
-#   RSVIEW_INSTALL_DIR   where to put the binary (default: $HOME/.local/bin)
-#   RSVIEW_VERSION       a specific tag like v0.10.0 (default: latest release)
+#   JVIEW_INSTALL_DIR   where to put the binary (default: $HOME/.local/bin)
+#   JVIEW_VERSION       a specific tag like v0.10.0 (default: latest release)
 #
 # It fetches from GitHub's releases/latest/download redirect, so it always tracks
 # the newest release without hitting the API (no token, no rate limit).
@@ -14,9 +14,9 @@
 set -eu
 
 REPO="vothanhdat/rsview"
-BIN="rsview"
-INSTALL_DIR="${RSVIEW_INSTALL_DIR:-$HOME/.local/bin}"
-VERSION="${RSVIEW_VERSION:-latest}"
+BIN="jview"
+INSTALL_DIR="${JVIEW_INSTALL_DIR:-$HOME/.local/bin}"
+VERSION="${JVIEW_VERSION:-latest}"
 
 err() { printf 'install: %s\n' "$1" >&2; exit 1; }
 

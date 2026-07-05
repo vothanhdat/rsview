@@ -33,4 +33,4 @@ jobs:
         with:
           python-version: "3.x"
       - run: pip install pyte
-      - run: python tests/e2e/tui_e2e.py target/release/rsview
+      - run: python tests/e2e/tui_e2e.py target/release/jview

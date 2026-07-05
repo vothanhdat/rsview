@@ -1,4 +1,4 @@
-# rsview demo recording — drives the real binary to a lossless PNG sequence,
+# jview demo recording — drives the real binary to a lossless PNG sequence,
 # then assembles a full-color animated WebP for the README. (No GIF: 256-color
 # palette + dithering wreck the text. No video intermediate either: VP9
 # quantization perturbs identical-looking frames just enough that img2webp
@@ -7,7 +7,7 @@
 # Regenerate:
 #   cargo build --release                         # build the binary
 #   node demo/gen.mjs demo/big.json 1             # ~1 GB sample (the whole pitch)
-#   RSVIEW_NO_ENHANCED_KEYS=1 PATH="$PWD/target/release:$PATH" vhs demo/demo.tape
+#   JVIEW_NO_ENHANCED_KEYS=1 PATH="$PWD/target/release:$PATH" vhs demo/demo.tape
 #   node demo/assemble-webp.mjs                   # frames/ -> docs/demo.webp
 #   rm -rf frames demo/big.json
 #
@@ -22,7 +22,7 @@
 
 Output frames/
 
-Require rsview
+Require jview
 
 Set Shell bash
 # Grid is ~2/3 the cols/rows (bigger, more readable text), rendered at 2x pixel
@@ -44,7 +44,7 @@ Sleep 600ms
 # ...opens instantly. The open is captured on-camera here (no Hide). The headless
 # ttyd recorder takes ~2s to first-paint a fresh process — real terminals are
 # instant — so the leading frames are blank; trim them in post if needed.
-Type "rsview demo/big.json"
+Type "jview demo/big.json"
 Sleep 1s
 Enter
 Sleep 1s

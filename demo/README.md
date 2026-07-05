@@ -7,7 +7,7 @@ so it can be refreshed whenever the UI changes.
 cargo build --release                 # 1. build the binary
 node demo/gen.mjs demo/big.json 1     # 2. generate a ~1 GB sample (deterministic)
 brew install vhs ffmpeg webp          # 3. one-time: recorder + ffmpeg + img2webp
-RSVIEW_NO_ENHANCED_KEYS=1 PATH="$PWD/target/release:$PATH" vhs demo/demo.tape   # 4. -> frames/
+JVIEW_NO_ENHANCED_KEYS=1 PATH="$PWD/target/release:$PATH" vhs demo/demo.tape   # 4. -> frames/
 node demo/assemble-webp.mjs           # 5. frames/ -> docs/demo.webp
 rm -rf frames demo/big.json
 ```
@@ -30,12 +30,12 @@ rm -rf frames demo/big.json
   composites them with ffmpeg's `overlay` filter, then runs img2webp lossless
   with `-d <ms>` matched to the tape's `Set Framerate`. End result keeps the
   blinking cursor at the shell prompt that the cursor-less path was dropping.
-- **`RSVIEW_NO_ENHANCED_KEYS=1` is required** on the vhs invocation. vhs records
-  through a headless `ttyd` terminal that never answers rsview's keyboard-
-  enhancement probe, so without it rsview stalls ~2s on a blank screen at startup
+- **`JVIEW_NO_ENHANCED_KEYS=1` is required** on the vhs invocation. vhs records
+  through a headless `ttyd` terminal that never answers jview's keyboard-
+  enhancement probe, so without it jview stalls ~2s on a blank screen at startup
   (a real terminal replies instantly — actual users never see this). vhs passes
   its own environment down to the recorded shell, which is how the var reaches
-  rsview.
+  jview.
 
 `demo/big.json` and the intermediate `frames/` are git-ignored (huge,
 reproducible). Commit only the rendered `docs/demo.webp`.
