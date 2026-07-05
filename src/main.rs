@@ -5,9 +5,11 @@
 //! values), and a level is flattened only as far as the viewport scrolls
 //! (windowing). Opening a multi-GB file stays near-constant memory.
 
+mod filter;
 mod scanner;
 mod search;
 mod source;
+use filter::{parse_pipeline, Filter, Op};
 use scanner::{
     container_empty, decode_str, skip_value, skip_ws, value_kind, Cursor, Kind, RawChild, Step,
     MAX_DEPTH,
@@ -510,6 +512,8 @@ enum Mode {
     Search,
     /// Typing a path to jump to (`:` prompt, e.g. `data.users[3].city`).
     Goto,
+    /// Typing a jq-style filter (`|` prompt, e.g. `.users[] | select(.age > 30)`).
+    Filter,
     /// The bookmark picker overlay (`'`): pick a saved node to jump to.
     Marks,
     /// The keyboard-shortcut cheatsheet overlay (`?`): any key closes it.
@@ -523,6 +527,10 @@ enum KeyOutcome {
     Continue,
     Quit,
     Relaunch,
+    /// Run the pipeline stashed in `App::pending_filter`, opening a result pane.
+    /// Deferred to the run loop because spawning the worker needs an owned byte
+    /// `Source` (a fixed mmap for files, a fresh snapshot for streams).
+    LaunchFilter,
 }
 
 /// One pane: an independent lazy tree + viewport over a byte range of the shared
@@ -578,6 +586,16 @@ struct View {
     bookmarks: Vec<Vec<usize>>,
     /// Selected row in the bookmark picker.
     mark_idx: usize,
+    /// Live filter-input buffer (typed while in `Mode::Filter`).
+    filter_query: String,
+    /// Set when the typed filter failed to parse, so the footer can surface why
+    /// without closing the prompt. Cleared on the next edit.
+    filter_error: Option<String>,
+    /// The running filter for a *result* pane: its streamed hits become this
+    /// pane's synthetic-array children. `None` for ordinary panes.
+    filter: Option<Filter>,
+    /// How many of `filter.hits` are already materialized as root children.
+    filter_added: usize,
 }
 
 /// Build the root node for a buffer. Shared by `App::new` and `App::rebuild`
@@ -935,6 +953,10 @@ impl View {
             bookmarks: Vec::new(),
             mark_idx: 0,
             flatten_incomplete: false,
+            filter_query: String::new(),
+            filter_error: None,
+            filter: None,
+            filter_added: 0,
         }
     }
 
@@ -954,6 +976,13 @@ impl View {
         // Bookmarked paths refer to the old tree; drop them on re-root.
         self.bookmarks.clear();
         self.mark_idx = 0;
+        // A filter's hits point into the old root; drop the worker and its state.
+        if let Some(f) = self.filter.take() {
+            f.cancel();
+        }
+        self.filter_added = 0;
+        self.filter_query.clear();
+        self.filter_error = None;
         self.clear_search();
     }
 
@@ -1030,6 +1059,48 @@ impl View {
             let p = self.search.as_ref().unwrap().matches[self.indexed].clone();
             self.match_set.insert(p);
             self.indexed += 1;
+        }
+    }
+
+    /// Fold any newly-selected filter hits into the result pane's synthetic array
+    /// root as fresh children. Appending (never rebuilding) keeps already-expanded
+    /// children — and their indices — stable as more results stream in.
+    fn pump_filter(&mut self, b: &[u8]) {
+        if self.filter.is_none() {
+            return;
+        }
+        self.filter.as_mut().unwrap().drain();
+        let total = self.filter.as_ref().unwrap().hits.len();
+        while self.filter_added < total {
+            // Snapshot the hit's fields, ending the borrow of `self.filter` before
+            // mutating `self.root`.
+            let (mut label, start, end, kind, end_exact) = {
+                let h = &self.filter.as_ref().unwrap().hits[self.filter_added];
+                (h.label.clone(), h.start, h.end, h.kind, h.end_exact)
+            };
+            if label.is_empty() {
+                label = self.filter_added.to_string();
+            }
+            let is_cont = matches!(kind, Kind::Object | Kind::Array);
+            let has = is_cont && !container_empty(b, start, end);
+            self.root.children.push(Node {
+                label,
+                start,
+                end,
+                end_exact,
+                kind,
+                is_index: false,
+                jsonl: false,
+                has_children: has,
+                expanded: false,
+                done: false,
+                children: Vec::new(),
+                cursor: None,
+            });
+            self.filter_added += 1;
+        }
+        if self.filter_added > 0 {
+            self.root.has_children = true;
         }
     }
 
@@ -1264,6 +1335,20 @@ struct App {
     /// Set by `p` to the focused node's byte range; the viewer quits and the
     /// caller writes that slice to the reserved stdout on the way out.
     extract: Option<(usize, usize)>,
+    /// A filter awaiting launch: stashed by the `|` prompt, consumed by the run
+    /// loop (which has the owned byte `Source` the worker needs).
+    pending_filter: Option<PendingFilter>,
+}
+
+/// A parsed, ready-to-run filter plus the pane range it should evaluate over.
+struct PendingFilter {
+    ops: Vec<Op>,
+    /// The raw expression, kept for the result pane's title.
+    expr: String,
+    start: usize,
+    end: usize,
+    kind: Kind,
+    jsonl: bool,
 }
 
 impl App {
@@ -1277,6 +1362,7 @@ impl App {
             flash: None,
             can_extract: false,
             extract: None,
+            pending_filter: None,
         }
     }
 
@@ -1518,6 +1604,46 @@ impl App {
             self.views[self.active].preview_child = Some(id);
         }
     }
+
+    /// Launch the pending filter: spawn its worker over `src` and open a new
+    /// child pane whose synthetic array root collects the selected nodes as they
+    /// stream in. A no-op if nothing is pending. `src` is the owned byte source
+    /// (the session mmap, or a stream snapshot) the worker reads.
+    fn launch_filter(&mut self, src: &Arc<Source>) {
+        let Some(pf) = self.pending_filter.take() else {
+            return;
+        };
+        let filter = Filter::spawn(Arc::clone(src), pf.ops, pf.jsonl, pf.start, pf.end, pf.kind);
+        // Keep the title compact so the live `N hits` count stays visible even in
+        // a narrow split pane; the full expression is what the user just typed.
+        let name = format!("| {}", truncate(&pf.expr, 28));
+        // A synthetic, pre-expanded array whose children are appended by
+        // `View::pump_filter`. It owns no cursor: the worker, not a byte range,
+        // is its source of children (`start`/`end` are the searched range, so a
+        // whole-root copy still slices something sane).
+        let root = Node {
+            label: name.clone(),
+            start: pf.start,
+            end: pf.end,
+            end_exact: false,
+            kind: Kind::Array,
+            is_index: false,
+            jsonl: false,
+            has_children: false,
+            expanded: true,
+            done: false,
+            children: Vec::new(),
+            cursor: None,
+        };
+        let parent = self.views[self.active].id;
+        let id = self.alloc_id();
+        let mut v = View::with_root(root, name, true);
+        v.id = id;
+        v.parent = Some(parent);
+        v.filter = Some(filter);
+        self.views.push(v);
+        self.active = self.views.len() - 1;
+    }
 }
 
 /// Walk the focus `path` from the root, collecting each ancestor's label and a
@@ -1742,11 +1868,20 @@ fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Option<&str>) {
             format!(" :{}   ↵ jump · esc cancel", view.goto),
             Style::default().fg(Color::Yellow),
         )
+    } else if view.mode == Mode::Filter {
+        let hint = match view.filter_error.as_deref() {
+            Some(e) => format!("({e})"),
+            None => "↵ run → new pane · esc cancel".to_string(),
+        };
+        Span::styled(
+            format!(" |{}   {hint}", view.filter_query),
+            Style::default().fg(Color::Yellow),
+        )
     } else if let Some(msg) = flash {
         Span::styled(format!(" {msg}"), Style::default().fg(Color::Green))
     } else {
         Span::styled(
-            " ↑/↓ move · enter expand · / search · : goto · y copy · ? help · q quit",
+            " ↑/↓ move · enter expand · / search · : goto · | filter · y copy · ? help · q quit",
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -1838,6 +1973,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("/", "search · re:rx · g:glob"),
         ("↵  ⇧↵", "next / prev match"),
         (":", "jump to a path · *? in keys"),
+        ("|", "jq-style filter → new pane"),
         ("m", "toggle bookmark"),
         ("'", "bookmark picker"),
         ("y / Y", "copy value / path"),
@@ -1950,6 +2086,12 @@ fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: 
     let n_rows = view.rows.iter().filter(|r| !r.loading).count();
     let pos = (view.focus + 1).min(n_rows.max(1));
     let mut prefix = format!(" {marker}{}   {}/{}+", view.name, pos, n_rows);
+    if let Some(f) = view.filter.as_ref() {
+        // A filter result pane: show how many nodes matched, with a `+` while the
+        // worker is still scanning.
+        let more = if f.finished { "" } else { "+" };
+        prefix.push_str(&format!("   {} hits{more}", f.hits.len()));
+    }
     if streaming {
         prefix.push_str("   ⟳ streaming");
     }
@@ -2135,6 +2277,62 @@ fn process_key(
         return KeyOutcome::Continue;
     }
 
+    // Filter mode: a `|` jq-style prompt. Enter parses the pipeline and (on
+    // success) hands it to the run loop to open a result pane; Esc cancels.
+    if app.active_view().mode == Mode::Filter {
+        match k.code {
+            KeyCode::Esc => {
+                let v = app.active_mut();
+                v.mode = Mode::Normal;
+                v.filter_query.clear();
+                v.filter_error = None;
+            }
+            KeyCode::Enter => {
+                let expr = app.active_view().filter_query.trim().to_string();
+                if expr.is_empty() {
+                    let v = app.active_mut();
+                    v.mode = Mode::Normal;
+                    v.filter_error = None;
+                    return KeyOutcome::Continue;
+                }
+                match parse_pipeline(&expr) {
+                    Ok(ops) => {
+                        let (start, end, kind, jsonl) = {
+                            let r = &app.active_view().root;
+                            (r.start, r.end, r.kind, r.jsonl)
+                        };
+                        app.pending_filter = Some(PendingFilter {
+                            ops,
+                            expr,
+                            start,
+                            end,
+                            kind,
+                            jsonl,
+                        });
+                        let v = app.active_mut();
+                        v.mode = Mode::Normal;
+                        v.filter_query.clear();
+                        v.filter_error = None;
+                        return KeyOutcome::LaunchFilter;
+                    }
+                    Err(e) => app.active_mut().filter_error = Some(e),
+                }
+            }
+            KeyCode::Backspace => {
+                let v = app.active_mut();
+                v.filter_query.pop();
+                v.filter_error = None;
+            }
+            KeyCode::Char(c) => {
+                let v = app.active_mut();
+                v.filter_query.push(c);
+                v.filter_error = None;
+            }
+            _ => {}
+        }
+        return KeyOutcome::Continue;
+    }
+
     // Marks mode: the bookmark picker overlay. j/k move, Enter jumps, d deletes.
     if app.active_view().mode == Mode::Marks {
         let v = app.active_mut();
@@ -2221,6 +2419,14 @@ fn process_key(
             let v = app.active_mut();
             v.mode = Mode::Goto;
             v.goto.clear();
+            return KeyOutcome::Continue;
+        }
+        // `|` opens the jq-style filter prompt; Enter opens a result pane.
+        KeyCode::Char('|') => {
+            let v = app.active_mut();
+            v.mode = Mode::Filter;
+            v.filter_query.clear();
+            v.filter_error = None;
             return KeyOutcome::Continue;
         }
         KeyCode::Char('m') => {
@@ -2353,6 +2559,7 @@ fn pump_input(app: &mut App, b: &[u8], h: usize, poll_ms: u64) -> std::io::Resul
             Event::Key(k) if k.kind == KeyEventKind::Press => match process_key(app, k, b, h) {
                 KeyOutcome::Quit => return Ok(KeyOutcome::Quit),
                 KeyOutcome::Relaunch => outcome = KeyOutcome::Relaunch,
+                KeyOutcome::LaunchFilter => outcome = KeyOutcome::LaunchFilter,
                 KeyOutcome::Continue => {}
             },
             Event::Mouse(m) => {
@@ -2390,20 +2597,22 @@ fn run(
     mmap: &Arc<Source>,
 ) -> std::io::Result<()> {
     loop {
-        // Fold in any matches the worker threads have produced since last frame.
+        // Fold in any matches / filter hits the worker threads produced last frame.
         for v in &mut app.views {
             v.pump_search();
+            v.pump_filter(b);
         }
         render_frame(term, app, b, false)?;
         let h = app.active_height(term_area()?);
         // While a flatten is mid-skip, don't block on input: poll at 0 ms and loop
         // so the next frame steps the skip another `FLATTEN_BUDGET` (still
         // dispatching any key pressed meanwhile). Otherwise a short poll so
-        // streaming match counts keep ticking even when idle.
+        // streaming match/filter counts keep ticking even when idle.
         let poll_ms = if app.flatten_pending() { 0 } else { 100 };
         match pump_input(app, b, h, poll_ms)? {
             KeyOutcome::Quit => return Ok(()),
             KeyOutcome::Relaunch => app.active_mut().relaunch(mmap),
+            KeyOutcome::LaunchFilter => app.launch_filter(mmap),
             KeyOutcome::Continue => {}
         }
     }
@@ -2463,6 +2672,11 @@ fn run_stream(
         // then release it so a search relaunch can snapshot it below.
         let outcome = {
             let b: &[u8] = buf;
+            // Fold in filter hits here, where the live buffer is borrowed (a stream
+            // only appends, so a hit's offsets stay valid against the grown buffer).
+            for v in &mut app.views {
+                v.pump_filter(b);
+            }
             render_frame(term, app, b, !done)?;
             let h = app.active_height(term_area()?);
             // 0 ms while a flatten is mid-skip (resume the skip next frame); 100 ms
@@ -2477,6 +2691,12 @@ fn run_stream(
                 // but one search covers what's arrived at its launch).
                 let snap = Arc::new(Source::Buffered(buf.clone()));
                 app.active_mut().relaunch(&snap);
+            }
+            KeyOutcome::LaunchFilter => {
+                // Filter over a snapshot of the bytes arrived so far, mirroring
+                // search: the result pane reflects the document at launch time.
+                let snap = Arc::new(Source::Buffered(buf.clone()));
+                app.launch_filter(&snap);
             }
             KeyOutcome::Continue => {}
         }

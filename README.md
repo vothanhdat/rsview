@@ -61,6 +61,7 @@ From a checkout: `cargo run --release -- file.json`.
 | `/` | search (live — results stream as you type) |
 | `Enter`/`↓` · `Shift-Enter`/`↑` (in search) | next / previous match |
 | `:` | jump to a path — absolute or relative to the cursor |
+| `\|` | jq-style filter — opens a result pane of the selected nodes |
 | `m` · `'` | bookmark the focused node · open the bookmark picker |
 | `y` · `Y` | copy the focused value/subtree · copy its path |
 | `p` | pipe the focused node's JSON to stdout (when output is redirected) |
@@ -85,6 +86,19 @@ the richer ones:
   default). Prefix with `re:` for a full regex (`re:^id_\w+$`) or `g:` for a
   glob (`g:user*`); a bad pattern shows `(bad pattern: …)` in the footer so you
   can fix it without losing what you typed.
+- **Filter (`|`)** — a jq-style **selection** pipeline that opens a new pane
+  listing the nodes it picks out (`.users[] | select(.age > 30) | .name`). It
+  supports field access (`.foo.bar`, `["odd.key"]`), indexing (`.[3]`),
+  iteration (`.[]` over an array's elements or an object's values), `select(…)`
+  with a comparison (`== != < <= > >=` against a number / `"string"` / `true` /
+  `false` / `null`) or a bare truthy path, and `|` pipes. Because it only
+  *selects* sub-values that already exist — it never builds new ones — each
+  result is a zero-copy byte range into the file, so filtering a multi-GB
+  document collects offsets rather than materializing values, and results stream
+  into the pane as the worker scans (the title shows a live `N hits` count).
+  Missing paths are skipped rather than erroring (jq's `?`); a malformed
+  expression shows the reason in the footer without closing the prompt. NDJSON
+  feeds each document through the pipeline in turn.
 - **Bookmarks (`m`/`'`)** — `m` toggles one on the focused node; `'` opens a picker
   (`↵` jump, `d` delete). Per-pane, session-lived.
 - **Copy (`y`/`Y`)** — goes through the terminal via

@@ -149,6 +149,35 @@ def scenario_sibling_nav(binary):
         t.close()
 
 
+def scenario_filter(binary):
+    print("filter: | jq-style selection opens a result pane")
+    t = Tui(binary, {"users": [
+        {"name": "amy", "age": 20},
+        {"name": "bob", "age": 40},
+        {"name": "cara", "age": 60},
+    ]})
+    try:
+        # A bad expression reports the reason and keeps the prompt open.
+        t.send("|"); t.send("select(.a >)"); t.send("\r")
+        check("malformed filter shows the parse error in the footer",
+              "not a value to compare" in t.footer(), t)
+        t.send("\x1b")  # esc out of the prompt
+        # A real selection pipeline opens a result pane of the picked nodes.
+        t.send("|"); t.send(".users[] | select(.age > 30) | .name"); t.send("\r")
+        t.pump(0.8)  # let the worker stream its hits in
+        scr = t.dump()
+        check("result pane lists the two matching names",
+              '"bob"' in scr and '"cara"' in scr, t)
+        check("filtered-out value is absent from the result pane",
+              '"amy"' not in scr, t)
+        check("result pane title shows a hit count",
+              "2 hit" in t.title(), t)
+        check("result labels carry the origin path",
+              "users[1].name" in scr, t)
+    finally:
+        t.close()
+
+
 def scenario_help_overlay(binary):
     print("help: ? overlay + trimmed footer")
     t = Tui(binary, {"a": {"b": 1}, "c": [1, 2, 3]})
@@ -175,6 +204,7 @@ def main():
 
     scenario_jump_relative_and_climb(binary)
     scenario_sibling_nav(binary)
+    scenario_filter(binary)
     scenario_help_overlay(binary)
 
     print()
