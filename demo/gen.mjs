@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Generate a large, realistically-nested JSON file for the rsview demo GIF.
+// Generate a large, realistically-nested JSON file for the jview demo GIF.
 // Deterministic (fixed PRNG seed) so the recording is reproducible.
 //
 //   node demo/gen.mjs demo/big.json 1      # ~1 GB  (the "opens instantly" shot)

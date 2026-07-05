@@ -2,7 +2,7 @@ name: release
 
 # Build prebuilt binaries for all common platforms and attach them to the
 # GitHub Release whenever a v* tag is pushed. The archive names are
-# cargo-binstall-compatible, so `cargo binstall rsview` pulls these directly.
+# cargo-binstall-compatible, so `cargo binstall jview` pulls these directly.
 
 on:
   push:
@@ -25,8 +25,8 @@ jobs:
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" \
                  --repo "$GITHUB_REPOSITORY" \
-                 --title "rsview $GITHUB_REF_NAME" \
-                 --notes "Prebuilt binaries for Linux (x86_64/arm64), macOS (Intel/Apple Silicon), and Windows. Or install with \`cargo binstall rsview\`."
+                 --title "jview $GITHUB_REF_NAME" \
+                 --notes "Prebuilt binaries for Linux (x86_64/arm64), macOS (Intel/Apple Silicon), and Windows. Or install with \`cargo binstall jview\`."
 
   upload-binaries:
     needs: create-release
@@ -52,12 +52,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - name: Build and upload rsview
+      - name: Build and upload jview
         uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: rsview
+          bin: jview
           target: ${{ matrix.target }}
-          # → rsview-<target>.tar.gz (.zip on Windows), uploaded to the tag's release.
+          # → jview-<target>.tar.gz (.zip on Windows), uploaded to the tag's release.
           archive: $bin-$target
           token: ${{ secrets.GITHUB_TOKEN }}
 

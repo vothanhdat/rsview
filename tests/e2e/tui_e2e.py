@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""End-to-end TUI tests for rsview.
+"""End-to-end TUI tests for jview.
 
 Drives the real binary inside a pseudo-terminal and asserts on what it paints,
 using pyte as a headless terminal emulator. This is the kind of thing unit tests
 can't reach — actual key handling, sticky headers, overlays, and the footer.
 
 Usage:
-    python tests/e2e/tui_e2e.py [path-to-rsview]      # default: target/release/rsview
+    python tests/e2e/tui_e2e.py [path-to-jview]      # default: target/release/jview
 
 Requires: pyte  (pip install pyte).  Unix only (uses pty.fork).
 Exits 0 if every scenario passes, 1 otherwise.
@@ -31,10 +31,10 @@ FAILS = []
 
 
 class Tui:
-    """A running rsview in a pty, with a pyte screen mirroring its output."""
+    """A running jview in a pty, with a pyte screen mirroring its output."""
 
     def __init__(self, binary, doc):
-        self.path = f"/tmp/rsview_e2e_{os.getpid()}.json"
+        self.path = f"/tmp/jview_e2e_{os.getpid()}.json"
         with open(self.path, "w") as f:
             json.dump(doc, f)
         self.screen = pyte.Screen(COLS, ROWS)
@@ -168,7 +168,7 @@ def scenario_help_overlay(binary):
 
 
 def main():
-    binary = sys.argv[1] if len(sys.argv) > 1 else "target/release/rsview"
+    binary = sys.argv[1] if len(sys.argv) > 1 else "target/release/jview"
     if not os.path.exists(binary):
         sys.exit(f"binary not found: {binary} (build it: cargo build --release)")
     binary = os.path.abspath(binary)

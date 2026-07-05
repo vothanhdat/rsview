@@ -1,10 +1,10 @@
-# rsview
+# jview
 
 **Browse, navigate, and search multi-GB JSON in the terminal at near-constant memory.**
 
-![rsview opening a 1 GB JSON file instantly](docs/demo.webp)
+![jview opening a 1 GB JSON file instantly](docs/demo.webp)
 
-rsview memory-maps a JSON file and parses it *on expand* — subtrees are byte
+jview memory-maps a JSON file and parses it *on expand* — subtrees are byte
 ranges into the mmap, never materialized — so opening a 1 GB document sits around
 **2.6 MB RSS** and first paint is near-instant whatever the file size. Rows are
 syntax-colored and collapsed containers show an inline preview of their first few
@@ -13,7 +13,7 @@ children. It's a native Rust port of
 proof-of-concept, not a finished product).
 
 Point it at a file, or pipe into it. Piped input **streams** — `curl -s … |
-rsview` renders the document as bytes arrive, and your cursor and expanded nodes
+jview` renders the document as bytes arrive, and your cursor and expanded nodes
 stay put as it fills in. (A stream can't be memory-mapped, so it's buffered and
 re-parsed on a throttle; the constant-memory property is the file path's.)
 
@@ -29,8 +29,8 @@ It picks the right build (Linux x86_64/arm64, macOS Intel/Apple Silicon) and
 drops it in `~/.local/bin`. Or, if you'd rather:
 
 ```sh
-cargo binstall rsview      # prebuilt binary via cargo-binstall
-cargo install  rsview      # compile from crates.io
+cargo binstall jview      # prebuilt binary via cargo-binstall
+cargo install  jview      # compile from crates.io
 ```
 
 Windows binaries (and every release archive) are attached to each
@@ -39,9 +39,9 @@ Windows binaries (and every release archive) are attached to each
 Then:
 
 ```sh
-rsview path/to/file.json
-cat file.json | rsview                            # pipe it (NDJSON auto-detected)
-curl -s https://raw.githubusercontent.com/json-iterator/test-data/refs/heads/master/large-file.json | rsview # streams as it downloads
+jview path/to/file.json
+cat file.json | jview                            # pipe it (NDJSON auto-detected)
+curl -s https://raw.githubusercontent.com/json-iterator/test-data/refs/heads/master/large-file.json | jview # streams as it downloads
 ```
 
 From a checkout: `cargo run --release -- file.json`.
@@ -91,8 +91,8 @@ the richer ones:
   [OSC 52](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Operating-System-Commands),
   so it needs no clipboard library and **works over SSH** (capped ~1 MiB; in tmux
   set `set -g set-clipboard on`).
-- **Pipe out (`p`)** — when you redirect rsview's output
-  (`rsview big.json | jq …`, or `> node.json`), the UI renders on your terminal
+- **Pipe out (`p`)** — when you redirect jview's output
+  (`jview big.json | jq …`, or `> node.json`), the UI renders on your terminal
   and `p` writes the focused node's raw JSON to that pipe/file, then quits. The
   payload is a zero-copy slice of the mmap and **uncapped**, so it's the way to
   carve one subtree out of a file too big for `jq` to open and hand just that
@@ -137,11 +137,11 @@ query engines — `jq --stream`, DuckDB's `read_json_auto`,
 [simdjson](https://github.com/simdjson/simdjson) — stay near-constant memory but
 aren't *browsers*: you pipe data through them, you don't navigate it.
 
-rsview takes the overlap those two camps leave open: **browse and search a
+jview takes the overlap those two camps leave open: **browse and search a
 multi-GB file interactively, at near-constant memory.** It is deliberately *not* a
 transform tool — constructing new values means materializing them, forfeiting the
 very property that makes it useful on a huge file. Reach for `jq` or DuckDB to
-*produce* data; reach for rsview to *read* a file too big to open comfortably
+*produce* data; reach for jview to *read* a file too big to open comfortably
 anywhere else — then `p` hands the one subtree you navigated to straight to `jq`,
 which could never have opened the whole file itself.
 

@@ -1,4 +1,4 @@
-//! rsview — proof-of-concept lazy JSON viewer in Rust.
+//! jview — proof-of-concept lazy JSON viewer in Rust.
 //!
 //! Demonstrates the core of react-obj-view's CLI in native Rust: a file is
 //! memory-mapped, parsed on expand (subtrees are byte ranges, not materialized
@@ -591,7 +591,7 @@ fn make_root(b: &[u8], name: &str, jsonl: bool) -> Node {
     } else {
         let rstart = skip_ws(b, 0, b.len());
         if rstart >= b.len() {
-            // Empty / whitespace-only input (e.g. `rsview </dev/null`, or a stream
+            // Empty / whitespace-only input (e.g. `jview </dev/null`, or a stream
             // with no data yet): show an empty root rather than indexing past the
             // buffer in value_kind.
             (rstart, Kind::Null, false)
@@ -2196,12 +2196,12 @@ fn process_key(
         }
         // `p` pipes the focused node's raw JSON out: it records the range and
         // quits, and the caller writes that slice to the reserved stdout. Only
-        // meaningful when stdout is redirected (`rsview … | jq`) — into a
+        // meaningful when stdout is redirected (`jview … | jq`) — into a
         // terminal there's nowhere to pipe, so show a hint instead of quitting.
         KeyCode::Char('p') => {
             if !app.can_extract {
                 app.flash =
-                    Some("pipe rsview into a command (e.g. | jq) to extract a node".to_string());
+                    Some("pipe jview into a command (e.g. | jq) to extract a node".to_string());
                 return KeyOutcome::Continue;
             }
             match app.focused_range() {
@@ -2587,8 +2587,8 @@ fn enable_enhanced_keys() -> bool {
     // `supports_keyboard_enhancement()` sends a query and blocks until the
     // terminal replies (or a ~2s timeout). Terminals that never answer — ttyd,
     // some multiplexers/pty wrappers — stall startup for that whole window.
-    // RSVIEW_NO_ENHANCED_KEYS=1 skips the probe (used by the demo recording).
-    if std::env::var_os("RSVIEW_NO_ENHANCED_KEYS").is_some() {
+    // JVIEW_NO_ENHANCED_KEYS=1 skips the probe (used by the demo recording).
+    if std::env::var_os("JVIEW_NO_ENHANCED_KEYS").is_some() {
         return false;
     }
     if supports_keyboard_enhancement().unwrap_or(false) {
@@ -2629,7 +2629,7 @@ const EXTRACT_HINT: &str = "output piped — press p to extract the focused node
 /// Where an extracted node's JSON goes when the viewer exits after `p`.
 ///
 /// A full-screen TUI and clean piped data can't share fd 1. When stdout is
-/// redirected (`rsview f.json | jq`, `> out.json`) we dup the real stdout aside
+/// redirected (`jview f.json | jq`, `> out.json`) we dup the real stdout aside
 /// here and point fd 1 at the controlling terminal, so every existing
 /// `stdout()` render/escape lands on the tty while the pipe stays pristine for
 /// the payload. When stdout is already a terminal there's nothing to pipe into,
@@ -2788,7 +2788,7 @@ fn run_file(path: String) -> std::io::Result<()> {
 fn run_stdin() -> std::io::Result<()> {
     let rx = spawn_reader(take_pipe_reader());
     // stdin was the pipe; fd 0 is now the terminal (reattached above). Reserve
-    // stdout so `… | rsview | jq` can extract a node into the downstream pipe.
+    // stdout so `… | jview | jq` can extract a node into the downstream pipe.
     let payload = reserve_stdout_for_payload();
     let mut buf: Vec<u8> = Vec::new();
     let mut jsonl = false;
@@ -2816,11 +2816,11 @@ fn run_stdin() -> std::io::Result<()> {
 }
 
 const USAGE: &str = "\
-rsview — browse, navigate and search multi-GB JSON in the terminal
+jview — browse, navigate and search multi-GB JSON in the terminal
 
 USAGE:
-    rsview <file.json>          open a file
-    cat file.json | rsview      or pipe JSON in (NDJSON auto-detected)
+    jview <file.json>          open a file
+    cat file.json | jview      or pipe JSON in (NDJSON auto-detected)
 
 OPTIONS:
     -h, --help       print this help
@@ -2831,7 +2831,7 @@ Keys: ↑/↓ move · enter expand · / search · : goto · y copy · ? help · 
 fn main() -> std::io::Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("-V" | "--version") => {
-            println!("rsview {}", env!("CARGO_PKG_VERSION"));
+            println!("jview {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("-h" | "--help") => {
@@ -2841,7 +2841,7 @@ fn main() -> std::io::Result<()> {
         Some(_) => run_file(std::env::args().nth(1).unwrap()),
         None => {
             if std::io::stdin().is_terminal() {
-                eprintln!("usage: rsview <file.json>   (or pipe JSON: cat file.json | rsview)");
+                eprintln!("usage: jview <file.json>   (or pipe JSON: cat file.json | jview)");
                 std::process::exit(2);
             }
             run_stdin()
@@ -3171,7 +3171,7 @@ mod tests {
         assert_eq!(inner, 5, "inner object starts at the second brace");
         // Pass a deliberately over-long provisional end (whole doc) to prove
         // skip_value stops at the inner `}` rather than slicing into `,"c":9}`.
-        let path = std::env::temp_dir().join(format!("rsview-extract-{}.json", std::process::id()));
+        let path = std::env::temp_dir().join(format!("jview-extract-{}.json", std::process::id()));
         let f = File::create(&path).expect("temp file");
         let sink = Payload {
             enabled: true,
