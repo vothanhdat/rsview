@@ -127,6 +127,40 @@ def scenario_jump_relative_and_climb(binary):
         t.close()
 
 
+def scenario_line_editing(binary):
+    print("prompts: caret editing (arrows, Home/End, mid-string insert)")
+    t = Tui(binary, {"alpha": {"beta": 1}, "gamma": 2})
+    try:
+        # Mid-string insertion: type a path missing a letter, move the caret back
+        # into it with ←, and insert — something an append-only prompt can't do.
+        t.send(":"); t.send("alpha.eta")
+        t.send("\x1b[D\x1b[D\x1b[D")     # ← ← ←  → caret before "eta"
+        t.send("b")                       # → "alpha.beta"
+        t.send("\r")
+        check("← then insert fixes the path mid-string (alpha.beta)",
+              "alpha › beta" in t.title(), t)
+
+        # The filter footer echoes the typed text verbatim, so it's a clean mirror
+        # of the edit buffer. Exercise insert-at-caret, Home/End, and Backspace.
+        t.send("|"); t.send("hello")
+        t.send("\x1b[D\x1b[D")            # ← ←  → caret between "hel|lo"
+        t.send("XY")                      # → "helXYlo"
+        check("insert at an interior caret",
+              "helXYlo" in t.footer(), t)
+        t.send("\x01"); t.send(">")       # Ctrl-A (home) then prepend
+        check("Ctrl-A homes the caret; text prepends",
+              ">helXYlo" in t.footer(), t)
+        t.send("\x05"); t.send("<")       # Ctrl-E (end) then append
+        check("Ctrl-E ends the caret; text appends",
+              ">helXYlo<" in t.footer(), t)
+        t.send("\x7f")                    # Backspace at end
+        check("Backspace deletes before the caret",
+              ">helXYlo<" not in t.footer() and ">helXYlo" in t.footer(), t)
+        t.send("\x1b")                    # cancel the prompt
+    finally:
+        t.close()
+
+
 def scenario_sibling_nav(binary):
     print("siblings: J / K step over subtrees")
     t = Tui(binary, {"events": [
@@ -289,6 +323,7 @@ def main():
     binary = os.path.abspath(binary)
 
     scenario_jump_relative_and_climb(binary)
+    scenario_line_editing(binary)
     scenario_sibling_nav(binary)
     scenario_filter(binary)
     scenario_peek(binary)

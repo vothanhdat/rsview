@@ -73,6 +73,12 @@ From a checkout: `cargo run --release -- file.json`.
 Press `?` in-app for the full list; the footer shows only the core keys. Notes on
 the richer ones:
 
+- **Editing the prompts** — the `/`, `:`, and `|` inputs are real single-line
+  fields with a visible caret: `←`/`→` move it, `Home`/`End` (or `Ctrl-A`/`Ctrl-E`)
+  jump to the ends, `Backspace`/`Delete` remove either side of it, and
+  `Ctrl-W`/`Ctrl-U`/`Ctrl-K` delete the previous word / to the start / to the end.
+  Editing anywhere in a `/` query re-runs the live search; moving the caret alone
+  doesn't.
 - **Jump (`:`)** — type a path, **absolute** (`data.users[3].city`; leading `$`
   optional, `["odd.key"]` brackets allowed) or **relative** to the cursor,
   Python-import style: `.actor` descends, `..sibling` climbs to the parent, `...x`

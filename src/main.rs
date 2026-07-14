@@ -32,7 +32,7 @@ use std::{
     io::{IsTerminal, Read},
     sync::{
         mpsc::{self, Receiver, TryRecvError},
-        Arc,
+        Arc, Weak,
     },
     thread,
     time::{Duration, Instant},
@@ -556,6 +556,124 @@ enum KeyOutcome {
     LaunchFilter,
 }
 
+/// A single-line editable text field — the model behind the `/`, `:`, and `|`
+/// prompts. It tracks a caret so the prompts support real in-place editing
+/// (arrow keys, Home/End, delete-forward, word/line kill) instead of the old
+/// append-only "type at the end, backspace off the end".
+#[derive(Default)]
+struct TextInput {
+    text: String,
+    /// Caret as a byte offset into `text`, always on a char boundary and in
+    /// `0..=text.len()`; equal to `text.len()` at the end of the line.
+    caret: usize,
+}
+
+impl TextInput {
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+    fn clear(&mut self) {
+        self.text.clear();
+        self.caret = 0;
+    }
+    /// Insert a char at the caret and step over it.
+    fn insert(&mut self, c: char) {
+        self.text.insert(self.caret, c);
+        self.caret += c.len_utf8();
+    }
+    /// Delete the char before the caret (Backspace); no-op at the start.
+    fn backspace(&mut self) {
+        if let Some(c) = self.text[..self.caret].chars().next_back() {
+            self.caret -= c.len_utf8();
+            self.text.remove(self.caret);
+        }
+    }
+    /// Delete the char at the caret (Delete); no-op at the end.
+    fn delete(&mut self) {
+        if self.caret < self.text.len() {
+            self.text.remove(self.caret);
+        }
+    }
+    fn left(&mut self) {
+        if let Some(c) = self.text[..self.caret].chars().next_back() {
+            self.caret -= c.len_utf8();
+        }
+    }
+    fn right(&mut self) {
+        if let Some(c) = self.text[self.caret..].chars().next() {
+            self.caret += c.len_utf8();
+        }
+    }
+    fn home(&mut self) {
+        self.caret = 0;
+    }
+    fn end(&mut self) {
+        self.caret = self.text.len();
+    }
+    /// Delete the word before the caret (Ctrl-W): trailing spaces, then the run
+    /// of non-spaces up to the previous boundary.
+    fn delete_word(&mut self) {
+        let head = self.text[..self.caret].trim_end_matches(' ');
+        let cut = head.rfind(' ').map_or(0, |i| i + 1);
+        self.text.replace_range(cut..self.caret, "");
+        self.caret = cut;
+    }
+    /// Delete everything before the caret (Ctrl-U).
+    fn clear_to_start(&mut self) {
+        self.text.replace_range(..self.caret, "");
+        self.caret = 0;
+    }
+    /// Delete everything from the caret to the end (Ctrl-K).
+    fn kill_to_end(&mut self) {
+        self.text.truncate(self.caret);
+    }
+    /// Apply one line-editing key. Returns `Some(changed)` when `code` is an
+    /// editing/navigation key (`changed` = whether the text was modified; caret
+    /// moves count as handled-but-unchanged), or `None` when the key isn't ours
+    /// (Enter/Esc/Up/Down — the caller decides those).
+    fn edit(&mut self, code: KeyCode, ctrl: bool) -> Option<bool> {
+        match code {
+            KeyCode::Char(c) if ctrl => match c {
+                'a' => Some(self.moved(Self::home)),
+                'e' => Some(self.moved(Self::end)),
+                'b' => Some(self.moved(Self::left)),
+                'f' => Some(self.moved(Self::right)),
+                'h' => Some(self.changed(Self::backspace)),
+                'd' => Some(self.changed(Self::delete)),
+                'w' => Some(self.changed(Self::delete_word)),
+                'u' => Some(self.changed(Self::clear_to_start)),
+                'k' => Some(self.changed(Self::kill_to_end)),
+                _ => None,
+            },
+            KeyCode::Char(c) => {
+                self.insert(c);
+                Some(true)
+            }
+            KeyCode::Backspace => Some(self.changed(Self::backspace)),
+            KeyCode::Delete => Some(self.changed(Self::delete)),
+            KeyCode::Left => Some(self.moved(Self::left)),
+            KeyCode::Right => Some(self.moved(Self::right)),
+            KeyCode::Home => Some(self.moved(Self::home)),
+            KeyCode::End => Some(self.moved(Self::end)),
+            _ => None,
+        }
+    }
+    /// Run a caret move; always reports "unchanged" (text is untouched).
+    fn moved(&mut self, f: impl FnOnce(&mut Self)) -> bool {
+        f(self);
+        false
+    }
+    /// Run an edit and report whether it actually changed the text.
+    fn changed(&mut self, f: impl FnOnce(&mut Self)) -> bool {
+        let before = self.text.len();
+        f(self);
+        self.text.len() != before
+    }
+}
+
 /// One pane: an independent lazy tree + viewport over a byte range of the shared
 /// `Source`. The main pane is the whole document; a split pane (`derived`) is
 /// rooted at another pane's focused node. Each keeps its own focus, scroll,
@@ -582,7 +700,7 @@ struct View {
     rows: Vec<Row>,
     mode: Mode,
     /// Live search-input buffer (typed while in `Mode::Search`).
-    query: String,
+    query: TextInput,
     /// Set when the typed `re:`/`g:` query failed to compile, so the footer can
     /// surface "(bad pattern)" without re-parsing. Cleared on a clean compile.
     query_error: Option<String>,
@@ -604,13 +722,13 @@ struct View {
     /// blocking on input — until it clears. Always false after a jump.
     flatten_incomplete: bool,
     /// Live path-input buffer (typed while in `Mode::Goto`).
-    goto: String,
+    goto: TextInput,
     /// Saved node paths (`m` toggles), jumped to via the `'` picker overlay.
     bookmarks: Vec<Vec<usize>>,
     /// Selected row in the bookmark picker.
     mark_idx: usize,
     /// Live filter-input buffer (typed while in `Mode::Filter`).
-    filter_query: String,
+    filter_query: TextInput,
     /// Set when the typed filter failed to parse, so the footer can surface why
     /// without closing the prompt. Cleared on the next edit.
     filter_error: Option<String>,
@@ -966,7 +1084,7 @@ impl View {
             scroll: 0,
             rows: Vec::new(),
             mode: Mode::Normal,
-            query: String::new(),
+            query: TextInput::default(),
             query_error: None,
             search: None,
             match_idx: 0,
@@ -974,11 +1092,11 @@ impl View {
             indexed: 0,
             want_path: None,
             landed: false,
-            goto: String::new(),
+            goto: TextInput::default(),
             bookmarks: Vec::new(),
             mark_idx: 0,
             flatten_incomplete: false,
-            filter_query: String::new(),
+            filter_query: TextInput::default(),
             filter_error: None,
             filter: None,
             filter_added: 0,
@@ -1090,7 +1208,7 @@ impl View {
         if self.query.is_empty() {
             return;
         }
-        let pattern = match Pattern::parse(&self.query) {
+        let pattern = match Pattern::parse(self.query.as_str()) {
             Ok(p) => p,
             Err(e) => {
                 self.query_error = Some(e);
@@ -1198,7 +1316,7 @@ impl View {
     /// toward the root and retries (see [`resolve_with_climb`]), so `:city` falls
     /// back to `..city`, `...city`, … relative to the cursor.
     fn goto_path(&mut self, b: &[u8]) -> String {
-        let parsed = parse_path(&self.goto);
+        let parsed = parse_path(self.goto.as_str());
         if parsed.up.is_none() && parsed.segs.is_empty() {
             return "empty path".to_string();
         }
@@ -1215,7 +1333,7 @@ impl View {
                     join_path("", &breadcrumb_segments(&self.root, &path))
                 )
             }
-            None => format!("path not found: {}", self.goto.trim()),
+            None => format!("path not found: {}", self.goto.as_str().trim()),
         }
     }
 
@@ -1906,7 +2024,7 @@ fn ui(f: &mut Frame, app: &App, streaming: bool) {
 /// The single global key/search-status bar, reflecting the active pane. A
 /// transient `flash` (e.g. a copy confirmation) takes the bar over the key hint.
 fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Option<&str>) {
-    let footer = if view.mode == Mode::Search {
+    let line = if view.mode == Mode::Search {
         let count = view.search.as_ref().map_or(0, |s| s.matches.len());
         let more = match &view.search {
             Some(s) if !s.finished => "+",
@@ -1922,36 +2040,51 @@ fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Option<&str>) {
         } else {
             format!("{}{} matches", count, more)
         };
-        Span::styled(
-            format!(
-                " /{}   {} · ↵/↓ next · ⇧↵/↑ prev · esc close",
-                view.query, pos
-            ),
-            Style::default().fg(Color::Yellow),
+        prompt_line(
+            '/',
+            &view.query,
+            &format!("{pos} · ↵/↓ next · ⇧↵/↑ prev · esc close"),
         )
     } else if view.mode == Mode::Goto {
-        Span::styled(
-            format!(" :{}   ↵ jump · esc cancel", view.goto),
-            Style::default().fg(Color::Yellow),
-        )
+        prompt_line(':', &view.goto, "↵ jump · esc cancel")
     } else if view.mode == Mode::Filter {
         let hint = match view.filter_error.as_deref() {
             Some(e) => format!("({e})"),
             None => "↵ run → new pane · esc cancel".to_string(),
         };
-        Span::styled(
-            format!(" |{}   {hint}", view.filter_query),
-            Style::default().fg(Color::Yellow),
-        )
+        prompt_line('|', &view.filter_query, &hint)
     } else if let Some(msg) = flash {
-        Span::styled(format!(" {msg}"), Style::default().fg(Color::Green))
+        Line::from(Span::styled(
+            format!(" {msg}"),
+            Style::default().fg(Color::Green),
+        ))
     } else {
-        Span::styled(
+        Line::from(Span::styled(
             " ↑/↓ move · enter expand · / search · : goto · | filter · y copy · ? help · q quit",
             Style::default().fg(Color::DarkGray),
-        )
+        ))
     };
-    f.render_widget(Paragraph::new(Line::from(footer)), area);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// Build a prompt footer line with a visible block caret at the edit position.
+/// The character under the caret is drawn reverse-video (a blank cell when the
+/// caret sits at the end of the line), so the `/`, `:`, and `|` prompts read
+/// like real input fields — the split at `input.caret` is always on a char
+/// boundary, so it never slices a multi-byte character.
+fn prompt_line(prefix: char, input: &TextInput, hint: &str) -> Line<'static> {
+    let base = Style::default().fg(Color::Yellow);
+    let (before, rest) = input.as_str().split_at(input.caret);
+    let under = rest.chars().next();
+    let after = &rest[under.map_or(0, char::len_utf8)..];
+    Line::from(vec![
+        Span::styled(format!(" {prefix}{before}"), base),
+        Span::styled(
+            under.unwrap_or(' ').to_string(),
+            base.add_modifier(Modifier::REVERSED),
+        ),
+        Span::styled(format!("{after}   {hint}"), base),
+    ])
 }
 
 /// Draw the bookmark picker as a centered overlay listing each saved node's
@@ -2412,15 +2545,15 @@ fn process_key(
             KeyCode::Enter if shift => v.nav_match(-1, b),
             KeyCode::Enter | KeyCode::Down => v.nav_match(1, b),
             KeyCode::Up => v.nav_match(-1, b),
-            KeyCode::Backspace => {
-                v.query.pop();
-                return KeyOutcome::Relaunch;
+            // Editing/caret keys go to the input; only a text change relaunches
+            // the live search (a caret move leaves the query — and results — put).
+            other => {
+                if let Some(changed) = v.query.edit(other, ctrl) {
+                    if changed {
+                        return KeyOutcome::Relaunch;
+                    }
+                }
             }
-            KeyCode::Char(c) => {
-                v.query.push(c);
-                return KeyOutcome::Relaunch;
-            }
-            _ => {}
         }
         return KeyOutcome::Continue;
     }
@@ -2443,13 +2576,9 @@ fn process_key(
                 };
                 app.flash = Some(msg);
             }
-            KeyCode::Backspace => {
-                app.active_mut().goto.pop();
+            other => {
+                app.active_mut().goto.edit(other, ctrl);
             }
-            KeyCode::Char(c) => {
-                app.active_mut().goto.push(c);
-            }
-            _ => {}
         }
         return KeyOutcome::Continue;
     }
@@ -2465,7 +2594,7 @@ fn process_key(
                 v.filter_error = None;
             }
             KeyCode::Enter => {
-                let expr = app.active_view().filter_query.trim().to_string();
+                let expr = app.active_view().filter_query.as_str().trim().to_string();
                 if expr.is_empty() {
                     let v = app.active_mut();
                     v.mode = Mode::Normal;
@@ -2495,17 +2624,12 @@ fn process_key(
                     Err(e) => app.active_mut().filter_error = Some(e),
                 }
             }
-            KeyCode::Backspace => {
+            other => {
                 let v = app.active_mut();
-                v.filter_query.pop();
-                v.filter_error = None;
+                if v.filter_query.edit(other, ctrl).is_some() {
+                    v.filter_error = None;
+                }
             }
-            KeyCode::Char(c) => {
-                let v = app.active_mut();
-                v.filter_query.push(c);
-                v.filter_error = None;
-            }
-            _ => {}
         }
         return KeyOutcome::Continue;
     }
@@ -2841,6 +2965,27 @@ const STREAM_REBUILD_MS: u128 = 100;
 /// The streaming loop: bytes arrive on `rx` from the reader thread, the buffer
 /// grows, and the tree is re-parsed on a throttle (preserving cursor/expansion).
 /// Search snapshots the buffer at launch (so it covers the bytes parsed so far).
+/// Hand a search/filter worker a `Source` over the stream bytes arrived so far,
+/// reusing the last one when the buffer hasn't grown since.
+///
+/// A snapshot must own its bytes (the worker outlives this frame's borrow of
+/// `buf`), but cloning the whole buffer on every call is the cost we're avoiding:
+/// search relaunches per keystroke. Since a stream only appends, a snapshot of
+/// length N stays a byte-identical prefix of any longer buffer, so as long as
+/// `cache` still points at a live snapshot of the current length we clone
+/// nothing and share its `Arc`. The cache is weak, so the copy lives exactly as
+/// long as some worker references it and is freed the moment the last one drops.
+fn buffer_snapshot(buf: &[u8], cache: &mut Weak<Source>) -> Arc<Source> {
+    if let Some(snap) = cache.upgrade() {
+        if snap.len() == buf.len() {
+            return snap;
+        }
+    }
+    let snap = Arc::new(Source::Buffered(buf.to_vec()));
+    *cache = Arc::downgrade(&snap);
+    snap
+}
+
 fn run_stream(
     term: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -2851,6 +2996,14 @@ fn run_stream(
     let mut dirty = false; // bytes arrived that aren't in the tree yet
     let mut done = false; // reader hit EOF
     let mut last_build = Instant::now();
+    // The most recent buffer snapshot handed to a search/filter worker, held
+    // weakly. Search relaunches once per keystroke, so typing a query would
+    // otherwise clone the whole (multi-GB) buffer on every character. Because a
+    // stream only appends, a snapshot stays a valid prefix until the buffer
+    // grows: consecutive launches at the same length reuse the one `Arc`
+    // (the live worker keeps it alive), and once every worker drops it — search
+    // closed, filter pane closed — the copy is freed. Zero steady-state cost.
+    let mut snapshot: Weak<Source> = Weak::new();
     loop {
         // Drain whatever the reader thread has produced.
         loop {
@@ -2905,13 +3058,13 @@ fn run_stream(
             KeyOutcome::Relaunch => {
                 // Search over the bytes parsed so far (the stream keeps growing,
                 // but one search covers what's arrived at its launch).
-                let snap = Arc::new(Source::Buffered(buf.clone()));
+                let snap = buffer_snapshot(buf, &mut snapshot);
                 app.active_mut().relaunch(&snap);
             }
             KeyOutcome::LaunchFilter => {
                 // Filter over a snapshot of the bytes arrived so far, mirroring
                 // search: the result pane reflects the document at launch time.
-                let snap = Arc::new(Source::Buffered(buf.clone()));
+                let snap = buffer_snapshot(buf, &mut snapshot);
                 app.launch_filter(&snap);
             }
             KeyOutcome::Continue => {}
