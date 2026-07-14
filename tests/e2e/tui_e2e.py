@@ -310,6 +310,9 @@ def scenario_help_overlay(binary):
         check("? opens the cheatsheet with the full key list",
               "keyboard shortcuts" in scr and "next / prev sibling" in scr
               and "split pane at node" in scr, t)
+        check("cheatsheet shows worked filter/search examples",
+              "examples" in scr and "select(.age > 30)" in scr
+              and "regex search" in scr, t)
         t.send("j")  # any key closes it
         check("any key closes the overlay", "keyboard shortcuts" not in t.dump(), t)
     finally:

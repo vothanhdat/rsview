@@ -2198,10 +2198,40 @@ fn render_help(f: &mut Frame, area: Rect) {
         .unwrap_or(0);
     let rows = ENTRIES.len().div_ceil(2);
 
+    // Worked examples for the two syntaxes that don't fit a one-line key hint:
+    // the `/` search prefixes and the `|` jq-style filter. Shown full-width
+    // below the key grid, `prefix code — description`.
+    const EXAMPLES: &[(&str, &str, &str)] = &[
+        ("/", "re:^id_\\d+$", "regex search"),
+        ("/", "g:log-*", "glob search (*, ? wildcards)"),
+        (
+            "|",
+            ".users[] | select(.age > 30) | .name",
+            "names of users over 30",
+        ),
+        ("|", ".. | .id", "every .id at any depth"),
+        (
+            "|",
+            "select(.name ~ \"re:^a\")",
+            "field value matches a regex",
+        ),
+        (
+            "|",
+            ".items[] | select(.f ~ \"g:*.log\")",
+            "field value matches a glob",
+        ),
+    ];
+    let ex_code_w = EXAMPLES
+        .iter()
+        .map(|(_, c, _)| c.chars().count())
+        .max()
+        .unwrap_or(0);
+
     let key_st = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
     let desc_st = Style::default().fg(Color::Gray);
+    let code_st = Style::default().fg(Color::Yellow);
     let panel_bg = Color::Indexed(236);
 
     // One "key  description" cell, key right-aligned so the columns line up.
@@ -2213,7 +2243,7 @@ fn render_help(f: &mut Frame, area: Rect) {
     };
 
     // Pair entry i with entry i+rows, so the list reads top-to-bottom per column.
-    let lines: Vec<Line> = (0..rows)
+    let mut lines: Vec<Line> = (0..rows)
         .map(|r| {
             let (k1, d1) = ENTRIES[r];
             let mut spans = cell(k1, d1);
@@ -2225,13 +2255,35 @@ fn render_help(f: &mut Frame, area: Rect) {
         })
         .collect();
 
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " examples · / search · | filter",
+        key_st,
+    )));
+    for &(p, c, d) in EXAMPLES {
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {p} "), key_st),
+            Span::styled(format!("{c:<ex_code_w$}"), code_st),
+            Span::styled(format!("  {d}"), desc_st),
+        ]));
+    }
+
     let title = " keyboard shortcuts · any key to close ";
     let col_w = key_w + desc_w + 4; // " " + key + "  " + desc + " "
+    let ex_w = 3
+        + ex_code_w
+        + 2
+        + EXAMPLES
+            .iter()
+            .map(|(_, _, d)| d.chars().count())
+            .max()
+            .unwrap_or(0);
     let inner_w = (col_w * 2 + 2)
+        .max(ex_w)
         .max(title.chars().count())
         .min(area.width.saturating_sub(2) as usize);
     let w = inner_w as u16 + 2;
-    let h = (rows as u16 + 2).min(area.height);
+    let h = (lines.len() as u16 + 2).min(area.height);
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
     let rect = Rect {
