@@ -1,35 +1,76 @@
 name: release
 
 # Build prebuilt binaries for all common platforms and attach them to the
-# GitHub Release whenever a v* tag is pushed. The archive names are
-# cargo-binstall-compatible, so `cargo binstall jview` pulls these directly.
-
+# GitHub Release. The archive names are cargo-binstall-compatible, so
+# `cargo binstall jview` pulls these directly.
+#
+# Two ways to cut a release:
+#   * push a `v*` tag (the classic path), or
+#   * run this workflow manually (Actions → release → Run workflow, or the API).
+#     On a manual run the tag is derived from the version in Cargo.toml and
+#     created on the runner — handy where the local environment can't push tags.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch: {}
 
 permissions:
   contents: write
 
 jobs:
+  # Resolve the tag every downstream job builds against. On a tag push that's
+  # just the pushed ref; on a manual run we read the version from Cargo.toml,
+  # create `v<version>` from the checked-out commit, and push it (the runner's
+  # GITHUB_TOKEN can push tags — it just won't re-trigger this workflow, which
+  # is exactly what we want since this run already covers it).
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ver=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+            tag="v${ver}"
+            if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+              echo "::error::${tag} already exists — bump the version in Cargo.toml/Cargo.lock on the default branch before releasing."
+              exit 1
+            fi
+            git tag "$tag"
+            git push origin "refs/tags/${tag}"
+            echo "Created and pushed ${tag} at $(git rev-parse --short HEAD)."
+          else
+            tag="$GITHUB_REF_NAME"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   # The upload action below attaches assets to an existing release but does not
   # create one, so make it first (idempotent — tolerate an existing release).
   create-release:
+    needs: resolve
     runs-on: ubuntu-latest
     steps:
       - name: Create the GitHub Release for this tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve.outputs.tag }}
         run: |
-          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$GITHUB_REF_NAME" \
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" \
                  --repo "$GITHUB_REPOSITORY" \
-                 --title "jview $GITHUB_REF_NAME" \
+                 --title "jview $TAG" \
                  --notes "Prebuilt binaries for Linux (x86_64/arm64), macOS (Intel/Apple Silicon), and Windows. Or install with \`cargo binstall jview\`."
 
   upload-binaries:
-    needs: create-release
+    needs: [resolve, create-release]
     strategy:
       fail-fast: false
       matrix:
@@ -52,6 +93,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
       - name: Build and upload jview
         uses: taiki-e/upload-rust-binary-action@v1
         with:
@@ -59,6 +102,9 @@ jobs:
           target: ${{ matrix.target }}
           # → jview-<target>.tar.gz (.zip on Windows), uploaded to the tag's release.
           archive: $bin-$target
+          # Explicit so the action targets the tag on a manual run too (where
+          # github.ref is a branch, not the tag).
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # The `curl … /stable/install.sh` one-liner in the README is served from the
@@ -66,10 +112,12 @@ jobs:
   # Move `stable` forward to this released (already CI-green) commit. Same-repo
   # write via the existing GITHUB_TOKEN — no extra permissions, no PAT.
   promote-stable:
+    needs: resolve
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
         with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
           fetch-depth: 0 # need history back to `stable` so the push has all objects
       - name: Fast-forward stable to this tag
         run: git push origin "HEAD:refs/heads/stable"
