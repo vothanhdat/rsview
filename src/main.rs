@@ -557,13 +557,19 @@ const SCHEMA_ARRAY_CAP: usize = 64;
 const SCHEMA_DEFAULT_DEPTH: usize = 1;
 /// Ceiling on how deep the overlay will expand (bounds work on deep data).
 const SCHEMA_MAX_DEPTH: usize = 6;
-/// An object is treated as a *map* (data-keyed dictionary, summarized by its
-/// values' shape rather than its keys) when it has at least this many entries and
-/// its values are homogeneous — see [`object_map_kind`].
-const SCHEMA_MAP_MIN_ENTRIES: usize = 8;
 /// How many of an object's values to probe when deciding map-ness.
-const SCHEMA_MAP_PROBE: usize = 64;
-/// Share (percent) of probed values that must be the same kind to call it a map.
+const SCHEMA_MAP_PROBE: usize = 48;
+/// Keys sampled per probed object value (bounds the map-detection cost).
+const SCHEMA_MAP_KEY_CAP: usize = 32;
+/// Object values needed before shape-similarity can call an object a map.
+const SCHEMA_MAP_MIN_OBJ: usize = 3;
+/// Key-set self-similarity (percent) for an object map — how alike the values'
+/// key-sets must be. High enough to reject a record whose object fields have
+/// disjoint keys; low enough to accept a slightly ragged real-world map.
+const SCHEMA_MAP_SIMILARITY_PCT: usize = 70;
+/// Entries needed to call a *scalar*-valued object a map.
+const SCHEMA_MAP_SCALAR_MIN: usize = 8;
+/// Value-kind homogeneity (percent) required for a map.
 const SCHEMA_MAP_RATIO_PCT: usize = 80;
 
 /// One field's shape across a sampled container: its (possibly nested, dotted /
@@ -599,8 +605,11 @@ struct Schema {
     /// Whether children are records (array/NDJSON/map) — drives the fill column.
     by_record: bool,
     /// True when the focused object was detected as a data-keyed map, so its
-    /// *values* (not its keys) were summarized. Only affects wording.
+    /// *values* (not its keys) were summarized.
     is_map: bool,
+    /// Manual map/record override (`m`): `Some(true/false)` forces the top-level
+    /// interpretation, `None` uses auto-detection.
+    force_map: Option<bool>,
     /// Fields, grouped by top-level field (most common first), each with its
     /// descendants beneath it.
     fields: Vec<FieldStat>,
@@ -2695,7 +2704,7 @@ fn render_schema(f: &mut Frame, area: Rect, view: &View) {
 
     let maptag = if sc.is_map { " · map" } else { "" };
     let title = format!(
-        " schema · {}{maptag} · depth {} ([ ] adjust) · j/k scroll · esc ",
+        " schema · {}{maptag} · depth {} · [ ] depth · m map/rec · esc ",
         sc.title, sc.depth,
     );
     let block = Block::default()
@@ -3076,15 +3085,33 @@ fn process_key(
         };
         if ddelta != 0 {
             let v = app.active_mut();
-            if let Some((path, title, cur)) = v
+            if let Some((path, title, cur, force)) = v
                 .schema
                 .as_ref()
-                .map(|s| (s.path.clone(), s.title.clone(), s.depth))
+                .map(|s| (s.path.clone(), s.title.clone(), s.depth, s.force_map))
             {
                 let nd = (cur as i32 + ddelta).clamp(0, SCHEMA_MAX_DEPTH as i32) as usize;
                 if nd != cur {
                     let node = get(&v.root, &path);
-                    if let Some(mut ns) = build_schema(node, b, title, nd) {
+                    if let Some(mut ns) = build_schema(node, b, title, nd, force) {
+                        ns.path = path;
+                        v.schema = Some(ns);
+                    }
+                }
+            }
+            return KeyOutcome::Continue;
+        }
+        // `m` forces the top-level map/record interpretation the other way.
+        if matches!(k.code, KeyCode::Char('m')) {
+            let v = app.active_mut();
+            if let Some((path, title, depth, is_map)) = v
+                .schema
+                .as_ref()
+                .map(|s| (s.path.clone(), s.title.clone(), s.depth, s.is_map))
+            {
+                let node = get(&v.root, &path);
+                if !node.jsonl && matches!(node.kind, Kind::Object) {
+                    if let Some(mut ns) = build_schema(node, b, title, depth, Some(!is_map)) {
                         ns.path = path;
                         v.schema = Some(ns);
                     }
@@ -3200,7 +3227,7 @@ fn process_key(
                         kind_name(node.kind)
                     }
                 );
-                build_schema(node, b, title, SCHEMA_DEFAULT_DEPTH).map(|mut s| {
+                build_schema(node, b, title, SCHEMA_DEFAULT_DEPTH, None).map(|mut s| {
                     s.path = row.path.clone();
                     s
                 })
@@ -3441,7 +3468,14 @@ fn schema_walk(
                     end: f.end,
                 });
                 if container && depth < max_depth {
-                    schema_walk(b, f.start, f.end, f.kind, &path, depth + 1, max_depth, out);
+                    // A nested field that is itself a map gets summarized by its
+                    // values under `path{}`, not exploded into its data-keys.
+                    if matches!(f.kind, Kind::Object) && range_map_kind(b, f.start, f.end).is_some()
+                    {
+                        schema_walk_map(b, f.start, f.end, &path, depth + 1, max_depth, out);
+                    } else {
+                        schema_walk(b, f.start, f.end, f.kind, &path, depth + 1, max_depth, out);
+                    }
                 }
             }
         }
@@ -3471,6 +3505,40 @@ fn schema_walk(
             }
         }
         _ => {}
+    }
+}
+
+/// Walk a nested *map*'s values (not its data-keys), emitting fields under
+/// `prefix{}` — the map analogue of an array's `prefix[]`. Bounded by
+/// `SCHEMA_ARRAY_CAP` values.
+#[allow(clippy::too_many_arguments)]
+fn schema_walk_map(
+    b: &[u8],
+    start: usize,
+    end: usize,
+    prefix: &str,
+    depth: usize,
+    max_depth: usize,
+    out: &mut Vec<Occ>,
+) {
+    let mp = format!("{prefix}{{}}");
+    let mut c = Cursor::new(start, end, false);
+    let mut i = 0;
+    while let Some(v) = c.next(b) {
+        i += 1;
+        if i > SCHEMA_ARRAY_CAP {
+            break;
+        }
+        if matches!(v.kind, Kind::Object) {
+            schema_walk(b, v.start, v.end, Kind::Object, &mp, depth, max_depth, out);
+        } else {
+            out.push(Occ {
+                path: mp.clone(),
+                kind: v.kind,
+                start: v.start,
+                end: v.end,
+            });
+        }
     }
 }
 
@@ -3513,29 +3581,27 @@ fn fold_record(
     }
 }
 
-/// Nesting level of a dotted / `[]` schema path (for indentation) — the number of
-/// `.` or `[]` steps below the top field.
+/// Nesting level of a dotted / `[]` / `{}` schema path (for grouping) — the number
+/// of `.`, `[]`, or `{}` steps below the top field.
 fn path_depth(path: &str) -> usize {
-    path.matches('.').count() + path.matches("[]").count()
+    path.matches('.').count() + path.matches("[]").count() + path.matches("{}").count()
 }
 
 /// The top-level segment of a schema path (`address.city` → `address`,
-/// `items[].sku` → `items`), used to keep a field's descendants grouped with it.
+/// `items[].sku` → `items`, `prices{}.ccy` → `prices`), used to keep a field's
+/// descendants grouped with it.
 fn top_segment(path: &str) -> &str {
-    let end = path.find(['.', '[']).unwrap_or(path.len());
+    let end = path.find(['.', '[', '{']).unwrap_or(path.len());
     &path[..end]
 }
 
 /// Decide whether an object is a *map* (a data-keyed dictionary like
-/// `{"AAPL": {…}, "MSFT": {…}}`) rather than a record with named fields, by
-/// probing its values: a map has many entries whose values share one kind. Returns
-/// that dominant kind, or `None` for a record (few entries, or mixed value types).
-/// Keeps the schema general — a map is summarized by its *values'* shape, not its
-/// open-ended keys.
-fn object_map_kind(node: &Node, b: &[u8]) -> Option<Kind> {
-    if node.jsonl || !matches!(node.kind, Kind::Object) {
-        return None;
-    }
+/// `{"AAPL": {…}, "MSFT": {…}}`) rather than a record with named fields, and if so
+/// the kind its values take. The signal is **value shape**, not key names: for
+/// object values, whether their key-sets look alike (a record's object fields have
+/// disjoint keys); for scalar values, many homogeneous entries. `None` for a
+/// record. Keeps the schema general — a map is summarized by its *values'* shape.
+fn range_map_kind(b: &[u8], start: usize, end: usize) -> Option<Kind> {
     const KINDS: [Kind; 6] = [
         Kind::Object,
         Kind::Array,
@@ -3546,20 +3612,61 @@ fn object_map_kind(node: &Node, b: &[u8]) -> Option<Kind> {
     ];
     let mut counts = [0usize; 6];
     let mut n = 0usize;
-    let mut c = node.make_cursor();
+    let mut n_obj = 0usize;
+    // key -> how many probed object values contain it.
+    let mut key_freq: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut c = Cursor::new(start, end, false);
     while let Some(f) = c.next(b) {
-        let i = KINDS.iter().position(|k| *k == f.kind).unwrap_or(0);
-        counts[i] += 1;
         n += 1;
+        counts[KINDS.iter().position(|k| *k == f.kind).unwrap_or(0)] += 1;
+        if matches!(f.kind, Kind::Object) {
+            n_obj += 1;
+            let mut seen = std::collections::HashSet::new();
+            let mut fc = Cursor::new(f.start, f.end, false);
+            let mut kc = 0;
+            while let Some(sub) = fc.next(b) {
+                if seen.insert(sub.label.clone()) {
+                    *key_freq.entry(sub.label).or_insert(0) += 1;
+                }
+                kc += 1;
+                if kc >= SCHEMA_MAP_KEY_CAP {
+                    break;
+                }
+            }
+        }
         if n >= SCHEMA_MAP_PROBE {
             break;
         }
     }
-    if n < SCHEMA_MAP_MIN_ENTRIES {
+    // Object map: enough object values whose key-sets are self-similar. The score
+    // (Σf²/Σf)/n_obj lands at 1.0 when every value shares every key and at 1/n_obj
+    // when keys are all unique — compared here as integers (no floats).
+    if n_obj >= SCHEMA_MAP_MIN_OBJ && n_obj * 100 >= n * SCHEMA_MAP_RATIO_PCT {
+        let sum_f: usize = key_freq.values().sum();
+        let sum_f2: usize = key_freq.values().map(|f| f * f).sum();
+        if sum_f > 0 && sum_f2 * 100 >= sum_f * n_obj * SCHEMA_MAP_SIMILARITY_PCT {
+            return Some(Kind::Object);
+        }
+    }
+    // Scalar map: many entries, homogeneous scalar values.
+    if n >= SCHEMA_MAP_SCALAR_MIN {
+        if let Some((bi, &best)) = counts.iter().enumerate().max_by_key(|(_, c)| **c) {
+            if !matches!(KINDS[bi], Kind::Object | Kind::Array)
+                && best * 100 >= n * SCHEMA_MAP_RATIO_PCT
+            {
+                return Some(KINDS[bi]);
+            }
+        }
+    }
+    None
+}
+
+/// [`range_map_kind`] for a focused node (only objects can be maps).
+fn object_map_kind(node: &Node, b: &[u8]) -> Option<Kind> {
+    if node.jsonl || !matches!(node.kind, Kind::Object) {
         return None;
     }
-    let (bi, &best) = counts.iter().enumerate().max_by_key(|(_, c)| **c)?;
-    (best * 100 >= n * SCHEMA_MAP_RATIO_PCT).then_some(KINDS[bi])
+    range_map_kind(b, node.start, node.end)
 }
 
 /// Sample a container and summarize its shape, expanding nested objects/arrays up
@@ -3567,12 +3674,23 @@ fn object_map_kind(node: &Node, b: &[u8]) -> Option<Kind> {
 /// its values (see [`object_map_kind`]). Bounded by `SCHEMA_SAMPLE` records (and
 /// `SCHEMA_ARRAY_CAP` per nested array), so it stays cheap even on multi-GB,
 /// deeply-nested data.
-fn build_schema(node: &Node, b: &[u8], title: String, max_depth: usize) -> Option<Schema> {
+fn build_schema(
+    node: &Node,
+    b: &[u8],
+    title: String,
+    max_depth: usize,
+    force_map: Option<bool>,
+) -> Option<Schema> {
     if !node.jsonl && !matches!(node.kind, Kind::Object | Kind::Array) {
         return None;
     }
-    // A map's *values* are the records; an array's/NDJSON's elements are.
-    let is_map = object_map_kind(node, b).is_some();
+    // A map's *values* are the records; an array's/NDJSON's elements are. The
+    // `m` override forces the top-level call; nested containers still auto-detect.
+    let can_map = !node.jsonl && matches!(node.kind, Kind::Object);
+    let is_map = match force_map {
+        Some(f) => f && can_map,
+        None => object_map_kind(node, b).is_some(),
+    };
     let by_record = node.jsonl || matches!(node.kind, Kind::Array) || is_map;
     let mut idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut fields: Vec<FieldStat> = Vec::new();
@@ -3620,9 +3738,15 @@ fn build_schema(node: &Node, b: &[u8], title: String, max_depth: usize) -> Optio
                 end: rc.end,
             });
             if matches!(rc.kind, Kind::Object | Kind::Array) && max_depth > 0 {
-                schema_walk(
-                    b, rc.start, rc.end, rc.kind, &rc.label, 1, max_depth, &mut occs,
-                );
+                if matches!(rc.kind, Kind::Object) && range_map_kind(b, rc.start, rc.end).is_some()
+                {
+                    // A field that is itself a map: summarize its values.
+                    schema_walk_map(b, rc.start, rc.end, &rc.label, 1, max_depth, &mut occs);
+                } else {
+                    schema_walk(
+                        b, rc.start, rc.end, rc.kind, &rc.label, 1, max_depth, &mut occs,
+                    );
+                }
             }
         }
         fold_record(&occs, b, &mut fields, &mut idx, &mut field_more);
@@ -3652,6 +3776,7 @@ fn build_schema(node: &Node, b: &[u8], title: String, max_depth: usize) -> Optio
         field_more,
         by_record,
         is_map,
+        force_map,
         fields,
         scroll: 0,
     })

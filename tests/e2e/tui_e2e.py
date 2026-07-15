@@ -356,6 +356,12 @@ def scenario_explore(binary):
         # A data-keyed map: keys are ids, values all share {ccy, amount}.
         "prices": {f"AAA{n:03d}": {"ccy": "USD", "amount": n * 1.5}
                    for n in range(20)},
+        # A record with disjoint-object fields (not a map) that *contains* a map.
+        "book": {
+            "meta": {"title": "t", "pages": 3},
+            "author": {"name": "n", "born": 1970},
+            "quotes": {f"Q{n:02d}": {"bid": n, "ask": n + 1} for n in range(12)},
+        },
     })
     try:
         # `c` counts a container's children without expanding it.
@@ -389,6 +395,22 @@ def scenario_explore(binary):
               "map" in m and "map entries" in m, t)
         check("map schema shows the value fields, not the data keys",
               "ccy" in m and "amount" in m and "AAA000" not in m, t)
+        # `m` forces the interpretation the other way — back to keys as fields.
+        t.send("m")
+        forced = t.dump()
+        check("m forces a map back to a record (keys become fields)",
+              "AAA000" in forced and "map entries" not in forced, t)
+        t.send("\x1b")
+
+        # A record whose object fields have *disjoint* keys stays a record (not a
+        # map), and a map nested inside a record is summarized with {} notation.
+        t.send(":"); t.send("book"); t.send("\r")
+        t.send("t")
+        bk = t.dump()
+        check("disjoint-object record is not mistaken for a map",
+              "map entries" not in bk and "meta.title" in bk, t)
+        check("a nested map is summarized by its values ({} notation)",
+              "quotes{}.bid" in bk and "quotes{}.ask" in bk, t)
         t.send("\x1b")
 
         # Scoped search: 'name' appears under both users and audit; scope to users.

@@ -102,11 +102,16 @@ the richer ones:
   contributes `tags[]` (and `items[].sku` for arrays of objects), each with its
   own fill rate — and `[` / `]` change the depth live (`0` = flat, up to 6). It
   also recognizes a **map** — a data-keyed object like
-  `{"AAPL": {…}, "MSFT": {…}}` where the keys are values, not field names — and
-  summarizes its *values'* shared shape instead of listing every key, so a
-  dictionary of thousands of entries reads as one record. `c` reports a
-  container's exact child count (`1,234,567 elements`) — a full scan, but on
-  demand, so you can size a collapsed level without opening it.
+  `{"AAPL": {…}, "MSFT": {…}}` where the keys are values, not field names — by
+  looking at whether the values share a shape (not just their count), so it
+  catches a small map and *isn't* fooled by a record whose object fields have
+  different keys. A map is summarized by its values' shared shape (`amount`,
+  `ccy`, …) instead of listing every key, and this works at any depth — a map
+  nested inside a record shows as `quotes{}.bid` (the `{}` marks map values, like
+  `[]` marks array elements). Press `m` to force the map/record call the other way
+  when you disagree. `c` reports a container's exact child count
+  (`1,234,567 elements`) — a full scan, but on demand, so you can size a collapsed
+  level without opening it.
 - **Search (`/`)** — plain queries are case-insensitive substring matches (the
   default). Prefix with `re:` for a full regex (`re:^id_\w+$`) or `g:` for a
   glob (`g:user*`); a bad pattern shows `(bad pattern: …)` in the footer so you
