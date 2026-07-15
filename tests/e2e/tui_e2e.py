@@ -353,6 +353,9 @@ def scenario_explore(binary):
             {"id": 3, "name": "cara", "contact": {"email": "c@x.com"}},
         ],
         "audit": [{"name": "zzz"}],
+        # A data-keyed map: keys are ids, values all share {ccy, amount}.
+        "prices": {f"AAA{n:03d}": {"ccy": "USD", "amount": n * 1.5}
+                   for n in range(20)},
     })
     try:
         # `c` counts a container's children without expanding it.
@@ -377,6 +380,16 @@ def scenario_explore(binary):
         check("[ collapses nesting to a flat view",
               "contact.email" not in flat and "contact" in flat, t)
         t.send("\x1b")  # close schema
+
+        # A data-keyed map is summarized by its VALUES' shape, not its keys.
+        t.send(":"); t.send("prices"); t.send("\r")
+        t.send("t")
+        m = t.dump()
+        check("a data-keyed object is detected as a map",
+              "map" in m and "map entries" in m, t)
+        check("map schema shows the value fields, not the data keys",
+              "ccy" in m and "amount" in m and "AAA000" not in m, t)
+        t.send("\x1b")
 
         # Scoped search: 'name' appears under both users and audit; scope to users.
         t.send(":"); t.send("users"); t.send("\r")

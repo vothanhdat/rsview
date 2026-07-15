@@ -100,9 +100,13 @@ the richer ones:
   a million objects tells you its shape instantly. It expands **one level of
   nesting by default** — a nested object contributes `contact.email`, an array
   contributes `tags[]` (and `items[].sku` for arrays of objects), each with its
-  own fill rate — and `[` / `]` change the depth live (`0` = flat, up to 6). `c`
-  reports a container's exact child count (`1,234,567 elements`) — a full scan,
-  but on demand, so you can size a collapsed level without opening it.
+  own fill rate — and `[` / `]` change the depth live (`0` = flat, up to 6). It
+  also recognizes a **map** — a data-keyed object like
+  `{"AAPL": {…}, "MSFT": {…}}` where the keys are values, not field names — and
+  summarizes its *values'* shared shape instead of listing every key, so a
+  dictionary of thousands of entries reads as one record. `c` reports a
+  container's exact child count (`1,234,567 elements`) — a full scan, but on
+  demand, so you can size a collapsed level without opening it.
 - **Search (`/`)** — plain queries are case-insensitive substring matches (the
   default). Prefix with `re:` for a full regex (`re:^id_\w+$`) or `g:` for a
   glob (`g:user*`); a bad pattern shows `(bad pattern: …)` in the footer so you

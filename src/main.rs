@@ -557,6 +557,14 @@ const SCHEMA_ARRAY_CAP: usize = 64;
 const SCHEMA_DEFAULT_DEPTH: usize = 1;
 /// Ceiling on how deep the overlay will expand (bounds work on deep data).
 const SCHEMA_MAX_DEPTH: usize = 6;
+/// An object is treated as a *map* (data-keyed dictionary, summarized by its
+/// values' shape rather than its keys) when it has at least this many entries and
+/// its values are homogeneous — see [`object_map_kind`].
+const SCHEMA_MAP_MIN_ENTRIES: usize = 8;
+/// How many of an object's values to probe when deciding map-ness.
+const SCHEMA_MAP_PROBE: usize = 64;
+/// Share (percent) of probed values that must be the same kind to call it a map.
+const SCHEMA_MAP_RATIO_PCT: usize = 80;
 
 /// One field's shape across a sampled container: its (possibly nested, dotted /
 /// `[]`) path, how many records had it, the JSON type(s) it took, an example
@@ -588,8 +596,11 @@ struct Schema {
     more: bool,
     /// True when it had more distinct fields than we track.
     field_more: bool,
-    /// Whether children are records (array/NDJSON) — drives the fill-rate column.
+    /// Whether children are records (array/NDJSON/map) — drives the fill column.
     by_record: bool,
+    /// True when the focused object was detected as a data-keyed map, so its
+    /// *values* (not its keys) were summarized. Only affects wording.
+    is_map: bool,
     /// Fields, grouped by top-level field (most common first), each with its
     /// descendants beneath it.
     fields: Vec<FieldStat>,
@@ -2619,8 +2630,9 @@ fn render_schema(f: &mut Frame, area: Rect, view: &View) {
         String::new()
     };
     let summary = if sc.by_record {
+        let unit = if sc.is_map { "map entries" } else { "records" };
         format!(
-            " {}{more} records sampled · {top_fields} field{}{nest}{fmore}",
+            " {}{more} {unit} sampled · {top_fields} field{}{nest}{fmore}",
             group(sc.records),
             if top_fields == 1 { "" } else { "s" },
         )
@@ -2681,8 +2693,9 @@ fn render_schema(f: &mut Frame, area: Rect, view: &View) {
         lines.push(Line::from(spans));
     }
 
+    let maptag = if sc.is_map { " · map" } else { "" };
     let title = format!(
-        " schema · {} · depth {} ([ ] adjust) · j/k scroll · esc ",
+        " schema · {}{maptag} · depth {} ([ ] adjust) · j/k scroll · esc ",
         sc.title, sc.depth,
     );
     let block = Block::default()
@@ -3513,15 +3526,54 @@ fn top_segment(path: &str) -> &str {
     &path[..end]
 }
 
+/// Decide whether an object is a *map* (a data-keyed dictionary like
+/// `{"AAPL": {…}, "MSFT": {…}}`) rather than a record with named fields, by
+/// probing its values: a map has many entries whose values share one kind. Returns
+/// that dominant kind, or `None` for a record (few entries, or mixed value types).
+/// Keeps the schema general — a map is summarized by its *values'* shape, not its
+/// open-ended keys.
+fn object_map_kind(node: &Node, b: &[u8]) -> Option<Kind> {
+    if node.jsonl || !matches!(node.kind, Kind::Object) {
+        return None;
+    }
+    const KINDS: [Kind; 6] = [
+        Kind::Object,
+        Kind::Array,
+        Kind::Str,
+        Kind::Number,
+        Kind::Bool,
+        Kind::Null,
+    ];
+    let mut counts = [0usize; 6];
+    let mut n = 0usize;
+    let mut c = node.make_cursor();
+    while let Some(f) = c.next(b) {
+        let i = KINDS.iter().position(|k| *k == f.kind).unwrap_or(0);
+        counts[i] += 1;
+        n += 1;
+        if n >= SCHEMA_MAP_PROBE {
+            break;
+        }
+    }
+    if n < SCHEMA_MAP_MIN_ENTRIES {
+        return None;
+    }
+    let (bi, &best) = counts.iter().enumerate().max_by_key(|(_, c)| **c)?;
+    (best * 100 >= n * SCHEMA_MAP_RATIO_PCT).then_some(KINDS[bi])
+}
+
 /// Sample a container and summarize its shape, expanding nested objects/arrays up
-/// to `max_depth` levels. `None` for a scalar. Bounded by `SCHEMA_SAMPLE` records
-/// (and `SCHEMA_ARRAY_CAP` per nested array), so it stays cheap even on multi-GB,
+/// to `max_depth` levels. `None` for a scalar. A data-keyed *map* is summarized by
+/// its values (see [`object_map_kind`]). Bounded by `SCHEMA_SAMPLE` records (and
+/// `SCHEMA_ARRAY_CAP` per nested array), so it stays cheap even on multi-GB,
 /// deeply-nested data.
 fn build_schema(node: &Node, b: &[u8], title: String, max_depth: usize) -> Option<Schema> {
     if !node.jsonl && !matches!(node.kind, Kind::Object | Kind::Array) {
         return None;
     }
-    let by_record = node.jsonl || matches!(node.kind, Kind::Array);
+    // A map's *values* are the records; an array's/NDJSON's elements are.
+    let is_map = object_map_kind(node, b).is_some();
+    let by_record = node.jsonl || matches!(node.kind, Kind::Array) || is_map;
     let mut idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut fields: Vec<FieldStat> = Vec::new();
     let mut records = 0usize;
@@ -3599,6 +3651,7 @@ fn build_schema(node: &Node, b: &[u8], title: String, max_depth: usize) -> Optio
         more,
         field_more,
         by_record,
+        is_map,
         fields,
         scroll: 0,
     })
