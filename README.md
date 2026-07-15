@@ -14,8 +14,12 @@ proof-of-concept, not a finished product).
 
 Point it at a file, or pipe into it. Piped input **streams** — `curl -s … |
 jview` renders the document as bytes arrive, and your cursor and expanded nodes
-stay put as it fills in. (A stream can't be memory-mapped, so it's buffered and
-re-parsed on a throttle; the constant-memory property is the file path's.)
+stay put as it fills in. A stream can't be memory-mapped directly, so its bytes
+are spilled to a temp file that jview mmaps and re-parses on a throttle — so a
+pipe stays at near-constant memory too, like the file path. The temp file is
+unlinked the moment it's opened, so it never appears on disk and the OS reclaims
+it when jview exits, even on a crash. (Where no writable temp dir is available,
+or off unix, it falls back to buffering in RAM.)
 
 ## Install
 
@@ -199,4 +203,4 @@ which could never have opened the whole file itself.
 | [src/scanner.rs](src/scanner.rs) | byte-range JSON scan + resumable child `Cursor` |
 | [src/main.rs](src/main.rs) | lazy `Node` tree, windowed flatten, multi-pane ratatui viewer, stdin streaming |
 | [src/search.rs](src/search.rs) | background-thread search + cancel + result stream |
-| [src/source.rs](src/source.rs) | byte source: memory-mapped file vs. buffered stream |
+| [src/source.rs](src/source.rs) | byte source: memory-mapped file or spilled stream, vs. RAM-buffered fallback |

@@ -33,18 +33,36 @@ FAILS = []
 class Tui:
     """A running jview in a pty, with a pyte screen mirroring its output."""
 
-    def __init__(self, binary, doc):
+    def __init__(self, binary, doc, pipe=False):
+        # File mode passes a path; pipe mode feeds the doc to jview's stdin (the
+        # spill-to-tempfile streaming path) and passes no arguments.
+        self.pipe = pipe
         self.path = f"/tmp/jview_e2e_{os.getpid()}.json"
-        with open(self.path, "w") as f:
-            json.dump(doc, f)
+        raw = doc if isinstance(doc, (str, bytes)) else json.dumps(doc)
+        if isinstance(raw, str):
+            raw = raw.encode()
         self.screen = pyte.Screen(COLS, ROWS)
         self.stream = pyte.ByteStream(self.screen)
+        if not pipe:
+            with open(self.path, "wb") as f:
+                f.write(raw)
         self.pid, self.fd = pty.fork()
         if self.pid == 0:  # child
-            os.execv(binary, [binary, self.path])
+            if pipe:
+                r, w = os.pipe()
+                if os.fork() == 0:  # grandchild feeds the pipe, then EOFs
+                    os.close(r)
+                    os.write(w, raw)
+                    os.close(w)
+                    os._exit(0)
+                os.close(w)
+                os.dup2(r, 0)
+                os.execv(binary, [binary])
+            else:
+                os.execv(binary, [binary, self.path])
             os._exit(127)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
-        self.pump(0.6)  # initial render
+        self.pump(0.8 if pipe else 0.6)  # initial render (streaming needs a beat)
 
     def pump(self, secs=0.3):
         end = time.time() + secs
@@ -298,6 +316,34 @@ def scenario_peek(binary):
         t.close()
 
 
+def scenario_stream_pipe(binary):
+    print("stream: piped stdin renders, searches, and cleans up its spill file")
+    import glob
+    pre = set(glob.glob("/tmp/jview-stream-*"))
+    # NDJSON piped in (not a file) exercises the spill-to-tempfile path.
+    doc = "\n".join(json.dumps({"id": i, "tag": "NEEDLE" if i == 40 else "x"})
+                    for i in range(60))
+    t = Tui(binary, doc, pipe=True)
+    try:
+        scr = t.dump()
+        check("piped stream renders as it arrives",
+              "id" in scr and "stdin" in t.title(), t)
+        # While running, the spill file is unlinked (no visible name) yet held open.
+        named = set(glob.glob("/tmp/jview-stream-*")) - pre
+        check("spill temp file is unlinked (no lingering name)", not named, t)
+        # Search runs over the spilled mmap and finds a row deep in the stream.
+        t.send("/"); t.send("NEEDLE"); t.pump(0.8)
+        foot = t.footer()
+        check("search over the spilled stream finds the needle",
+              "match" in foot and "0 match" not in foot, t)
+        t.send("\x1b")  # esc out of search
+    finally:
+        t.close()
+        t.pump(0.2)
+    leftover = set(glob.glob("/tmp/jview-stream-*")) - pre
+    check("no spill temp files leak after exit", not leftover, t)
+
+
 def scenario_help_overlay(binary):
     print("help: ? overlay + trimmed footer")
     t = Tui(binary, {"a": {"b": 1}, "c": [1, 2, 3]})
@@ -330,6 +376,7 @@ def main():
     scenario_sibling_nav(binary)
     scenario_filter(binary)
     scenario_peek(binary)
+    scenario_stream_pipe(binary)
     scenario_help_overlay(binary)
 
     print()

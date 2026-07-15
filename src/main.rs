@@ -17,7 +17,7 @@ use scanner::{
 use search::{glob_to_regex, Pattern, Search};
 use source::Source;
 
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapOptions};
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
     layout::{Constraint, Layout, Rect},
@@ -29,7 +29,7 @@ use ratatui::{
 use std::{
     collections::HashSet,
     fs::File,
-    io::{IsTerminal, Read},
+    io::{IsTerminal, Read, Write},
     sync::{
         mpsc::{self, Receiver, TryRecvError},
         Arc, Weak,
@@ -3017,31 +3017,154 @@ const STREAM_REBUILD_MS: u128 = 100;
 /// The streaming loop: bytes arrive on `rx` from the reader thread, the buffer
 /// grows, and the tree is re-parsed on a throttle (preserving cursor/expansion).
 /// Search snapshots the buffer at launch (so it covers the bytes parsed so far).
-/// Hand a search/filter worker a `Source` over the stream bytes arrived so far,
-/// reusing the last one when the buffer hasn't grown since.
+/// The growing byte store behind a streamed (piped) document.
 ///
-/// A snapshot must own its bytes (the worker outlives this frame's borrow of
-/// `buf`), but cloning the whole buffer on every call is the cost we're avoiding:
-/// search relaunches per keystroke. Since a stream only appends, a snapshot of
-/// length N stays a byte-identical prefix of any longer buffer, so as long as
-/// `cache` still points at a live snapshot of the current length we clone
-/// nothing and share its `Arc`. The cache is weak, so the copy lives exactly as
-/// long as some worker references it and is freed the moment the last one drops.
-fn buffer_snapshot(buf: &[u8], cache: &mut Weak<Source>) -> Arc<Source> {
-    if let Some(snap) = cache.upgrade() {
-        if snap.len() == buf.len() {
-            return snap;
+/// A pipe can't be mmap'd directly, but its bytes can be spilled to a temp file
+/// and *that* mmap'd — so the document lives in evictable, file-backed page
+/// cache instead of resident anonymous RAM, and RSS stays ~flat however large
+/// the stream (the same property the file path has). The temp file is unlinked
+/// the instant it's opened: it has no name on disk, the open fd keeps the inode
+/// alive, and the OS reclaims the space when jview exits — cleanly, even on a
+/// panic or `SIGKILL`. Where spilling isn't available (non-unix, or no writable
+/// temp dir) it falls back to an in-RAM `Vec`, the fully-resident behaviour.
+enum StreamStore {
+    /// Spilled to an unlinked temp file, mmap'd and re-mapped as it grows. Old
+    /// mappings stay valid because a stream only ever appends.
+    Spilled {
+        /// Read+append handle to the unlinked file; keeps the inode alive.
+        file: File,
+        /// Current mapping over the first `len` bytes, refreshed on growth.
+        map: Option<Mmap>,
+        /// Bytes durably written so far (`<= file size`; a partial failed write
+        /// is never counted, so the mapped prefix is always consistent).
+        len: usize,
+    },
+    /// In-RAM fallback: the whole document is resident.
+    Ram(Vec<u8>),
+}
+
+impl StreamStore {
+    /// Spill to a temp file where possible, else buffer in RAM.
+    fn new() -> StreamStore {
+        #[cfg(unix)]
+        if let Some(s) = Self::try_spill() {
+            return s;
+        }
+        StreamStore::Ram(Vec::new())
+    }
+
+    /// Create an unlinked temp file to spill into. `None` if no temp file could
+    /// be opened (read-only temp dir, etc.) — the caller falls back to RAM.
+    #[cfg(unix)]
+    fn try_spill() -> Option<StreamStore> {
+        use std::fs::OpenOptions;
+        let dir = std::env::temp_dir();
+        // A per-process name; unlinked immediately, so a collision only happens
+        // if a prior run was killed in the microseconds before its own unlink —
+        // try a few suffixes to be safe.
+        for n in 0..8 {
+            let path = dir.join(format!("jview-stream-{}-{}.json", std::process::id(), n));
+            if let Ok(file) = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .create_new(true)
+                .open(&path)
+            {
+                // Unlink now: no directory entry to clean up, so the space is
+                // reclaimed on exit however jview dies. The fd (and any mmap of
+                // it) keeps the bytes readable meanwhile.
+                let _ = std::fs::remove_file(&path);
+                return Some(StreamStore::Spilled {
+                    file,
+                    map: None,
+                    len: 0,
+                });
+            }
+        }
+        None
+    }
+
+    /// Append a freshly-read chunk. Best-effort on a spill write failure (disk
+    /// full): `len` simply doesn't advance, so the mapped prefix stays valid and
+    /// the view just stops growing rather than crashing.
+    fn append(&mut self, chunk: &[u8]) {
+        match self {
+            StreamStore::Spilled { file, len, .. } => {
+                if file.write_all(chunk).is_ok() {
+                    *len += chunk.len();
+                }
+            }
+            StreamStore::Ram(v) => v.extend_from_slice(chunk),
         }
     }
-    let snap = Arc::new(Source::Buffered(buf.to_vec()));
-    *cache = Arc::downgrade(&snap);
-    snap
+
+    /// Refresh the mapping so [`bytes`](Self::bytes) covers everything appended
+    /// so far. Cheap and zero-copy (mmap sets up page tables lazily); a failure
+    /// keeps the previous, shorter map and is retried next tick.
+    fn sync(&mut self) {
+        if let StreamStore::Spilled { file, map, len } = self {
+            if *len > 0 && map.as_ref().map_or(0, |m| m.len()) != *len {
+                if let Ok(m) = unsafe { MmapOptions::new().len(*len).map(&*file) } {
+                    *map = Some(m);
+                }
+            }
+        }
+    }
+
+    /// The document bytes parsed/rendered this frame.
+    fn bytes(&self) -> &[u8] {
+        match self {
+            StreamStore::Spilled { map, len, .. } => match map {
+                Some(m) => &m[..(*len).min(m.len())],
+                None => &[],
+            },
+            StreamStore::Ram(v) => v,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            StreamStore::Spilled { len, .. } => *len,
+            StreamStore::Ram(v) => v.len(),
+        }
+    }
+
+    /// Hand a search/filter worker an owned `Source` over the bytes arrived so
+    /// far, reusing the last one when the store hasn't grown since.
+    ///
+    /// The worker outlives this frame, so it needs an owned source. For a spill
+    /// that's a fresh mmap of the same file — zero-copy; for the RAM fallback
+    /// it's an unavoidable buffer copy. Either way, because a stream only
+    /// appends, a source of length N stays a byte-identical prefix of any longer
+    /// store: while `cache` still points at a live source of the current length
+    /// we hand back the same `Arc` (search relaunches once per keystroke, so
+    /// this collapses per-character work to per-growth). The cache is weak, so
+    /// the source is freed the moment the last worker drops it.
+    fn snapshot(&self, cache: &mut Weak<Source>) -> Arc<Source> {
+        let len = self.len();
+        if let Some(snap) = cache.upgrade() {
+            if snap.len() == len {
+                return snap;
+            }
+        }
+        let snap = match self {
+            StreamStore::Spilled { file, len, .. } if *len > 0 => {
+                match unsafe { MmapOptions::new().len(*len).map(file) } {
+                    Ok(m) => Arc::new(Source::Mapped(m)),
+                    Err(_) => Arc::new(Source::Buffered(self.bytes().to_vec())),
+                }
+            }
+            _ => Arc::new(Source::Buffered(self.bytes().to_vec())),
+        };
+        *cache = Arc::downgrade(&snap);
+        snap
+    }
 }
 
 fn run_stream(
     term: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    buf: &mut Vec<u8>,
+    store: &mut StreamStore,
     jsonl: &mut bool,
     rx: Receiver<Vec<u8>>,
 ) -> std::io::Result<()> {
@@ -3057,11 +3180,13 @@ fn run_stream(
     // closed, filter pane closed — the copy is freed. Zero steady-state cost.
     let mut snapshot: Weak<Source> = Weak::new();
     loop {
-        // Drain whatever the reader thread has produced.
+        // Drain whatever the reader thread has produced into the store (spilled
+        // to the temp file, or the RAM fallback). The chunk is freed right after,
+        // so nothing accumulates in memory beyond the store itself.
         loop {
             match rx.try_recv() {
                 Ok(chunk) => {
-                    buf.extend_from_slice(&chunk);
+                    store.append(&chunk);
                     dirty = true;
                 }
                 Err(TryRecvError::Empty) => break,
@@ -3071,8 +3196,14 @@ fn run_stream(
                 }
             }
         }
+        // Refresh the mapping to cover the newly-arrived bytes *before* anything
+        // reads them — the sniff and the rebuild both need the grown view (unlike
+        // the RAM fallback, a spill's `bytes()` lags until it's re-mapped).
+        if dirty {
+            store.sync();
+        }
         // NDJSON detection is sticky: once multi-doc, stay multi-doc.
-        if !*jsonl && sniff_multi(buf) {
+        if !*jsonl && sniff_multi(store.bytes()) {
             *jsonl = true;
         }
         // Re-parse on a throttle, or immediately once the stream is complete.
@@ -3080,7 +3211,7 @@ fn run_stream(
         // snapshots of the bytes that had arrived when they were spun off.
         if dirty && (done || last_build.elapsed().as_millis() >= STREAM_REBUILD_MS) {
             if let Some(main) = app.views.iter_mut().find(|v| !v.derived) {
-                main.rebuild(buf, *jsonl);
+                main.rebuild(store.bytes(), *jsonl);
             }
             dirty = false;
             last_build = Instant::now();
@@ -3089,10 +3220,10 @@ fn run_stream(
         for v in &mut app.views {
             v.pump_search();
         }
-        // Borrow the (possibly grown) buffer just for this frame's render + input,
-        // then release it so a search relaunch can snapshot it below.
+        // Borrow the store's bytes just for this frame's render + input, then
+        // release the borrow so a search relaunch can snapshot the store below.
         let outcome = {
-            let b: &[u8] = buf;
+            let b: &[u8] = store.bytes();
             // Fold in filter hits here, where the live buffer is borrowed (a stream
             // only appends, so a hit's offsets stay valid against the grown buffer).
             for v in &mut app.views {
@@ -3110,13 +3241,13 @@ fn run_stream(
             KeyOutcome::Relaunch => {
                 // Search over the bytes parsed so far (the stream keeps growing,
                 // but one search covers what's arrived at its launch).
-                let snap = buffer_snapshot(buf, &mut snapshot);
+                let snap = store.snapshot(&mut snapshot);
                 app.active_mut().relaunch(&snap);
             }
             KeyOutcome::LaunchFilter => {
                 // Filter over a snapshot of the bytes arrived so far, mirroring
                 // search: the result pane reflects the document at launch time.
-                let snap = buffer_snapshot(buf, &mut snapshot);
+                let snap = store.snapshot(&mut snapshot);
                 app.launch_filter(&snap);
             }
             KeyOutcome::Continue => {}
@@ -3424,16 +3555,18 @@ fn run_file(path: String) -> std::io::Result<()> {
     res
 }
 
-/// Stream piped stdin: the JSON renders progressively as it arrives (a pipe
-/// can't be mmap'd, so it's buffered in RAM and re-parsed on a throttle).
+/// Stream piped stdin: the JSON renders progressively as it arrives. A pipe
+/// can't be mmap'd, so it's spilled to an (unlinked) temp file we mmap — RSS
+/// stays ~flat like the file path — or buffered in RAM where that's not
+/// available, and re-parsed on a throttle.
 fn run_stdin() -> std::io::Result<()> {
     let rx = spawn_reader(take_pipe_reader());
     // stdin was the pipe; fd 0 is now the terminal (reattached above). Reserve
     // stdout so `… | jview | jq` can extract a node into the downstream pipe.
     let payload = reserve_stdout_for_payload();
-    let mut buf: Vec<u8> = Vec::new();
+    let mut store = StreamStore::new();
     let mut jsonl = false;
-    let mut app = App::single(View::new(&buf, "stdin", jsonl));
+    let mut app = App::single(View::new(store.bytes(), "stdin", jsonl));
     app.can_extract = payload.enabled;
     if app.can_extract {
         app.flash = Some(EXTRACT_HINT.to_string());
@@ -3441,17 +3574,17 @@ fn run_stdin() -> std::io::Result<()> {
     let mut term = ratatui::init();
     // Same as run_file: paint before the up-to-2s keyboard-enhancement probe so
     // the (initially empty) streaming pane shows immediately, not a blank screen.
-    let _ = render_frame(&mut term, &mut app, &buf, true);
+    let _ = render_frame(&mut term, &mut app, store.bytes(), true);
     let enhanced = enable_enhanced_keys();
     enable_mouse();
-    let res = run_stream(&mut term, &mut app, &mut buf, &mut jsonl, rx);
+    let res = run_stream(&mut term, &mut app, &mut store, &mut jsonl, rx);
     disable_mouse();
     if enhanced {
         disable_enhanced_keys();
     }
     ratatui::restore();
     if let Some(range) = app.extract {
-        write_extract(&buf, range, payload)?;
+        write_extract(store.bytes(), range, payload)?;
     }
     res
 }
