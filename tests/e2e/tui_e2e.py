@@ -344,6 +344,54 @@ def scenario_stream_pipe(binary):
     check("no spill temp files leak after exit", not leftover, t)
 
 
+def scenario_explore(binary):
+    print("explore: c count · t schema · Tab-scoped search")
+    t = Tui(binary, {
+        "users": [
+            {"id": 1, "name": "amy", "email": "a@x.com"},
+            {"id": 2, "name": "bob"},
+            {"id": 3, "name": "cara", "email": "c@x.com"},
+        ],
+        "audit": [{"name": "zzz"}],
+    })
+    try:
+        # `c` counts a container's children without expanding it.
+        t.send(":"); t.send("users"); t.send("\r")
+        t.send("c")
+        check("c reports the element count", "3 elements" in t.footer(), t)
+
+        # `t` summarizes the container's shape: fields, types, fill rate.
+        t.send("t")
+        scr = t.dump()
+        check("t opens a schema card", "schema" in scr and "users" in scr, t)
+        check("schema lists fields with types",
+              "name" in scr and "string" in scr and "email" in scr, t)
+        check("schema shows a fill rate for a partial field",
+              "66%" in scr or "67%" in scr, t)
+        t.send("\x1b")  # close schema
+
+        # Scoped search: 'name' appears under both users and audit; scope to users.
+        t.send(":"); t.send("users"); t.send("\r")
+        t.send("/"); t.send("name"); t.pump(0.6)
+        whole = t.footer()
+        check("unscoped search sees matches across the doc",
+              "match" in whole and "0 match" not in whole, t)
+        t.send("\t"); t.pump(0.6)  # scope to users
+        scoped = t.footer()
+        check("Tab scopes the search to the focused container",
+              "in users" in scoped, t)
+        # users has 3 names; audit has 1 — scoping must drop the audit hit.
+        import re
+        def count(s):
+            m = re.search(r"(\d+)\s+match", s)
+            return int(m.group(1)) if m else -1
+        check("scoping narrows the match count",
+              0 < count(scoped) < count(whole), t)
+        t.send("\x1b")
+    finally:
+        t.close()
+
+
 def scenario_help_overlay(binary):
     print("help: ? overlay + trimmed footer")
     t = Tui(binary, {"a": {"b": 1}, "c": [1, 2, 3]})
@@ -377,6 +425,7 @@ def main():
     scenario_filter(binary)
     scenario_peek(binary)
     scenario_stream_pipe(binary)
+    scenario_explore(binary)
     scenario_help_overlay(binary)
 
     print()

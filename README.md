@@ -62,13 +62,14 @@ From a checkout: `cargo run --release -- file.json`.
 | `g`, `Home` | top |
 | `Enter`/`→`/`Space` | expand / collapse a container — or peek a leaf's full value |
 | `←` | collapse, or jump to parent if already collapsed |
-| `/` | search (live — results stream as you type) |
+| `t` · `c` | schema (sampled field/type summary) of a container · count its children |
+| `/` | search (live — results stream as you type; `Tab` scopes it to the focused subtree) |
 | `Enter`/`↓` · `Shift-Enter`/`↑` (in search) | next / previous match |
 | `:` | jump to a path — absolute or relative to the cursor |
 | `\|` | jq-style filter — opens a result pane of the selected nodes |
 | `m` · `'` | bookmark the focused node · open the bookmark picker |
 | `y` · `Y` | copy the focused value/subtree · copy its path |
-| `p` | pipe the focused node's JSON to stdout (when output is redirected) |
+| `p` | pipe the focused node's JSON to stdout — or every hit on a filter pane (when output is redirected) |
 | `s` · `o` | split a new pane at the node · open a preview pane |
 | `\` · `+`/`-` · `Tab` | toggle layout · resize · switch pane |
 | `x` · `q`/`Esc` | close the active pane · close (quit on the last) |
@@ -92,10 +93,19 @@ the richer ones:
   segments accept `*`/`?` wildcards (`data.user*`, `data.*name*`) when you only
   remember part of the key — the first child whose label matches the whole
   pattern wins.
+- **Explore (`t` / `c`)** — orient yourself in unfamiliar data without expanding
+  it. `t` on an array or object opens a **schema card**: a sampled (first 1000
+  children) summary of every field, the JSON type(s) it takes, its fill rate
+  across records, and an example value — sorted most-common first, so an array of
+  a million objects tells you its shape instantly. `c` reports a container's exact
+  child count (`1,234,567 elements`) — a full scan, but on demand, so you can size
+  a collapsed level without opening it.
 - **Search (`/`)** — plain queries are case-insensitive substring matches (the
   default). Prefix with `re:` for a full regex (`re:^id_\w+$`) or `g:` for a
   glob (`g:user*`); a bad pattern shows `(bad pattern: …)` in the footer so you
-  can fix it without losing what you typed.
+  can fix it without losing what you typed. `Tab` **scopes** the search to the
+  container you were on when you opened it (the footer shows `in <label>`) — press
+  it again for the whole document; scoping is faster and quieter in a huge file.
 - **Filter (`|`)** — a jq-style **selection** pipeline that opens a new pane
   listing the nodes it picks out (`.users[] | select(.age > 30) | .name`).
   Supported:
@@ -147,8 +157,10 @@ the richer ones:
   and `p` writes the focused node's raw JSON to that pipe/file, then quits. The
   payload is a zero-copy slice of the mmap and **uncapped**, so it's the way to
   carve one subtree out of a file too big for `jq` to open and hand just that
-  piece downstream. Into a plain terminal (no redirect) there's nowhere to pipe,
-  so `p` shows a hint instead.
+  piece downstream. On a **filter-result pane** `p` instead streams *every* hit as
+  NDJSON (one value per line), so `select(…)` becomes a batch extractor — carve
+  all the matching subtrees out at once. Into a plain terminal (no redirect)
+  there's nowhere to pipe, so `p` shows a hint instead.
 - **Panes (`s`/`o`)** — `s` splits a new pane rooted at the focused node; `o` opens
   one *preview* pane that follows your cursor (master/detail). Panes share the one
   mmap (a split costs nothing), each keeps its own focus/expansion/search, and

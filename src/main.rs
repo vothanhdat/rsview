@@ -526,6 +526,9 @@ enum Mode {
     /// The value-peek overlay (`Enter`/`Space` on a scalar leaf): the focused
     /// value decoded in full and scrollable. See [`View::peek`].
     Peek,
+    /// The schema/shape overlay (`t` on a container): a sampled field→type
+    /// summary of a container's children. See [`View::schema`].
+    Schema,
 }
 
 /// The state behind a [`Mode::Peek`] overlay: one scalar's full value, decoded
@@ -540,6 +543,42 @@ struct Peek {
     /// True when the decode hit the cap, so the title can flag it.
     truncated: bool,
     /// Top visible wrapped line (advanced by the scroll keys).
+    scroll: usize,
+}
+
+/// How many children the `t` schema overlay samples before summarizing.
+const SCHEMA_SAMPLE: usize = 1000;
+/// Cap on distinct fields tracked (a pathological object with a huge key space
+/// won't blow up the summary).
+const SCHEMA_FIELDS_MAX: usize = 500;
+
+/// One field's shape across a sampled container: how many records had it, the
+/// JSON type(s) it took, and an example value.
+struct FieldStat {
+    name: String,
+    count: usize,
+    kinds: Vec<Kind>,
+    example: String,
+}
+
+/// The `t` schema overlay: a sampled type/shape summary of a container. For an
+/// array (or NDJSON root) each element is a *record* and the fields are the union
+/// of the elements' keys with a fill rate; for an object the fields are its own
+/// keys. See [`build_schema`].
+struct Schema {
+    /// The container's label + kind, for the card title.
+    title: String,
+    /// Records considered (array elements, or 1× the object's own keys).
+    records: usize,
+    /// True when the container had more children than we sampled.
+    more: bool,
+    /// True when it had more distinct fields than we track.
+    field_more: bool,
+    /// Whether children are records (array/NDJSON) — drives the fill-rate column.
+    by_record: bool,
+    /// Fields, sorted most-common first.
+    fields: Vec<FieldStat>,
+    /// Top visible row (advanced by the scroll keys).
     scroll: usize,
 }
 
@@ -674,6 +713,21 @@ impl TextInput {
     }
 }
 
+/// A search scope: the focused container's subtree, captured when the `/` prompt
+/// opens. `Tab` toggles between searching this subtree and the whole document.
+/// `path` is the container's absolute path from the pane root, so subtree-local
+/// match paths (the worker indexes children from 0) can be lifted back to
+/// absolute paths that line up with the rows.
+#[derive(Clone)]
+struct Scope {
+    start: usize,
+    end: usize,
+    kind: Kind,
+    jsonl: bool,
+    path: Vec<usize>,
+    label: String,
+}
+
 /// One pane: an independent lazy tree + viewport over a byte range of the shared
 /// `Source`. The main pane is the whole document; a split pane (`derived`) is
 /// rooted at another pane's focused node. Each keeps its own focus, scroll,
@@ -706,6 +760,11 @@ struct View {
     query_error: Option<String>,
     /// The running search, if any. `None` once cleared/cancelled.
     search: Option<Search>,
+    /// The focused container captured when `/` opened, or `None` if the focus
+    /// wasn't a container. `Tab` in the prompt flips `scoped` to search just this
+    /// subtree (faster and quieter in a huge document) vs. the whole pane.
+    search_scope: Option<Scope>,
+    scoped: bool,
     /// Which match the cursor is currently on.
     match_idx: usize,
     /// Whether match-cycling has landed on a result yet (so the first
@@ -739,6 +798,8 @@ struct View {
     filter_added: usize,
     /// The open value-peek overlay, if any (`Mode::Peek`).
     peek: Option<Peek>,
+    /// The open schema overlay, if any (`Mode::Schema`).
+    schema: Option<Schema>,
 }
 
 /// Build the root node for a buffer. Shared by `App::new` and `App::rebuild`
@@ -1087,6 +1148,8 @@ impl View {
             query: TextInput::default(),
             query_error: None,
             search: None,
+            search_scope: None,
+            scoped: false,
             match_idx: 0,
             match_set: HashSet::new(),
             indexed: 0,
@@ -1101,6 +1164,7 @@ impl View {
             filter: None,
             filter_added: 0,
             peek: None,
+            schema: None,
         }
     }
 
@@ -1117,6 +1181,7 @@ impl View {
         self.want_path = None;
         self.mode = Mode::Normal;
         self.peek = None;
+        self.schema = None;
         self.goto.clear();
         // Bookmarked paths refer to the old tree; drop them on re-root.
         self.bookmarks.clear();
@@ -1195,6 +1260,40 @@ impl View {
     /// A `re:`/`g:` query that fails to compile is treated as zero-matches —
     /// the footer surfaces the parse error so the user can fix the expression
     /// without losing what they've typed.
+    /// The focused container's subtree as a search scope, or `None` if the focus
+    /// isn't a container (nothing to scope into).
+    fn scope_of_focus(&self) -> Option<Scope> {
+        let row = self.rows.get(self.focus)?;
+        let node = get(&self.root, &row.path);
+        if node.jsonl || matches!(node.kind, Kind::Object | Kind::Array) {
+            Some(Scope {
+                start: node.start,
+                end: node.end,
+                kind: node.kind,
+                jsonl: node.jsonl,
+                path: row.path.clone(),
+                label: row.label.clone(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Lift a worker match path to absolute. A scoped search scans a subtree and
+    /// indexes its children from 0, so those paths need the scope's own path
+    /// prepended to line up with the pane's rows; an unscoped search already
+    /// yields absolute paths.
+    fn abs_match(&self, p: &[usize]) -> Vec<usize> {
+        match (self.scoped, &self.search_scope) {
+            (true, Some(s)) => {
+                let mut full = s.path.clone();
+                full.extend_from_slice(p);
+                full
+            }
+            _ => p.to_vec(),
+        }
+    }
+
     fn relaunch(&mut self, mmap: &Arc<Source>) {
         if let Some(old) = self.search.take() {
             old.cancel(); // belt-and-suspenders; Drop also flips the flag
@@ -1215,13 +1314,23 @@ impl View {
                 return;
             }
         };
+        // Scan just the focused subtree when scoped, else the whole pane root.
+        let (start, end, kind, jsonl) = match (self.scoped, &self.search_scope) {
+            (true, Some(s)) => (s.start, s.end, s.kind, s.jsonl),
+            _ => (
+                self.root.start,
+                self.root.end,
+                self.root.kind,
+                self.root.jsonl,
+            ),
+        };
         self.search = Some(Search::spawn(
             Arc::clone(mmap),
             pattern,
-            self.root.jsonl,
-            self.root.start,
-            self.root.end,
-            self.root.kind,
+            jsonl,
+            start,
+            end,
+            kind,
         ));
     }
 
@@ -1233,7 +1342,7 @@ impl View {
         let n = self.search.as_ref().map_or(0, |s| s.matches.len());
         while self.indexed < n {
             let p = self.search.as_ref().unwrap().matches[self.indexed].clone();
-            self.match_set.insert(p);
+            self.match_set.insert(self.abs_match(&p));
             self.indexed += 1;
         }
     }
@@ -1301,6 +1410,7 @@ impl View {
             (self.match_idx + n - 1) % n
         };
         let path = self.search.as_ref().unwrap().matches[self.match_idx].clone();
+        let path = self.abs_match(&path);
         self.jump_to(&path, b);
     }
 
@@ -1367,6 +1477,8 @@ impl View {
         self.match_idx = 0;
         self.landed = false;
         self.want_path = None;
+        self.search_scope = None;
+        self.scoped = false;
     }
 
     /// Jump to the next (`forward`) or previous sibling at the focused node's
@@ -1511,6 +1623,10 @@ struct App {
     /// Set by `p` to the focused node's byte range; the viewer quits and the
     /// caller writes that slice to the reserved stdout on the way out.
     extract: Option<(usize, usize)>,
+    /// Set by `p` on a filter-result pane: the byte range of *every* hit, emitted
+    /// as NDJSON (one per line) on the way out — batch-carving many subtrees at
+    /// once, the same zero-copy way `extract` carves one.
+    extract_batch: Option<Vec<(usize, usize)>>,
     /// A filter awaiting launch: stashed by the `|` prompt, consumed by the run
     /// loop (which has the owned byte `Source` the worker needs).
     pending_filter: Option<PendingFilter>,
@@ -1538,6 +1654,7 @@ impl App {
             flash: None,
             can_extract: false,
             extract: None,
+            extract_batch: None,
             pending_filter: None,
         }
     }
@@ -2017,6 +2134,7 @@ fn ui(f: &mut Frame, app: &App, streaming: bool) {
         Mode::Marks => render_marks(f, area, app.active_view()),
         Mode::Help => render_help(f, area),
         Mode::Peek => render_peek(f, area, app.active_view()),
+        Mode::Schema => render_schema(f, area, app.active_view()),
         _ => {}
     }
 }
@@ -2040,10 +2158,16 @@ fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Option<&str>) {
         } else {
             format!("{}{} matches", count, more)
         };
+        // Scope hint: show where a scoped search is aimed, or that Tab can scope.
+        let scope = match (&view.search_scope, view.scoped) {
+            (Some(s), true) => format!(" · in {} · ⇥ all", s.label),
+            (Some(_), false) => " · ⇥ scope".to_string(),
+            (None, _) => String::new(),
+        };
         prompt_line(
             '/',
             &view.query,
-            &format!("{pos} · ↵/↓ next · ⇧↵/↑ prev · esc close"),
+            &format!("{pos}{scope} · ↵/↓ next · esc close"),
         )
     } else if view.mode == Mode::Goto {
         prompt_line(':', &view.goto, "↵ jump · esc cancel")
@@ -2169,14 +2293,16 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("Enter  →", "expand · peek a leaf"),
         ("←", "collapse / parent"),
         ("wheel", "scroll the pane"),
-        ("/", "search · re:rx · g:glob"),
+        ("t", "schema of a container"),
+        ("c", "count children"),
+        ("/", "search · ⇥ scope subtree"),
         ("↵  ⇧↵", "next / prev match"),
         (":", "jump to a path · *? in keys"),
         ("|", "jq-style filter → new pane"),
         ("m", "toggle bookmark"),
         ("'", "bookmark picker"),
         ("y / Y", "copy value / path"),
-        ("p", "pipe node to stdout"),
+        ("p", "pipe node · all hits on a filter pane"),
         ("s", "split pane at node"),
         ("o", "preview pane"),
         ("\\", "toggle pane layout"),
@@ -2422,6 +2548,140 @@ fn render_peek(f: &mut Frame, area: Rect, view: &View) {
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
+/// Header rows the schema card draws above its scrollable field list (a summary
+/// line + the column header), so the scroll clamp and the renderer agree.
+const SCHEMA_HEADER_ROWS: usize = 2;
+
+/// Clip a column value to `w` chars, adding `…` when it overflows.
+fn clip_col(s: &str, w: usize) -> String {
+    if s.chars().count() > w {
+        let mut t: String = s.chars().take(w.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    } else {
+        s.to_string()
+    }
+}
+
+/// Draw the schema overlay: a sampled field→type table for the focused
+/// container, scrolled to `schema.scroll`, in the same floating-card style as the
+/// other overlays. Opened by `t`; closed by `esc`/`q`/`t`.
+fn render_schema(f: &mut Frame, area: Rect, view: &View) {
+    let Some(sc) = view.schema.as_ref() else {
+        return;
+    };
+    let (rect, inner_w, inner_h) = peek_layout(area);
+    let body_h = inner_h.saturating_sub(SCHEMA_HEADER_ROWS);
+
+    // Column widths within the card: name (bounded), type, fill%, then example
+    // takes the rest.
+    let name_w = sc
+        .fields
+        .iter()
+        .map(|f| f.name.chars().count())
+        .max()
+        .unwrap_or(5)
+        .clamp(5, 28);
+    let type_w = 16usize;
+    let fill_w = if sc.by_record { 4 } else { 0 };
+    let fixed = name_w + 2 + type_w + 2 + if sc.by_record { fill_w + 2 } else { 0 };
+    let ex_w = inner_w.saturating_sub(fixed).max(6);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let panel_bg = Color::Indexed(236);
+
+    let mut lines: Vec<Line> = Vec::new();
+    // Summary line.
+    let unit = if sc.by_record { "records" } else { "fields" };
+    let more = if sc.more { "+" } else { "" };
+    let fmore = if sc.field_more {
+        " · +more fields"
+    } else {
+        ""
+    };
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {}{more} {unit} sampled · {} distinct field{}{fmore}",
+            group(sc.records),
+            sc.fields.len(),
+            if sc.fields.len() == 1 { "" } else { "s" },
+        ),
+        dim,
+    )));
+    // Column header.
+    let hdr = if sc.by_record {
+        format!(
+            " {:<name_w$}  {:<type_w$}  {:>fill_w$}  example",
+            "field", "type", "fill"
+        )
+    } else {
+        format!(" {:<name_w$}  {:<type_w$}  example", "field", "type")
+    };
+    lines.push(Line::from(Span::styled(
+        hdr,
+        dim.add_modifier(Modifier::BOLD),
+    )));
+
+    // Scrolled field rows.
+    let top = sc.scroll.min(sc.fields.len().saturating_sub(body_h));
+    let bottom = (top + body_h).min(sc.fields.len());
+    for fst in &sc.fields[top..bottom] {
+        let name = clip_col(&fst.name, name_w);
+        let types = clip_col(
+            &fst.kinds
+                .iter()
+                .map(|k| kind_name(*k))
+                .collect::<Vec<_>>()
+                .join("|"),
+            type_w,
+        );
+        let ex = clip_col(&fst.example, ex_w);
+        let mut spans = vec![
+            Span::raw(" "),
+            Span::styled(format!("{name:<name_w$}"), Style::default().fg(C_KEY)),
+            Span::raw("  "),
+            Span::styled(
+                format!("{types:<type_w$}"),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw("  "),
+        ];
+        if sc.by_record {
+            let pct = fst.count * 100 / sc.records.max(1);
+            spans.push(Span::styled(format!("{:>fill_w$}", format!("{pct}%")), dim));
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            format!("{ex:<ex_w$}"),
+            Style::default().fg(Color::Gray),
+        ));
+        lines.push(Line::from(spans));
+    }
+
+    let title = format!(
+        " schema · {} · {} field{} · j/k scroll · esc ",
+        sc.title,
+        sc.fields.len(),
+        if sc.fields.len() == 1 { "" } else { "s" },
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(panel_bg))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
 /// Braille spinner frames for the inline "still scanning a huge value" row.
 /// Advanced by wall-clock time so it animates across the drain's repaints without
 /// threading a frame counter through the render path.
@@ -2597,6 +2857,12 @@ fn process_key(
             KeyCode::Enter if shift => v.nav_match(-1, b),
             KeyCode::Enter | KeyCode::Down => v.nav_match(1, b),
             KeyCode::Up => v.nav_match(-1, b),
+            // Tab scopes the search to the focused container (captured at open)
+            // and back — a no-op if the focus wasn't a container.
+            KeyCode::Tab | KeyCode::BackTab if v.search_scope.is_some() => {
+                v.scoped = !v.scoped;
+                return KeyOutcome::Relaunch;
+            }
             // Editing/caret keys go to the input; only a text change relaunches
             // the live search (a caret move leaves the query — and results — put).
             other => {
@@ -2763,6 +3029,34 @@ fn process_key(
         return KeyOutcome::Continue;
     }
 
+    // Schema mode: the shape overlay. Scroll the field list; Esc/q/t/Enter close.
+    if app.active_view().mode == Mode::Schema {
+        let (_, _, inner_h) = peek_layout(term_area().unwrap_or(Rect::new(0, 0, 80, 24)));
+        let body_h = inner_h.saturating_sub(SCHEMA_HEADER_ROWS);
+        let v = app.active_mut();
+        if let Some(sc) = v.schema.as_mut() {
+            let max = sc.fields.len().saturating_sub(body_h);
+            match k.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t') | KeyCode::Enter => {
+                    v.mode = Mode::Normal;
+                    v.schema = None;
+                }
+                KeyCode::Down | KeyCode::Char('j') => sc.scroll = (sc.scroll + 1).min(max),
+                KeyCode::Up | KeyCode::Char('k') => sc.scroll = sc.scroll.saturating_sub(1),
+                KeyCode::PageDown | KeyCode::Char(' ') => sc.scroll = (sc.scroll + body_h).min(max),
+                KeyCode::PageUp => sc.scroll = sc.scroll.saturating_sub(body_h),
+                KeyCode::Char('f') if ctrl => sc.scroll = (sc.scroll + body_h).min(max),
+                KeyCode::Char('b') if ctrl => sc.scroll = sc.scroll.saturating_sub(body_h),
+                KeyCode::Home | KeyCode::Char('g') => sc.scroll = 0,
+                KeyCode::End | KeyCode::Char('G') => sc.scroll = max,
+                _ => {}
+            }
+        } else {
+            v.mode = Mode::Normal;
+        }
+        return KeyOutcome::Continue;
+    }
+
     // Any normal-mode key dismisses the previous flash (copy status, …); copy
     // keys below set a fresh one.
     app.flash = None;
@@ -2788,6 +3082,17 @@ fn process_key(
                     Some("pipe jview into a command (e.g. | jq) to extract a node".to_string());
                 return KeyOutcome::Continue;
             }
+            // On a filter-result pane, `p` carves out *all* the hits as NDJSON;
+            // elsewhere it carves the one focused node.
+            if let Some(f) = &app.active_view().filter {
+                let ranges: Vec<(usize, usize)> = f.hits.iter().map(|h| (h.start, h.end)).collect();
+                if ranges.is_empty() {
+                    app.flash = Some("no filter hits to extract".to_string());
+                    return KeyOutcome::Continue;
+                }
+                app.extract_batch = Some(ranges);
+                return KeyOutcome::Quit;
+            }
             match app.focused_range() {
                 Some(range) => {
                     app.extract = Some(range);
@@ -2798,6 +3103,55 @@ fn process_key(
                     return KeyOutcome::Continue;
                 }
             }
+        }
+        // `c` counts the focused container's direct children — the size of a
+        // collapsed level without expanding it (a full scan, but on demand).
+        KeyCode::Char('c') => {
+            let v = app.active_view();
+            let msg = v.rows.get(v.focus).map(|row| {
+                let node = get(&v.root, &row.path);
+                match count_children(node, b) {
+                    Some(n) => {
+                        let what = if matches!(node.kind, Kind::Array) || node.jsonl {
+                            "elements"
+                        } else {
+                            "entries"
+                        };
+                        format!("{}: {} {what}", row.label, group(n))
+                    }
+                    None => format!("{}: not a container", row.label),
+                }
+            });
+            if let Some(m) = msg {
+                app.flash = Some(m);
+            }
+            return KeyOutcome::Continue;
+        }
+        // `t` shows the focused container's shape: a sampled field→type summary.
+        KeyCode::Char('t') => {
+            let v = app.active_view();
+            let built = v.rows.get(v.focus).and_then(|row| {
+                let node = get(&v.root, &row.path);
+                let title = format!(
+                    "{} · {}",
+                    row.label,
+                    if node.jsonl {
+                        "ndjson"
+                    } else {
+                        kind_name(node.kind)
+                    }
+                );
+                build_schema(node, b, title)
+            });
+            match built {
+                Some(s) => {
+                    let v = app.active_mut();
+                    v.schema = Some(s);
+                    v.mode = Mode::Schema;
+                }
+                None => app.flash = Some("schema: focus an array or object".to_string()),
+            }
+            return KeyOutcome::Continue;
         }
         // `:` opens the path-jump prompt; `m` bookmarks the focused node; `'`
         // opens the bookmark picker.
@@ -2884,6 +3238,9 @@ fn process_key(
         KeyCode::Char('/') => {
             v.mode = Mode::Search;
             v.query.clear();
+            // Capture the focused container so `Tab` can scope the search into it.
+            v.search_scope = v.scope_of_focus();
+            v.scoped = false;
             return KeyOutcome::Relaunch;
         }
         KeyCode::Down | KeyCode::Char('j') => v.focus += 1,
@@ -2915,6 +3272,188 @@ fn process_key(
         _ => {}
     }
     KeyOutcome::Continue
+}
+
+/// Count a container's direct children by scanning them (bounded only by the
+/// data — a resumable cursor, so it's the same walk `expand` does, just to the
+/// end). `None` for a scalar. Backs the `c` key: "how big is this?" without
+/// expanding a possibly-huge level.
+fn count_children(node: &Node, b: &[u8]) -> Option<usize> {
+    if !node.jsonl && !matches!(node.kind, Kind::Object | Kind::Array) {
+        return None;
+    }
+    let mut cur = node.make_cursor();
+    let mut n = 0usize;
+    while cur.next(b).is_some() {
+        n += 1;
+    }
+    Some(n)
+}
+
+/// Human name for a JSON kind, for the schema overlay.
+fn kind_name(k: Kind) -> &'static str {
+    match k {
+        Kind::Object => "object",
+        Kind::Array => "array",
+        Kind::Str => "string",
+        Kind::Number => "number",
+        Kind::Bool => "bool",
+        Kind::Null => "null",
+    }
+}
+
+/// A short example value for the schema overlay — a scalar decoded and clipped,
+/// a container shown as `{…}` / `[…]` (or empty).
+fn sample_value(b: &[u8], start: usize, end: usize, kind: Kind) -> String {
+    const MAX: usize = 34;
+    let clip = |s: String| -> String {
+        if s.chars().count() > MAX {
+            let mut t: String = s.chars().take(MAX - 1).collect();
+            t.push('…');
+            t
+        } else {
+            s
+        }
+    };
+    match kind {
+        Kind::Object => (if container_empty(b, start, end) {
+            "{}"
+        } else {
+            "{…}"
+        })
+        .to_string(),
+        Kind::Array => (if container_empty(b, start, end) {
+            "[]"
+        } else {
+            "[…]"
+        })
+        .to_string(),
+        Kind::Str => clip(format!("\"{}\"", decode_str(b, start, end))),
+        _ => clip(
+            String::from_utf8_lossy(&b[start..end.min(b.len())])
+                .trim()
+                .to_string(),
+        ),
+    }
+}
+
+/// Fold one field into the running stats: bump its count, union its type, keep
+/// the first non-empty example. New fields are added until `SCHEMA_FIELDS_MAX`.
+fn tally_field(
+    fields: &mut Vec<FieldStat>,
+    idx: &mut std::collections::HashMap<String, usize>,
+    name: &str,
+    kind: Kind,
+    example: String,
+    field_more: &mut bool,
+) {
+    if let Some(&i) = idx.get(name) {
+        let f = &mut fields[i];
+        f.count += 1;
+        if !f.kinds.contains(&kind) {
+            f.kinds.push(kind);
+        }
+        if f.example.is_empty() && !example.is_empty() {
+            f.example = example;
+        }
+    } else if fields.len() < SCHEMA_FIELDS_MAX {
+        idx.insert(name.to_string(), fields.len());
+        fields.push(FieldStat {
+            name: name.to_string(),
+            count: 1,
+            kinds: vec![kind],
+            example,
+        });
+    } else {
+        *field_more = true;
+    }
+}
+
+/// Sample a container and summarize its shape. `None` for a scalar. For an array
+/// (or NDJSON root) each element is a record and object elements contribute their
+/// keys (with a fill rate); for a plain object the keys are its own. Bounded by
+/// `SCHEMA_SAMPLE`, so it's cheap even on a multi-GB array — it scans the same
+/// child ranges `expand` would, just up to the sample cap.
+fn build_schema(node: &Node, b: &[u8], title: String) -> Option<Schema> {
+    if !node.jsonl && !matches!(node.kind, Kind::Object | Kind::Array) {
+        return None;
+    }
+    let by_record = node.jsonl || matches!(node.kind, Kind::Array);
+    let mut idx: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut fields: Vec<FieldStat> = Vec::new();
+    let mut records = 0usize;
+    let mut field_more = false;
+
+    let mut cur = node.make_cursor();
+    while records < SCHEMA_SAMPLE {
+        let Some(rc) = cur.next(b) else { break };
+        records += 1;
+        if by_record && matches!(rc.kind, Kind::Object) {
+            // Array/NDJSON element that's an object: contribute its keys.
+            let mut fc = Cursor::new(rc.start, rc.end, false);
+            while let Some(fld) = fc.next(b) {
+                let ex = sample_value(b, fld.start, fld.end, fld.kind);
+                tally_field(
+                    &mut fields,
+                    &mut idx,
+                    &fld.label,
+                    fld.kind,
+                    ex,
+                    &mut field_more,
+                );
+            }
+        } else if by_record {
+            // Array of scalars/arrays: a single synthetic "(value)" column.
+            let ex = sample_value(b, rc.start, rc.end, rc.kind);
+            tally_field(
+                &mut fields,
+                &mut idx,
+                "(value)",
+                rc.kind,
+                ex,
+                &mut field_more,
+            );
+        } else {
+            // Plain object: each direct child is a field, seen once.
+            let ex = sample_value(b, rc.start, rc.end, rc.kind);
+            tally_field(
+                &mut fields,
+                &mut idx,
+                &rc.label,
+                rc.kind,
+                ex,
+                &mut field_more,
+            );
+        }
+    }
+    // Was there more than we sampled?
+    let more = cur.next(b).is_some();
+    // Most-common first, then alphabetical.
+    fields.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+
+    Some(Schema {
+        title,
+        records,
+        more,
+        field_more,
+        by_record,
+        fields,
+        scroll: 0,
+    })
+}
+
+/// Group an integer with thousands separators: `1234567` → `"1,234,567"`.
+fn group(n: usize) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, &c) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c as char);
+    }
+    out
 }
 
 fn term_area() -> std::io::Result<Rect> {
@@ -3418,12 +3957,15 @@ impl Payload {
     /// the output is a clean line for `jq` / a shell / a file. Uncapped, unlike
     /// the clipboard copy: piping a large subtree is the whole point, and the
     /// slice is a zero-copy view into the mmap.
-    fn emit(self, bytes: &[u8]) -> std::io::Result<()> {
-        use std::io::Write;
-        let mut w: Box<dyn Write> = match self.file {
+    fn into_writer(self) -> Box<dyn Write> {
+        match self.file {
             Some(f) => Box::new(f),
             None => Box::new(std::io::stdout()),
-        };
+        }
+    }
+
+    fn emit(self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut w = self.into_writer();
         w.write_all(bytes)?;
         w.write_all(b"\n")?;
         w.flush()
@@ -3508,6 +4050,23 @@ fn write_extract(
     sink.emit(&slice[..cut])
 }
 
+/// Write every filter hit to the reserved stdout as NDJSON — one trimmed value
+/// per line — streaming each slice straight from the source (no concatenation).
+fn write_extract_all(b: &[u8], ranges: &[(usize, usize)], sink: Payload) -> std::io::Result<()> {
+    let mut w = sink.into_writer();
+    for &(start, prov_end) in ranges {
+        let end = skip_value(b, start, prov_end);
+        let slice = &b[start..end];
+        let cut = slice
+            .iter()
+            .rposition(|c| !c.is_ascii_whitespace())
+            .map_or(0, |p| p + 1);
+        w.write_all(&slice[..cut])?;
+        w.write_all(b"\n")?;
+    }
+    w.flush()
+}
+
 /// Open a file via mmap (zero-copy, near-constant memory) and run the viewer.
 fn run_file(path: String) -> std::io::Result<()> {
     // NDJSON / JSON Lines detected by extension (cheap — a content sniff would
@@ -3548,8 +4107,10 @@ fn run_file(path: String) -> std::io::Result<()> {
         disable_enhanced_keys();
     }
     ratatui::restore();
-    // After restoring the terminal, hand the chosen node to the reserved stdout.
-    if let Some(range) = app.extract {
+    // After restoring the terminal, hand the chosen node(s) to the reserved stdout.
+    if let Some(ranges) = app.extract_batch.take() {
+        write_extract_all(b, &ranges, payload)?;
+    } else if let Some(range) = app.extract {
         write_extract(b, range, payload)?;
     }
     res
@@ -3583,7 +4144,9 @@ fn run_stdin() -> std::io::Result<()> {
         disable_enhanced_keys();
     }
     ratatui::restore();
-    if let Some(range) = app.extract {
+    if let Some(ranges) = app.extract_batch.take() {
+        write_extract_all(store.bytes(), &ranges, payload)?;
+    } else if let Some(range) = app.extract {
         write_extract(store.bytes(), range, payload)?;
     }
     res
@@ -3955,6 +4518,31 @@ mod tests {
         let got = std::fs::read(&path).expect("read back");
         let _ = std::fs::remove_file(&path);
         assert_eq!(got, b"{\"b\":[1,2,3]}\n");
+    }
+
+    #[test]
+    fn write_extract_all_emits_one_ndjson_line_per_hit() {
+        // Batch extract (`p` on a filter pane) writes each hit's real slice on its
+        // own line — provisional ends resolved, so hits never bleed into siblings.
+        let b = br#"[{"n":"a"},{"n":"b"},{"n":"c"}]"#;
+        // Ranges for the three objects, each with an over-long provisional end to
+        // prove skip_value re-resolves the closer per hit.
+        let ranges: Vec<(usize, usize)> = b
+            .iter()
+            .enumerate()
+            .filter(|(_, &c)| c == b'{')
+            .map(|(i, _)| (i, b.len()))
+            .collect();
+        assert_eq!(ranges.len(), 3);
+        let path = std::env::temp_dir().join(format!("jview-batch-{}.json", std::process::id()));
+        let sink = Payload {
+            enabled: true,
+            file: Some(File::create(&path).expect("temp file")),
+        };
+        write_extract_all(b, &ranges, sink).expect("write");
+        let got = std::fs::read(&path).expect("read back");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(got, b"{\"n\":\"a\"}\n{\"n\":\"b\"}\n{\"n\":\"c\"}\n");
     }
 
     #[test]
