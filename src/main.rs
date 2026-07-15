@@ -551,11 +551,19 @@ const SCHEMA_SAMPLE: usize = 1000;
 /// Cap on distinct fields tracked (a pathological object with a huge key space
 /// won't blow up the summary).
 const SCHEMA_FIELDS_MAX: usize = 500;
+/// Elements sampled per *nested* array to characterize its shape.
+const SCHEMA_ARRAY_CAP: usize = 64;
+/// Nesting levels expanded by default (0 = flat, top fields only).
+const SCHEMA_DEFAULT_DEPTH: usize = 1;
+/// Ceiling on how deep the overlay will expand (bounds work on deep data).
+const SCHEMA_MAX_DEPTH: usize = 6;
 
-/// One field's shape across a sampled container: how many records had it, the
-/// JSON type(s) it took, and an example value.
+/// One field's shape across a sampled container: its (possibly nested, dotted /
+/// `[]`) path, how many records had it, the JSON type(s) it took, an example
+/// value, and its nesting level (for indentation).
 struct FieldStat {
     name: String,
+    depth: usize,
     count: usize,
     kinds: Vec<Kind>,
     example: String,
@@ -564,10 +572,16 @@ struct FieldStat {
 /// The `t` schema overlay: a sampled type/shape summary of a container. For an
 /// array (or NDJSON root) each element is a *record* and the fields are the union
 /// of the elements' keys with a fill rate; for an object the fields are its own
-/// keys. See [`build_schema`].
+/// keys. Nested objects/arrays are expanded up to `depth` levels — a field's
+/// value that's an object contributes `field.sub`, an array contributes `field[]`
+/// (and `field[].sub` for arrays of objects). See [`build_schema`].
 struct Schema {
     /// The container's label + kind, for the card title.
     title: String,
+    /// The focused node's path, so changing `depth` can re-sample it.
+    path: Vec<usize>,
+    /// Nesting levels currently expanded (adjustable in the overlay).
+    depth: usize,
     /// Records considered (array elements, or 1× the object's own keys).
     records: usize,
     /// True when the container had more children than we sampled.
@@ -576,7 +590,8 @@ struct Schema {
     field_more: bool,
     /// Whether children are records (array/NDJSON) — drives the fill-rate column.
     by_record: bool,
-    /// Fields, sorted most-common first.
+    /// Fields, grouped by top-level field (most common first), each with its
+    /// descendants beneath it.
     fields: Vec<FieldStat>,
     /// Top visible row (advanced by the scroll keys).
     scroll: usize,
@@ -2581,7 +2596,7 @@ fn render_schema(f: &mut Frame, area: Rect, view: &View) {
         .map(|f| f.name.chars().count())
         .max()
         .unwrap_or(5)
-        .clamp(5, 28);
+        .clamp(5, 38);
     let type_w = 16usize;
     let fill_w = if sc.by_record { 4 } else { 0 };
     let fixed = name_w + 2 + type_w + 2 + if sc.by_record { fill_w + 2 } else { 0 };
@@ -2590,24 +2605,32 @@ fn render_schema(f: &mut Frame, area: Rect, view: &View) {
     let dim = Style::default().fg(Color::DarkGray);
     let panel_bg = Color::Indexed(236);
 
+    let top_fields = sc.fields.iter().filter(|f| f.depth == 0).count();
+    let nested = sc.fields.len() - top_fields;
+
     let mut lines: Vec<Line> = Vec::new();
-    // Summary line.
-    let unit = if sc.by_record { "records" } else { "fields" };
+    // Summary line: records + fill only make sense for a record set; for a single
+    // object just report its field count.
     let more = if sc.more { "+" } else { "" };
-    let fmore = if sc.field_more {
-        " · +more fields"
+    let fmore = if sc.field_more { " · +more" } else { "" };
+    let nest = if nested > 0 {
+        format!(" (+{nested} nested)")
     } else {
-        ""
+        String::new()
     };
-    lines.push(Line::from(Span::styled(
+    let summary = if sc.by_record {
         format!(
-            " {}{more} {unit} sampled · {} distinct field{}{fmore}",
+            " {}{more} records sampled · {top_fields} field{}{nest}{fmore}",
             group(sc.records),
-            sc.fields.len(),
-            if sc.fields.len() == 1 { "" } else { "s" },
-        ),
-        dim,
-    )));
+            if top_fields == 1 { "" } else { "s" },
+        )
+    } else {
+        format!(
+            " {top_fields} field{}{nest}{fmore}",
+            if top_fields == 1 { "" } else { "s" },
+        )
+    };
+    lines.push(Line::from(Span::styled(summary, dim)));
     // Column header.
     let hdr = if sc.by_record {
         format!(
@@ -2659,10 +2682,8 @@ fn render_schema(f: &mut Frame, area: Rect, view: &View) {
     }
 
     let title = format!(
-        " schema · {} · {} field{} · j/k scroll · esc ",
-        sc.title,
-        sc.fields.len(),
-        if sc.fields.len() == 1 { "" } else { "s" },
+        " schema · {} · depth {} ([ ] adjust) · j/k scroll · esc ",
+        sc.title, sc.depth,
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3033,6 +3054,31 @@ fn process_key(
     if app.active_view().mode == Mode::Schema {
         let (_, _, inner_h) = peek_layout(term_area().unwrap_or(Rect::new(0, 0, 80, 24)));
         let body_h = inner_h.saturating_sub(SCHEMA_HEADER_ROWS);
+        // `[`/`]` (or `-`/`+`) change how many nesting levels are expanded, which
+        // re-samples — handle that first, before borrowing the schema for scroll.
+        let ddelta = match k.code {
+            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::Char(']') => 1i32,
+            KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::Char('[') => -1,
+            _ => 0,
+        };
+        if ddelta != 0 {
+            let v = app.active_mut();
+            if let Some((path, title, cur)) = v
+                .schema
+                .as_ref()
+                .map(|s| (s.path.clone(), s.title.clone(), s.depth))
+            {
+                let nd = (cur as i32 + ddelta).clamp(0, SCHEMA_MAX_DEPTH as i32) as usize;
+                if nd != cur {
+                    let node = get(&v.root, &path);
+                    if let Some(mut ns) = build_schema(node, b, title, nd) {
+                        ns.path = path;
+                        v.schema = Some(ns);
+                    }
+                }
+            }
+            return KeyOutcome::Continue;
+        }
         let v = app.active_mut();
         if let Some(sc) = v.schema.as_mut() {
             let max = sc.fields.len().saturating_sub(body_h);
@@ -3141,7 +3187,10 @@ fn process_key(
                         kind_name(node.kind)
                     }
                 );
-                build_schema(node, b, title)
+                build_schema(node, b, title, SCHEMA_DEFAULT_DEPTH).map(|mut s| {
+                    s.path = row.path.clone();
+                    s
+                })
             });
             match built {
                 Some(s) => {
@@ -3337,44 +3386,138 @@ fn sample_value(b: &[u8], start: usize, end: usize, kind: Kind) -> String {
     }
 }
 
-/// Fold one field into the running stats: bump its count, union its type, keep
-/// the first non-empty example. New fields are added until `SCHEMA_FIELDS_MAX`.
-fn tally_field(
-    fields: &mut Vec<FieldStat>,
-    idx: &mut std::collections::HashMap<String, usize>,
-    name: &str,
+/// A field seen while walking one record: its path, type, and value range (for a
+/// lazily-built example). Presence is deduped per record, so a path counts once
+/// toward its fill rate no matter how many array elements carried it.
+struct Occ {
+    path: String,
     kind: Kind,
-    example: String,
-    field_more: &mut bool,
+    start: usize,
+    end: usize,
+}
+
+/// Walk one value, emitting an [`Occ`] for every field reachable within `depth`
+/// more nesting levels. An object contributes `prefix.key`; an array descends
+/// into its elements under `prefix[]` (objects there contribute `prefix[].key`),
+/// bounded by `SCHEMA_ARRAY_CAP` so a giant nested array can't blow up the walk.
+#[allow(clippy::too_many_arguments)]
+fn schema_walk(
+    b: &[u8],
+    start: usize,
+    end: usize,
+    kind: Kind,
+    prefix: &str,
+    depth: usize,
+    max_depth: usize,
+    out: &mut Vec<Occ>,
 ) {
-    if let Some(&i) = idx.get(name) {
-        let f = &mut fields[i];
-        f.count += 1;
-        if !f.kinds.contains(&kind) {
-            f.kinds.push(kind);
+    match kind {
+        Kind::Object => {
+            let mut c = Cursor::new(start, end, false);
+            while let Some(f) = c.next(b) {
+                let path = if prefix.is_empty() {
+                    f.label.clone()
+                } else {
+                    format!("{prefix}.{}", f.label)
+                };
+                let container = matches!(f.kind, Kind::Object | Kind::Array);
+                out.push(Occ {
+                    path: path.clone(),
+                    kind: f.kind,
+                    start: f.start,
+                    end: f.end,
+                });
+                if container && depth < max_depth {
+                    schema_walk(b, f.start, f.end, f.kind, &path, depth + 1, max_depth, out);
+                }
+            }
         }
-        if f.example.is_empty() && !example.is_empty() {
-            f.example = example;
+        Kind::Array => {
+            // The array's elements share one `prefix[]` path; sample a bounded
+            // number to learn their shape.
+            let ep = format!("{prefix}[]");
+            let mut c = Cursor::new(start, end, true);
+            let mut i = 0;
+            while let Some(e) = c.next(b) {
+                i += 1;
+                if i > SCHEMA_ARRAY_CAP {
+                    break;
+                }
+                if matches!(e.kind, Kind::Object) {
+                    // Object elements contribute their keys under `prefix[]` at
+                    // this same level (descending into the array was the step).
+                    schema_walk(b, e.start, e.end, Kind::Object, &ep, depth, max_depth, out);
+                } else {
+                    out.push(Occ {
+                        path: ep.clone(),
+                        kind: e.kind,
+                        start: e.start,
+                        end: e.end,
+                    });
+                }
+            }
         }
-    } else if fields.len() < SCHEMA_FIELDS_MAX {
-        idx.insert(name.to_string(), fields.len());
-        fields.push(FieldStat {
-            name: name.to_string(),
-            count: 1,
-            kinds: vec![kind],
-            example,
-        });
-    } else {
-        *field_more = true;
+        _ => {}
     }
 }
 
-/// Sample a container and summarize its shape. `None` for a scalar. For an array
-/// (or NDJSON root) each element is a record and object elements contribute their
-/// keys (with a fill rate); for a plain object the keys are its own. Bounded by
-/// `SCHEMA_SAMPLE`, so it's cheap even on a multi-GB array — it scans the same
-/// child ranges `expand` would, just up to the sample cap.
-fn build_schema(node: &Node, b: &[u8], title: String) -> Option<Schema> {
+/// Fold one record's occurrences into the running field stats: union each path's
+/// type and example, and count each distinct path once (per-record presence, so
+/// the fill rate reads as "fraction of records containing this path").
+fn fold_record(
+    occs: &[Occ],
+    b: &[u8],
+    fields: &mut Vec<FieldStat>,
+    idx: &mut std::collections::HashMap<String, usize>,
+    field_more: &mut bool,
+) {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for o in occs {
+        let first = seen.insert(o.path.as_str());
+        if let Some(&i) = idx.get(&o.path) {
+            let f = &mut fields[i];
+            if first {
+                f.count += 1;
+            }
+            if !f.kinds.contains(&o.kind) {
+                f.kinds.push(o.kind);
+            }
+            if f.example.is_empty() {
+                f.example = sample_value(b, o.start, o.end, o.kind);
+            }
+        } else if fields.len() < SCHEMA_FIELDS_MAX {
+            idx.insert(o.path.clone(), fields.len());
+            fields.push(FieldStat {
+                name: o.path.clone(),
+                depth: path_depth(&o.path),
+                count: 1,
+                kinds: vec![o.kind],
+                example: sample_value(b, o.start, o.end, o.kind),
+            });
+        } else {
+            *field_more = true;
+        }
+    }
+}
+
+/// Nesting level of a dotted / `[]` schema path (for indentation) — the number of
+/// `.` or `[]` steps below the top field.
+fn path_depth(path: &str) -> usize {
+    path.matches('.').count() + path.matches("[]").count()
+}
+
+/// The top-level segment of a schema path (`address.city` → `address`,
+/// `items[].sku` → `items`), used to keep a field's descendants grouped with it.
+fn top_segment(path: &str) -> &str {
+    let end = path.find(['.', '[']).unwrap_or(path.len());
+    &path[..end]
+}
+
+/// Sample a container and summarize its shape, expanding nested objects/arrays up
+/// to `max_depth` levels. `None` for a scalar. Bounded by `SCHEMA_SAMPLE` records
+/// (and `SCHEMA_ARRAY_CAP` per nested array), so it stays cheap even on multi-GB,
+/// deeply-nested data.
+fn build_schema(node: &Node, b: &[u8], title: String, max_depth: usize) -> Option<Schema> {
     if !node.jsonl && !matches!(node.kind, Kind::Object | Kind::Array) {
         return None;
     }
@@ -3385,54 +3528,73 @@ fn build_schema(node: &Node, b: &[u8], title: String) -> Option<Schema> {
     let mut field_more = false;
 
     let mut cur = node.make_cursor();
+    let mut occs: Vec<Occ> = Vec::new();
     while records < SCHEMA_SAMPLE {
         let Some(rc) = cur.next(b) else { break };
         records += 1;
+        occs.clear();
         if by_record && matches!(rc.kind, Kind::Object) {
-            // Array/NDJSON element that's an object: contribute its keys.
-            let mut fc = Cursor::new(rc.start, rc.end, false);
-            while let Some(fld) = fc.next(b) {
-                let ex = sample_value(b, fld.start, fld.end, fld.kind);
-                tally_field(
-                    &mut fields,
-                    &mut idx,
-                    &fld.label,
-                    fld.kind,
-                    ex,
-                    &mut field_more,
+            schema_walk(
+                b,
+                rc.start,
+                rc.end,
+                Kind::Object,
+                "",
+                0,
+                max_depth,
+                &mut occs,
+            );
+        } else if by_record {
+            // Array of scalars/arrays: one synthetic "(value)" column, expanded if
+            // the elements are themselves arrays.
+            occs.push(Occ {
+                path: "(value)".to_string(),
+                kind: rc.kind,
+                start: rc.start,
+                end: rc.end,
+            });
+            if matches!(rc.kind, Kind::Array) && max_depth > 0 {
+                schema_walk(
+                    b, rc.start, rc.end, rc.kind, "(value)", 1, max_depth, &mut occs,
                 );
             }
-        } else if by_record {
-            // Array of scalars/arrays: a single synthetic "(value)" column.
-            let ex = sample_value(b, rc.start, rc.end, rc.kind);
-            tally_field(
-                &mut fields,
-                &mut idx,
-                "(value)",
-                rc.kind,
-                ex,
-                &mut field_more,
-            );
         } else {
-            // Plain object: each direct child is a field, seen once.
-            let ex = sample_value(b, rc.start, rc.end, rc.kind);
-            tally_field(
-                &mut fields,
-                &mut idx,
-                &rc.label,
-                rc.kind,
-                ex,
-                &mut field_more,
-            );
+            // Plain object: each `rc` is one of its fields. Emit it, and expand
+            // it when it's a nested container.
+            occs.push(Occ {
+                path: rc.label.clone(),
+                kind: rc.kind,
+                start: rc.start,
+                end: rc.end,
+            });
+            if matches!(rc.kind, Kind::Object | Kind::Array) && max_depth > 0 {
+                schema_walk(
+                    b, rc.start, rc.end, rc.kind, &rc.label, 1, max_depth, &mut occs,
+                );
+            }
         }
+        fold_record(&occs, b, &mut fields, &mut idx, &mut field_more);
     }
-    // Was there more than we sampled?
     let more = cur.next(b).is_some();
-    // Most-common first, then alphabetical.
-    fields.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+
+    // Group each top field's descendants beneath it, top fields most-common first.
+    // Keying by `top_segment`'s count keeps a group contiguous; lexical order
+    // within keeps a parent ("items") ahead of its children ("items[].sku").
+    let top_count: std::collections::HashMap<String, usize> = fields
+        .iter()
+        .filter(|f| f.depth == 0)
+        .map(|f| (f.name.clone(), f.count))
+        .collect();
+    fields.sort_by(|a, b| {
+        let ca = top_count.get(top_segment(&a.name)).copied().unwrap_or(0);
+        let cb = top_count.get(top_segment(&b.name)).copied().unwrap_or(0);
+        cb.cmp(&ca).then_with(|| a.name.cmp(&b.name))
+    });
 
     Some(Schema {
         title,
+        path: Vec::new(),
+        depth: max_depth,
         records,
         more,
         field_more,

@@ -348,9 +348,9 @@ def scenario_explore(binary):
     print("explore: c count · t schema · Tab-scoped search")
     t = Tui(binary, {
         "users": [
-            {"id": 1, "name": "amy", "email": "a@x.com"},
+            {"id": 1, "name": "amy", "contact": {"email": "a@x.com"}, "tags": ["x"]},
             {"id": 2, "name": "bob"},
-            {"id": 3, "name": "cara", "email": "c@x.com"},
+            {"id": 3, "name": "cara", "contact": {"email": "c@x.com"}},
         ],
         "audit": [{"name": "zzz"}],
     })
@@ -365,9 +365,17 @@ def scenario_explore(binary):
         scr = t.dump()
         check("t opens a schema card", "schema" in scr and "users" in scr, t)
         check("schema lists fields with types",
-              "name" in scr and "string" in scr and "email" in scr, t)
+              "name" in scr and "string" in scr, t)
         check("schema shows a fill rate for a partial field",
               "66%" in scr or "67%" in scr, t)
+        # Default depth 1 expands one nesting level: nested object + array element.
+        check("schema expands nested fields by default",
+              "contact.email" in scr and "tags[]" in scr, t)
+        # `[` collapses to flat (depth 0) — nested paths disappear.
+        t.send("[")
+        flat = t.dump()
+        check("[ collapses nesting to a flat view",
+              "contact.email" not in flat and "contact" in flat, t)
         t.send("\x1b")  # close schema
 
         # Scoped search: 'name' appears under both users and audit; scope to users.

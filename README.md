@@ -97,9 +97,12 @@ the richer ones:
   it. `t` on an array or object opens a **schema card**: a sampled (first 1000
   children) summary of every field, the JSON type(s) it takes, its fill rate
   across records, and an example value — sorted most-common first, so an array of
-  a million objects tells you its shape instantly. `c` reports a container's exact
-  child count (`1,234,567 elements`) — a full scan, but on demand, so you can size
-  a collapsed level without opening it.
+  a million objects tells you its shape instantly. It expands **one level of
+  nesting by default** — a nested object contributes `contact.email`, an array
+  contributes `tags[]` (and `items[].sku` for arrays of objects), each with its
+  own fill rate — and `[` / `]` change the depth live (`0` = flat, up to 6). `c`
+  reports a container's exact child count (`1,234,567 elements`) — a full scan,
+  but on demand, so you can size a collapsed level without opening it.
 - **Search (`/`)** — plain queries are case-insensitive substring matches (the
   default). Prefix with `re:` for a full regex (`re:^id_\w+$`) or `g:` for a
   glob (`g:user*`); a bad pattern shows `(bad pattern: …)` in the footer so you
