@@ -62,7 +62,7 @@ From a checkout: `cargo run --release -- file.json`.
 | `g`, `Home` | top |
 | `Enter`/`→`/`Space` | expand / collapse a container — or peek a leaf's full value |
 | `←` | collapse, or jump to parent if already collapsed |
-| `t` · `c` | schema (sampled field/type summary) of a container · count its children |
+| `t` · `c` | infer the value's type (TypeScript-style; `y` copies it) · count a container's children |
 | `/` | search (live — results stream as you type; `Tab` scopes it to the focused subtree) |
 | `Enter`/`↓` · `Shift-Enter`/`↑` (in search) | next / previous match |
 | `:` | jump to a path — absolute or relative to the cursor |
@@ -93,25 +93,26 @@ the richer ones:
   segments accept `*`/`?` wildcards (`data.user*`, `data.*name*`) when you only
   remember part of the key — the first child whose label matches the whole
   pattern wins.
-- **Explore (`t` / `c`)** — orient yourself in unfamiliar data without expanding
-  it. `t` on an array or object opens a **schema card**: a sampled (first 1000
-  children) summary of every field, the JSON type(s) it takes, its fill rate
-  across records, and an example value — sorted most-common first, so an array of
-  a million objects tells you its shape instantly. It expands **one level of
-  nesting by default** — a nested object contributes `contact.email`, an array
-  contributes `tags[]` (and `items[].sku` for arrays of objects), each with its
-  own fill rate — and `[` / `]` change the depth live (`0` = flat, up to 6). It
-  also recognizes a **map** — a data-keyed object like
-  `{"AAPL": {…}, "MSFT": {…}}` where the keys are values, not field names — by
-  looking at whether the values share a shape (not just their count), so it
-  catches a small map and *isn't* fooled by a record whose object fields have
-  different keys. A map is summarized by its values' shared shape (`amount`,
-  `ccy`, …) instead of listing every key, and this works at any depth — a map
-  nested inside a record shows as `quotes{}.bid` (the `{}` marks map values, like
-  `[]` marks array elements). Press `m` to force the map/record call the other way
-  when you disagree. `c` reports a container's exact child count
-  (`1,234,567 elements`) — a full scan, but on demand, so you can size a collapsed
-  level without opening it.
+- **Type (`t`)** — infer the focused value's **structural type**, rendered
+  TypeScript-style, the way a "JSON to TypeScript" tool does. It samples the
+  bytes and *merges* them into one recursive type: object shapes are unified (a
+  key missing from some records becomes `field?`, with a `// 66%` fill comment),
+  array elements and map values collapse into a single element type, mixed scalars
+  become unions (`number | string`), and a **data-keyed object** — `{"AAPL": {…},
+  "MSFT": {…}}`, detected by whether the values share a shape rather than by key
+  names — becomes `Record<string, T>`. It recurses to full depth automatically, so
+  ```ts
+  {
+    users: { id: number; name: string; email?: string; contact?: { email: string } }[]
+    cumulativeStats: Record<string, { buyCount: number; buyValCum: number }>
+  }
+  ```
+  falls out in one shot. Scroll it with `j`/`k`, and **`y` copies the whole type**
+  to your clipboard to paste straight into your code. Sampling is bounded (2000
+  records, a node budget), so it stays instant on huge, deeply-nested data. The
+  inference lives in its own module, [src/schema.rs](src/schema.rs).
+- **Count (`c`)** — a container's exact child count (`1,234,567 elements`), a full
+  scan but on demand, so you can size a collapsed level without opening it.
 - **Search (`/`)** — plain queries are case-insensitive substring matches (the
   default). Prefix with `re:` for a full regex (`re:^id_\w+$`) or `g:` for a
   glob (`g:user*`); a bad pattern shows `(bad pattern: …)` in the footer so you
@@ -227,4 +228,5 @@ which could never have opened the whole file itself.
 | [src/scanner.rs](src/scanner.rs) | byte-range JSON scan + resumable child `Cursor` |
 | [src/main.rs](src/main.rs) | lazy `Node` tree, windowed flatten, multi-pane ratatui viewer, stdin streaming |
 | [src/search.rs](src/search.rs) | background-thread search + cancel + result stream |
+| [src/schema.rs](src/schema.rs) | JSON → structural type inference (the `t` overlay) |
 | [src/source.rs](src/source.rs) | byte source: memory-mapped file or spilled stream, vs. RAM-buffered fallback |

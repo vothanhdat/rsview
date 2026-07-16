@@ -1,0 +1,466 @@
+//! JSON → structural type inference for the `t` schema overlay.
+//!
+//! Instead of a flat table of paths, this samples a value's bytes and *merges*
+//! them into one recursive type — the way a "JSON to TypeScript" tool does:
+//! object shapes are unified (a key missing from some samples becomes optional),
+//! array elements and map values are unified into a single element type, mixed
+//! scalars become unions, and a data-keyed object becomes `Record<string, T>`.
+//! It's rendered TypeScript-style and is copyable.
+//!
+//! Zero-copy: it reads byte ranges through the scanner's `Cursor` and never
+//! materializes a value. Bounded by sampling caps and a global node budget, so it
+//! stays cheap on huge, deeply-nested data.
+
+use crate::scanner::{Cursor, Kind};
+use std::collections::HashMap;
+
+/// Top-level array/map entries sampled.
+const TOP_SAMPLE: usize = 2000;
+/// Entries sampled per *nested* array/map.
+const NESTED_CAP: usize = 128;
+/// Keys read per object.
+const KEY_CAP: usize = 512;
+/// Total values inferred before the walk stops descending (runaway guard).
+const NODE_BUDGET: usize = 300_000;
+/// Deepest nesting inferred.
+const MAX_DEPTH: usize = 24;
+
+// --- map detection (value-shape based) -------------------------------------
+
+/// Values probed to decide whether an object is a data-keyed map.
+const MAP_PROBE: usize = 48;
+/// Keys sampled per probed object value.
+const MAP_KEY_CAP: usize = 32;
+/// Object values needed before shape-similarity can call an object a map.
+const MAP_MIN_OBJ: usize = 3;
+/// Key-set self-similarity (percent) for an object map.
+const MAP_SIMILARITY_PCT: usize = 70;
+/// Entries needed to call a scalar-valued object a map.
+const MAP_SCALAR_MIN: usize = 8;
+/// Value-kind homogeneity (percent) for a map.
+const MAP_RATIO_PCT: usize = 80;
+
+/// Whether an object at `[start, end)` reads as a map (data keys, uniform values)
+/// rather than a record with named fields — see the module docs on `t`.
+pub fn looks_like_map(b: &[u8], start: usize, end: usize) -> bool {
+    let mut n = 0usize;
+    let mut n_obj = 0usize;
+    let mut scalar_counts = [0usize; 4]; // str, num, bool, null
+    let mut key_freq: HashMap<String, usize> = HashMap::new();
+    let mut c = Cursor::new(start, end, false);
+    while let Some(f) = c.next(b) {
+        n += 1;
+        match f.kind {
+            Kind::Object => {
+                n_obj += 1;
+                let mut seen = std::collections::HashSet::new();
+                let mut fc = Cursor::new(f.start, f.end, false);
+                let mut kc = 0;
+                while let Some(sub) = fc.next(b) {
+                    if seen.insert(sub.label.clone()) {
+                        *key_freq.entry(sub.label).or_insert(0) += 1;
+                    }
+                    kc += 1;
+                    if kc >= MAP_KEY_CAP {
+                        break;
+                    }
+                }
+            }
+            Kind::Str => scalar_counts[0] += 1,
+            Kind::Number => scalar_counts[1] += 1,
+            Kind::Bool => scalar_counts[2] += 1,
+            Kind::Null => scalar_counts[3] += 1,
+            Kind::Array => {}
+        }
+        if n >= MAP_PROBE {
+            break;
+        }
+    }
+    // Object map: enough object values whose key-sets look alike. Score
+    // (Σf²/Σf)/n_obj ∈ [1/n_obj, 1] — 1 when every value shares every key.
+    if n_obj >= MAP_MIN_OBJ && n_obj * 100 >= n * MAP_RATIO_PCT {
+        let sum_f: usize = key_freq.values().sum();
+        let sum_f2: usize = key_freq.values().map(|f| f * f).sum();
+        if sum_f > 0 && sum_f2 * 100 >= sum_f * n_obj * MAP_SIMILARITY_PCT {
+            return true;
+        }
+    }
+    // Scalar map: many entries, homogeneous scalar values.
+    let n_scalar_same = scalar_counts.iter().copied().max().unwrap_or(0);
+    if n >= MAP_SCALAR_MIN && n_scalar_same * 100 >= n * MAP_RATIO_PCT {
+        return true;
+    }
+    false
+}
+
+// --- the inferred type -----------------------------------------------------
+
+/// A structural type inferred from sampled JSON.
+#[derive(Debug, PartialEq)]
+pub enum Type {
+    /// Nothing observed, or the node budget ran out.
+    Any,
+    Str,
+    Num,
+    Bool,
+    Null,
+    Array(Box<Type>),
+    /// A record: named fields, each possibly optional.
+    Object(Vec<Field>),
+    /// A data-keyed map — `Record<string, T>`.
+    Map(Box<Type>),
+    /// Mixed shapes seen at the same position.
+    Union(Vec<Type>),
+}
+
+/// One field of an [`Type::Object`], with how often it appeared (for optionality
+/// and a fill-rate comment).
+#[derive(Debug, PartialEq)]
+pub struct Field {
+    pub name: String,
+    pub ty: Type,
+    pub present: usize,
+    pub total: usize,
+}
+
+impl Field {
+    pub fn optional(&self) -> bool {
+        self.present < self.total
+    }
+}
+
+// --- inference (accumulate then finish) ------------------------------------
+
+struct Budget(usize);
+impl Budget {
+    fn take(&mut self) -> bool {
+        if self.0 == 0 {
+            return false;
+        }
+        self.0 -= 1;
+        true
+    }
+}
+
+/// Accumulates every value seen at one position, then collapses to a [`Type`].
+#[derive(Default)]
+struct Acc {
+    str: bool,
+    num: bool,
+    boo: bool,
+    null: bool,
+    // record variant
+    rec_count: usize,
+    order: Vec<String>,
+    fields: HashMap<String, FieldAcc>,
+    // map variant
+    map_count: usize,
+    map_val: Option<Box<Acc>>,
+    // array variant
+    arr_count: usize,
+    arr_elem: Option<Box<Acc>>,
+}
+
+#[derive(Default)]
+struct FieldAcc {
+    present: usize,
+    acc: Acc,
+}
+
+impl Acc {
+    /// Fold one value into the accumulator.
+    fn add(
+        &mut self,
+        b: &[u8],
+        start: usize,
+        end: usize,
+        kind: Kind,
+        depth: usize,
+        bud: &mut Budget,
+    ) {
+        if depth > MAX_DEPTH || !bud.take() {
+            return;
+        }
+        let lim = if depth == 0 { TOP_SAMPLE } else { NESTED_CAP };
+        match kind {
+            Kind::Str => self.str = true,
+            Kind::Number => self.num = true,
+            Kind::Bool => self.boo = true,
+            Kind::Null => self.null = true,
+            Kind::Array => {
+                self.arr_count += 1;
+                let el = self.arr_elem.get_or_insert_with(Box::default);
+                let mut c = Cursor::new(start, end, true);
+                let mut i = 0;
+                while let Some(e) = c.next(b) {
+                    i += 1;
+                    if i > lim {
+                        break;
+                    }
+                    el.add(b, e.start, e.end, e.kind, depth + 1, bud);
+                }
+            }
+            Kind::Object if looks_like_map(b, start, end) => {
+                self.map_count += 1;
+                let mv = self.map_val.get_or_insert_with(Box::default);
+                let mut c = Cursor::new(start, end, false);
+                let mut i = 0;
+                while let Some(v) = c.next(b) {
+                    i += 1;
+                    if i > lim {
+                        break;
+                    }
+                    mv.add(b, v.start, v.end, v.kind, depth + 1, bud);
+                }
+            }
+            Kind::Object => {
+                self.rec_count += 1;
+                let mut c = Cursor::new(start, end, false);
+                let mut i = 0;
+                while let Some(f) = c.next(b) {
+                    i += 1;
+                    if i > KEY_CAP {
+                        break;
+                    }
+                    let fa = match self.fields.get_mut(&f.label) {
+                        Some(fa) => fa,
+                        None => {
+                            self.order.push(f.label.clone());
+                            self.fields.entry(f.label.clone()).or_default()
+                        }
+                    };
+                    fa.present += 1;
+                    fa.acc.add(b, f.start, f.end, f.kind, depth + 1, bud);
+                }
+            }
+        }
+    }
+
+    /// Collapse the accumulated observations into a single type.
+    fn finish(mut self) -> Type {
+        let mut variants: Vec<Type> = Vec::new();
+        if self.rec_count > 0 {
+            let total = self.rec_count;
+            let order = std::mem::take(&mut self.order);
+            let fields = order
+                .into_iter()
+                .filter_map(|k| {
+                    self.fields.remove(&k).map(|fa| Field {
+                        name: k,
+                        ty: fa.acc.finish(),
+                        present: fa.present,
+                        total,
+                    })
+                })
+                .collect();
+            variants.push(Type::Object(fields));
+        }
+        if self.arr_count > 0 {
+            let el = self.arr_elem.map_or(Type::Any, |a| a.finish());
+            variants.push(Type::Array(Box::new(el)));
+        }
+        if self.map_count > 0 {
+            let v = self.map_val.map_or(Type::Any, |a| a.finish());
+            variants.push(Type::Map(Box::new(v)));
+        }
+        if self.str {
+            variants.push(Type::Str);
+        }
+        if self.num {
+            variants.push(Type::Num);
+        }
+        if self.boo {
+            variants.push(Type::Bool);
+        }
+        if self.null {
+            variants.push(Type::Null);
+        }
+        match variants.len() {
+            0 => Type::Any,
+            1 => variants.pop().unwrap(),
+            _ => Type::Union(variants),
+        }
+    }
+}
+
+/// Infer the structural type of the value at `[start, end)`. `jsonl` treats the
+/// range as a stream of documents (an array of them).
+pub fn infer(b: &[u8], start: usize, end: usize, kind: Kind, jsonl: bool) -> Type {
+    let mut bud = Budget(NODE_BUDGET);
+    let mut acc = Acc::default();
+    if jsonl {
+        let mut el = Acc::default();
+        let mut c = Cursor::lines(start, end);
+        let mut i = 0;
+        while let Some(d) = c.next(b) {
+            i += 1;
+            if i > TOP_SAMPLE {
+                break;
+            }
+            el.add(b, d.start, d.end, d.kind, 1, &mut bud);
+        }
+        return Type::Array(Box::new(el.finish()));
+    }
+    acc.add(b, start, end, kind, 0, &mut bud);
+    acc.finish()
+}
+
+// --- rendering (TypeScript-ish) --------------------------------------------
+
+/// The scalar keyword for a leaf type, or `None` for a composite.
+fn word(ty: &Type) -> Option<&'static str> {
+    match ty {
+        Type::Any => Some("any"),
+        Type::Str => Some("string"),
+        Type::Num => Some("number"),
+        Type::Bool => Some("boolean"),
+        Type::Null => Some("null"),
+        _ => None,
+    }
+}
+
+/// Render the type as indented lines. `note` is appended to the *first* line
+/// (used for a field's `// %` fill comment).
+fn write_type(
+    ty: &Type,
+    indent: usize,
+    prefix: &str,
+    suffix: &str,
+    note: &str,
+    out: &mut Vec<String>,
+) {
+    let pad = "  ".repeat(indent);
+    if let Some(w) = word(ty) {
+        out.push(format!("{pad}{prefix}{w}{suffix}{note}"));
+        return;
+    }
+    match ty {
+        Type::Array(el) => {
+            let sfx = format!("[]{suffix}");
+            write_type(el, indent, prefix, &sfx, note, out);
+        }
+        Type::Map(v) => {
+            let pfx = format!("{prefix}Record<string, ");
+            let sfx = format!(">{suffix}");
+            write_type(v, indent, &pfx, &sfx, note, out);
+        }
+        Type::Object(fields) => {
+            if fields.is_empty() {
+                out.push(format!("{pad}{prefix}{{}}{suffix}{note}"));
+                return;
+            }
+            out.push(format!("{pad}{prefix}{{{note}"));
+            for f in fields {
+                let opt = if f.optional() { "?" } else { "" };
+                let fnote = if f.optional() && f.total > 0 {
+                    format!("   // {}%", f.present * 100 / f.total)
+                } else {
+                    String::new()
+                };
+                let fpfx = format!("{}{opt}: ", f.name);
+                write_type(&f.ty, indent + 1, &fpfx, "", &fnote, out);
+            }
+            out.push(format!("{pad}}}{suffix}"));
+        }
+        Type::Union(vs) => write_union(vs, indent, prefix, suffix, note, out),
+        _ => {}
+    }
+}
+
+/// Render a union: scalars inline (`a | b`), a nullable/optional container as
+/// `{…} | null`. Falls back to `| …` when several distinct composites collide
+/// (rare) rather than exploding.
+fn write_union(
+    vs: &[Type],
+    indent: usize,
+    prefix: &str,
+    suffix: &str,
+    note: &str,
+    out: &mut Vec<String>,
+) {
+    let scalars: Vec<&str> = vs.iter().filter_map(word).collect();
+    let composites: Vec<&Type> = vs.iter().filter(|v| word(v).is_none()).collect();
+    if composites.is_empty() {
+        let joined = scalars.join(" | ");
+        let pad = "  ".repeat(indent);
+        out.push(format!("{pad}{prefix}{joined}{suffix}{note}"));
+        return;
+    }
+    let mut tail = String::new();
+    if !scalars.is_empty() {
+        tail.push_str(&format!(" | {}", scalars.join(" | ")));
+    }
+    if composites.len() > 1 {
+        tail.push_str(" | …");
+    }
+    let sfx = format!("{tail}{suffix}");
+    write_type(composites[0], indent, prefix, &sfx, note, out);
+}
+
+/// The type as scrollable display lines for the overlay.
+pub fn render(ty: &Type) -> Vec<String> {
+    let mut out = Vec::new();
+    write_type(ty, 0, "", "", "", &mut out);
+    if out.is_empty() {
+        out.push("any".into());
+    }
+    out
+}
+
+/// The type as copyable source (what `y` yanks).
+pub fn to_source(ty: &Type) -> String {
+    render(ty).join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(json: &str) -> String {
+        let b = json.as_bytes();
+        let ty = infer(b, 0, b.len(), crate::scanner::value_kind(b, 0), false);
+        to_source(&ty)
+    }
+
+    #[test]
+    fn merges_object_records_with_optionals() {
+        // `b` is missing from the first element → optional; `a` is always present.
+        let t = ts(r#"[{"a":1},{"a":2,"b":"x"}]"#);
+        assert!(t.contains("a: number"), "{t}");
+        assert!(t.contains("b?: string"), "{t}");
+        assert!(t.trim_end().ends_with("}[]"), "{t}");
+    }
+
+    #[test]
+    fn data_keyed_object_is_a_record_map() {
+        let t = ts(r#"{"AAA":{"v":1},"BBB":{"v":2},"CCC":{"v":3},"DDD":{"v":4}}"#);
+        assert!(t.contains("Record<string, {"), "{t}");
+        assert!(t.contains("v: number"), "{t}");
+        assert!(!t.contains("AAA"), "keys must not leak: {t}");
+    }
+
+    #[test]
+    fn nested_map_inside_record() {
+        let t = ts(r#"{"owner":"x","positions":{"S1":{"qty":1},"S2":{"qty":2},"S3":{"qty":3}}}"#);
+        assert!(t.contains("owner: string"), "{t}");
+        assert!(t.contains("positions: Record<string, {"), "{t}");
+        assert!(t.contains("qty: number"), "{t}");
+    }
+
+    #[test]
+    fn mixed_scalars_form_a_union() {
+        let t = ts(r#"[1,"x",2,"y"]"#);
+        assert!(
+            t.contains("number") && t.contains("string") && t.contains('|'),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn disjoint_object_fields_stay_a_record() {
+        // address/geo have disjoint keys → a record, not a map.
+        let t = ts(r#"{"address":{"street":"x"},"geo":{"lat":1}}"#);
+        assert!(t.contains("address: {"), "{t}");
+        assert!(!t.contains("Record<string"), "should not be a map: {t}");
+    }
+}

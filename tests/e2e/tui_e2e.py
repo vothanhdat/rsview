@@ -345,7 +345,7 @@ def scenario_stream_pipe(binary):
 
 
 def scenario_explore(binary):
-    print("explore: c count · t schema · Tab-scoped search")
+    print("explore: c count · t type · Tab-scoped search")
     t = Tui(binary, {
         "users": [
             {"id": 1, "name": "amy", "contact": {"email": "a@x.com"}, "tags": ["x"]},
@@ -369,48 +369,39 @@ def scenario_explore(binary):
         t.send("c")
         check("c reports the element count", "3 elements" in t.footer(), t)
 
-        # `t` summarizes the container's shape: fields, types, fill rate.
+        # `t` infers the node's structural type (JSON→TypeScript style).
         t.send("t")
         scr = t.dump()
-        check("t opens a schema card", "schema" in scr and "users" in scr, t)
-        check("schema lists fields with types",
-              "name" in scr and "string" in scr, t)
-        check("schema shows a fill rate for a partial field",
-              "66%" in scr or "67%" in scr, t)
-        # Default depth 1 expands one nesting level: nested object + array element.
-        check("schema expands nested fields by default",
-              "contact.email" in scr and "tags[]" in scr, t)
-        # `[` collapses to flat (depth 0) — nested paths disappear.
-        t.send("[")
-        flat = t.dump()
-        check("[ collapses nesting to a flat view",
-              "contact.email" not in flat and "contact" in flat, t)
-        t.send("\x1b")  # close schema
+        check("t opens a type card", "type" in scr and "y copy" in scr, t)
+        check("array of objects → { … }[] with scalar field types",
+              "id: number" in scr and "name: string" in scr and "}[]" in scr, t)
+        check("a field missing from some records is optional (?)",
+              "contact?: {" in scr and "email: string" in scr, t)
+        check("arrays render as T[]", "tags?: string[]" in scr, t)
+        # `y` copies the whole type to the clipboard.
+        t.send("y")
+        check("y copies the inferred type", "copied type" in t.footer(), t)
+        t.send("\x1b")  # close
 
-        # A data-keyed map is summarized by its VALUES' shape, not its keys.
+        # A data-keyed object becomes Record<string, V> — values, not keys.
         t.send(":"); t.send("prices"); t.send("\r")
         t.send("t")
         m = t.dump()
-        check("a data-keyed object is detected as a map",
-              "map" in m and "map entries" in m, t)
-        check("map schema shows the value fields, not the data keys",
-              "ccy" in m and "amount" in m and "AAA000" not in m, t)
-        # `m` forces the interpretation the other way — back to keys as fields.
-        t.send("m")
-        forced = t.dump()
-        check("m forces a map back to a record (keys become fields)",
-              "AAA000" in forced and "map entries" not in forced, t)
+        check("a data-keyed object infers as Record<string, …>",
+              "Record<string, {" in m, t)
+        check("the map's value fields are inferred, not its data keys",
+              "ccy: string" in m and "amount: number" in m and "AAA000" not in m, t)
         t.send("\x1b")
 
-        # A record whose object fields have *disjoint* keys stays a record (not a
-        # map), and a map nested inside a record is summarized with {} notation.
+        # A record whose object fields have disjoint keys stays a record, and a map
+        # nested inside a record is inferred as a nested Record<>.
         t.send(":"); t.send("book"); t.send("\r")
         t.send("t")
         bk = t.dump()
-        check("disjoint-object record is not mistaken for a map",
-              "map entries" not in bk and "meta.title" in bk, t)
-        check("a nested map is summarized by its values ({} notation)",
-              "quotes{}.bid" in bk and "quotes{}.ask" in bk, t)
+        check("disjoint-object record stays a record (not a Record<>)",
+              "meta: {" in bk and "title: string" in bk, t)
+        check("a nested map infers as a nested Record<string, …>",
+              "quotes: Record<string, {" in bk and "bid: number" in bk, t)
         t.send("\x1b")
 
         # Scoped search: 'name' appears under both users and audit; scope to users.
