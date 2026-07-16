@@ -25,7 +25,7 @@ const NODE_BUDGET: usize = 300_000;
 /// Deepest nesting inferred.
 const MAX_DEPTH: usize = 24;
 
-// --- map detection (value-shape based) -------------------------------------
+// --- map detection (value-shape + key-shape based) -------------------------
 
 /// Values probed to decide whether an object is a data-keyed map.
 const MAP_PROBE: usize = 48;
@@ -35,23 +35,60 @@ const MAP_KEY_CAP: usize = 32;
 const MAP_MIN_OBJ: usize = 3;
 /// Key-set self-similarity (percent) for an object map.
 const MAP_SIMILARITY_PCT: usize = 70;
-/// Entries needed to call a scalar-valued object a map.
-const MAP_SCALAR_MIN: usize = 8;
-/// Value-kind homogeneity (percent) for a map.
+/// Entries at/above which sheer count alone marks a homogeneous object a map.
+const MAP_MANY: usize = 8;
+/// Value-kind homogeneity (percent) required for a map.
 const MAP_RATIO_PCT: usize = 80;
+/// Share (percent) of keys that must be *non-identifier* (data-like) for the
+/// key-shape signal to fire — the strong tell that keys are values, not fields.
+const MAP_DATAKEY_PCT: usize = 60;
 
-/// Whether an object at `[start, end)` reads as a map (data keys, uniform values)
-/// rather than a record with named fields — see the module docs on `t`.
-pub fn looks_like_map(b: &[u8], start: usize, end: usize) -> bool {
+/// The key type of a [`Type::Map`].
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum MapKey {
+    Str,
+    Num,
+}
+
+/// Whether a key looks like a normal field name (`^[A-Za-z_][A-Za-z0-9_]*$`).
+/// Numeric, delimited (`DNSE|STOCK`), or dotted keys are *not* identifiers — a
+/// strong sign they're data.
+fn is_ident_key(k: &str) -> bool {
+    let mut cs = k.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether an object at `[start, end)` reads as a data-keyed map (keys are
+/// values, values share a shape) rather than a record. Returns the inferred key
+/// type — `Num` when every sampled key parses as a number, else `Str`.
+///
+/// Three independent triggers, all gated on homogeneous values: **key shape**
+/// (most keys aren't identifiers — catches `{8960: …, 8970: …}` even with a few
+/// entries), **object similarity** (object values with alike key-sets), and
+/// **sheer count** (many uniform entries).
+pub fn looks_like_map(b: &[u8], start: usize, end: usize) -> Option<MapKey> {
     let mut n = 0usize;
+    let mut kind_counts = [0usize; 5]; // obj, arr, str, num, bool+null
     let mut n_obj = 0usize;
-    let mut scalar_counts = [0usize; 4]; // str, num, bool, null
+    let mut n_nonident = 0usize;
+    let mut n_numeric = 0usize;
     let mut key_freq: HashMap<String, usize> = HashMap::new();
     let mut c = Cursor::new(start, end, false);
     while let Some(f) = c.next(b) {
         n += 1;
+        if !is_ident_key(&f.label) {
+            n_nonident += 1;
+        }
+        if f.label.parse::<f64>().is_ok() {
+            n_numeric += 1;
+        }
         match f.kind {
             Kind::Object => {
+                kind_counts[0] += 1;
                 n_obj += 1;
                 let mut seen = std::collections::HashSet::new();
                 let mut fc = Cursor::new(f.start, f.end, false);
@@ -66,31 +103,41 @@ pub fn looks_like_map(b: &[u8], start: usize, end: usize) -> bool {
                     }
                 }
             }
-            Kind::Str => scalar_counts[0] += 1,
-            Kind::Number => scalar_counts[1] += 1,
-            Kind::Bool => scalar_counts[2] += 1,
-            Kind::Null => scalar_counts[3] += 1,
-            Kind::Array => {}
+            Kind::Array => kind_counts[1] += 1,
+            Kind::Str => kind_counts[2] += 1,
+            Kind::Number => kind_counts[3] += 1,
+            Kind::Bool | Kind::Null => kind_counts[4] += 1,
         }
         if n >= MAP_PROBE {
             break;
         }
     }
-    // Object map: enough object values whose key-sets look alike. Score
+    if n == 0 {
+        return None;
+    }
+    // Values must be homogeneous in kind — a record's values are typically mixed.
+    let dominant = kind_counts.iter().copied().max().unwrap_or(0);
+    if dominant * 100 < n * MAP_RATIO_PCT {
+        return None;
+    }
+    // Object similarity: object values whose key-sets look alike. Score
     // (Σf²/Σf)/n_obj ∈ [1/n_obj, 1] — 1 when every value shares every key.
-    if n_obj >= MAP_MIN_OBJ && n_obj * 100 >= n * MAP_RATIO_PCT {
+    let obj_similar = n_obj >= MAP_MIN_OBJ && n_obj * 100 >= n * MAP_RATIO_PCT && {
         let sum_f: usize = key_freq.values().sum();
         let sum_f2: usize = key_freq.values().map(|f| f * f).sum();
-        if sum_f > 0 && sum_f2 * 100 >= sum_f * n_obj * MAP_SIMILARITY_PCT {
-            return true;
-        }
+        sum_f > 0 && sum_f2 * 100 >= sum_f * n_obj * MAP_SIMILARITY_PCT
+    };
+    // Key shape: most keys aren't identifiers → they're data.
+    let data_keys = n_nonident * 100 >= n * MAP_DATAKEY_PCT;
+    if obj_similar || data_keys || n >= MAP_MANY {
+        Some(if n_numeric == n {
+            MapKey::Num
+        } else {
+            MapKey::Str
+        })
+    } else {
+        None
     }
-    // Scalar map: many entries, homogeneous scalar values.
-    let n_scalar_same = scalar_counts.iter().copied().max().unwrap_or(0);
-    if n >= MAP_SCALAR_MIN && n_scalar_same * 100 >= n * MAP_RATIO_PCT {
-        return true;
-    }
-    false
 }
 
 // --- the inferred type -----------------------------------------------------
@@ -107,8 +154,8 @@ pub enum Type {
     Array(Box<Type>),
     /// A record: named fields, each possibly optional.
     Object(Vec<Field>),
-    /// A data-keyed map — `Record<string, T>`.
-    Map(Box<Type>),
+    /// A data-keyed map — `Record<K, T>`, where `K` is `string` or `number`.
+    Map(MapKey, Box<Type>),
     /// Mixed shapes seen at the same position.
     Union(Vec<Type>),
 }
@@ -156,6 +203,9 @@ struct Acc {
     // map variant
     map_count: usize,
     map_val: Option<Box<Acc>>,
+    /// Set once a map occurrence with non-numeric keys is seen (so the merged
+    /// key type is `number` only when *every* occurrence had numeric keys).
+    map_key_str: bool,
     // array variant
     arr_count: usize,
     arr_elem: Option<Box<Acc>>,
@@ -200,37 +250,43 @@ impl Acc {
                     el.add(b, e.start, e.end, e.kind, depth + 1, bud);
                 }
             }
-            Kind::Object if looks_like_map(b, start, end) => {
-                self.map_count += 1;
-                let mv = self.map_val.get_or_insert_with(Box::default);
-                let mut c = Cursor::new(start, end, false);
-                let mut i = 0;
-                while let Some(v) = c.next(b) {
-                    i += 1;
-                    if i > lim {
-                        break;
-                    }
-                    mv.add(b, v.start, v.end, v.kind, depth + 1, bud);
-                }
-            }
             Kind::Object => {
-                self.rec_count += 1;
-                let mut c = Cursor::new(start, end, false);
-                let mut i = 0;
-                while let Some(f) = c.next(b) {
-                    i += 1;
-                    if i > KEY_CAP {
-                        break;
+                if let Some(key) = looks_like_map(b, start, end) {
+                    // A data-keyed map: merge its *values* into one element type.
+                    self.map_count += 1;
+                    if key == MapKey::Str {
+                        self.map_key_str = true;
                     }
-                    let fa = match self.fields.get_mut(&f.label) {
-                        Some(fa) => fa,
-                        None => {
-                            self.order.push(f.label.clone());
-                            self.fields.entry(f.label.clone()).or_default()
+                    let mv = self.map_val.get_or_insert_with(Box::default);
+                    let mut c = Cursor::new(start, end, false);
+                    let mut i = 0;
+                    while let Some(v) = c.next(b) {
+                        i += 1;
+                        if i > lim {
+                            break;
                         }
-                    };
-                    fa.present += 1;
-                    fa.acc.add(b, f.start, f.end, f.kind, depth + 1, bud);
+                        mv.add(b, v.start, v.end, v.kind, depth + 1, bud);
+                    }
+                } else {
+                    // A record: merge each key's value type across occurrences.
+                    self.rec_count += 1;
+                    let mut c = Cursor::new(start, end, false);
+                    let mut i = 0;
+                    while let Some(f) = c.next(b) {
+                        i += 1;
+                        if i > KEY_CAP {
+                            break;
+                        }
+                        let fa = match self.fields.get_mut(&f.label) {
+                            Some(fa) => fa,
+                            None => {
+                                self.order.push(f.label.clone());
+                                self.fields.entry(f.label.clone()).or_default()
+                            }
+                        };
+                        fa.present += 1;
+                        fa.acc.add(b, f.start, f.end, f.kind, depth + 1, bud);
+                    }
                 }
             }
         }
@@ -260,8 +316,13 @@ impl Acc {
             variants.push(Type::Array(Box::new(el)));
         }
         if self.map_count > 0 {
+            let key = if self.map_key_str {
+                MapKey::Str
+            } else {
+                MapKey::Num
+            };
             let v = self.map_val.map_or(Type::Any, |a| a.finish());
-            variants.push(Type::Map(Box::new(v)));
+            variants.push(Type::Map(key, Box::new(v)));
         }
         if self.str {
             variants.push(Type::Str);
@@ -339,8 +400,12 @@ fn write_type(
             let sfx = format!("[]{suffix}");
             write_type(el, indent, prefix, &sfx, note, out);
         }
-        Type::Map(v) => {
-            let pfx = format!("{prefix}Record<string, ");
+        Type::Map(key, v) => {
+            let kw = match key {
+                MapKey::Str => "string",
+                MapKey::Num => "number",
+            };
+            let pfx = format!("{prefix}Record<{kw}, ");
             let sfx = format!(">{suffix}");
             write_type(v, indent, &pfx, &sfx, note, out);
         }
@@ -461,6 +526,30 @@ mod tests {
         // address/geo have disjoint keys → a record, not a map.
         let t = ts(r#"{"address":{"street":"x"},"geo":{"lat":1}}"#);
         assert!(t.contains("address: {"), "{t}");
-        assert!(!t.contains("Record<string"), "should not be a map: {t}");
+        assert!(!t.contains("Record<"), "should not be a map: {t}");
+    }
+
+    #[test]
+    fn numeric_keyed_object_is_a_record_number_map() {
+        // Numeric keys (a few of them, array values) → Record<number, number[]>.
+        let t = ts(r#"{"8960":[2,18],"8970":[2,0],"9000":[1,0],"9120":[10,0]}"#);
+        assert_eq!(t, "Record<number, number[]>", "{t}");
+    }
+
+    #[test]
+    fn numeric_keyed_maps_merge_across_records_instead_of_exploding() {
+        // Each record's `lv` map has *different* numeric keys; merged they must
+        // collapse to one Record<number, …>, not a union of every key.
+        let t = ts(r#"[{"lv":{"10":[1],"20":[2]}},{"lv":{"30":[3],"40":[4]}},{"lv":{"50":[5]}}]"#);
+        assert!(t.contains("lv: Record<number, number[]>"), "{t}");
+        assert!(!t.contains("10?"), "keys must not explode into fields: {t}");
+    }
+
+    #[test]
+    fn identifier_keyed_small_object_stays_a_record() {
+        // Few entries, identifier keys → a record even though values are uniform.
+        let t = ts(r#"{"x":[1],"y":[2],"z":[3]}"#);
+        assert!(t.contains("x: number[]"), "{t}");
+        assert!(!t.contains("Record<"), "should not be a map: {t}");
     }
 }

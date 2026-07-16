@@ -98,9 +98,15 @@ the richer ones:
   bytes and *merges* them into one recursive type: object shapes are unified (a
   key missing from some records becomes `field?`, with a `// 66%` fill comment),
   array elements and map values collapse into a single element type, mixed scalars
-  become unions (`number | string`), and a **data-keyed object** — `{"AAPL": {…},
-  "MSFT": {…}}`, detected by whether the values share a shape rather than by key
-  names — becomes `Record<string, T>`. It recurses to full depth automatically, so
+  become unions (`number | string`), and a **data-keyed object** becomes
+  `Record<K, T>`. Map detection uses both the values (do they share a shape?) and
+  the **keys** (do they look like data rather than field names?) — so
+  `{"AAPL": {…}, "MSFT": {…}}` and `{8960: […], 8970: […]}` are both recognized
+  (the latter as `Record<number, number[]>`), even with only a handful of entries,
+  while a small record with real field names stays a record. Because detection
+  runs per-node, a map nested in thousands of records collapses to one
+  `Record<…>` instead of exploding every key into an optional field. It recurses
+  to full depth automatically, so
   ```ts
   {
     users: { id: number; name: string; email?: string; contact?: { email: string } }[]
