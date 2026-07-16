@@ -12,24 +12,24 @@ mod schema;
 mod search;
 mod source;
 mod stream;
+mod tree;
+mod ui;
 use filter::{parse_pipeline, Filter, Program};
 use input::TextInput;
-use scanner::{
-    container_empty, decode_str, skip_value, skip_ws, value_kind, Cursor, Kind, RawChild, Step,
-    MAX_DEPTH,
-};
-use search::{glob_to_regex, Pattern, Search};
+use scanner::{container_empty, decode_str, skip_value, skip_ws, Kind};
+use search::{Pattern, Search};
 use source::Source;
 use stream::{spawn_reader, take_pipe_reader, StreamStore, STREAM_REBUILD_MS};
+use tree::{
+    breadcrumb_segments, collect_expanded, count_children, expand_to, flatten, get, get_mut,
+    join_path, make_root, make_subroot, parse_path, resolve_with_climb, set_expanded, truncate,
+    Node, Row,
+};
 
 use memmap2::Mmap;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
-    Frame,
+    layout::Rect,
 };
 use std::{
     collections::HashSet,
@@ -42,21 +42,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How many children to show in a collapsed container's inline preview.
-const PREVIEW_ITEMS: usize = 5;
-/// Max display width of a collapsed preview before it's truncated with `…`.
-const PREVIEW_WIDTH: usize = 64;
-/// Bytes the inline preview will step over to reach the *next* sibling before
-/// giving up with `…`. A preview must be cheap to recompute every frame, so it
-/// must never pay a huge `skip_value`: if the next key sits behind a value bigger
-/// than this (e.g. `meta` behind a 1 GB `users`), the preview shows `…` instead
-/// of blocking to scan past it. Generous enough that normal values still appear.
-const PREVIEW_SKIP_BUDGET: usize = 64 << 10; // 64 KiB
-/// When decoding a scalar for display, only touch this many bytes. A preview/row
-/// truncates to a few dozen chars anyway, so decoding a whole multi-hundred-MB
-/// string (or a bogus run of digits) would just be wasted work and a memory
-/// spike. 512 bytes always covers the truncation width, even for 4-byte chars.
-const PREVIEW_DECODE_BYTES: usize = 512;
 /// Upper bound on the bytes the peek overlay decodes for a single scalar. Peek is
 /// on-demand (one keypress, not per-frame), so this is far more generous than the
 /// row cap — enough to read a big embedded blob — while still bounding the decode
@@ -80,11 +65,6 @@ const WHEEL_STEP: usize = 3;
 /// subtree wholesale, that's the export-to-file feature's job, not the clipboard.)
 const COPY_MAX_BYTES: usize = 1 << 20; // 1 MiB
 
-/// How many children a `:` goto will scan to resolve an object key. A goto is a
-/// synchronous, page-faulting walk, so this bounds the UI freeze on a giant
-/// level — a key past this many siblings reports "not found" rather than hanging.
-const GOTO_SCAN_CAP: usize = 100_000;
-
 /// Wall-clock budget for one cooperative `flatten` pass. When reaching the next
 /// on-screen row means skipping over a huge value (e.g. a 1 GB array to find the
 /// sibling after it), `flatten` yields after this long so the loop can paint what
@@ -92,431 +72,8 @@ const GOTO_SCAN_CAP: usize = 100_000;
 /// every later frame responsive instead of blocking on one giant `skip_value`.
 const FLATTEN_BUDGET: Duration = Duration::from_millis(8);
 
-/// Bytes a single resumable skip-chunk steps over before re-checking the frame
-/// deadline. Small enough that the deadline is honoured to within a chunk, large
-/// enough that the per-chunk overhead is negligible (~1–2 ms of scanning).
-const SKIP_CHUNK_BYTES: usize = 2 << 20; // 2 MiB
-
-// Syntax-highlight palette (ANSI named colors so it adapts to the terminal theme).
-const C_KEY: Color = Color::Cyan; // object keys
-const C_INDEX: Color = Color::DarkGray; // array indices
-const C_STR: Color = Color::Green; // string values
-const C_NUM: Color = Color::Yellow; // numbers
-const C_BOOL: Color = Color::Magenta; // true / false
-const C_PUNCT: Color = Color::DarkGray; // braces, colon, markers, previews
-
-/// The foreground color for a value of the given kind.
-fn value_color(kind: Kind) -> Color {
-    match kind {
-        Kind::Str => C_STR,
-        Kind::Number => C_NUM,
-        Kind::Bool => C_BOOL,
-        Kind::Null | Kind::Object | Kind::Array => C_PUNCT,
-    }
-}
-
-/// A lazily-expanding tree node. Children are scanned on demand from `cursor`
-/// (resumable), so a collapsed node costs O(1) and a huge level only enumerates
-/// as far as it's scrolled.
-struct Node {
-    label: String,
-    start: usize,
-    end: usize,
-    /// False when `end` is provisional — a container whose closer hasn't been
-    /// scanned yet (`end` is its parent's bound). Display/expand work regardless
-    /// (cursors stop at the real closer); the raw-range consumers (copy `y`, split
-    /// `o`/`O`) check this and skip to the true closer before slicing.
-    end_exact: bool,
-    kind: Kind,
-    is_index: bool,
-    /// Synthetic NDJSON root: children are the documents, enumerated by a
-    /// `Cursor::lines` instead of a bracketed-container cursor.
-    jsonl: bool,
-    has_children: bool,
-    expanded: bool,
-    done: bool,
-    children: Vec<Node>,
-    cursor: Option<Cursor>,
-}
-
-impl Node {
-    fn is_container(&self) -> bool {
-        matches!(self.kind, Kind::Object | Kind::Array)
-    }
-
-    /// The right child-cursor for this node: a line stream for the NDJSON root,
-    /// otherwise a normal bracketed-container cursor.
-    fn make_cursor(&self) -> Cursor {
-        if self.jsonl {
-            Cursor::lines(self.start, self.end)
-        } else {
-            Cursor::new(self.start, self.end, matches!(self.kind, Kind::Array))
-        }
-    }
-
-    fn from_raw(rc: RawChild, b: &[u8]) -> Node {
-        let is_cont = matches!(rc.kind, Kind::Object | Kind::Array);
-        // `container_empty` only reads just past the opener, so a provisional
-        // (over-long) `end` is harmless here.
-        let has = is_cont && !container_empty(b, rc.start, rc.end);
-        Node {
-            label: rc.label,
-            start: rc.start,
-            end: rc.end,
-            end_exact: rc.end_exact,
-            kind: rc.kind,
-            is_index: rc.is_index,
-            jsonl: false,
-            has_children: has,
-            expanded: false,
-            done: false,
-            children: Vec::new(),
-            cursor: None,
-        }
-    }
-
-    fn toggle(&mut self) {
-        if !self.is_container() || !self.has_children {
-            return;
-        }
-        self.expanded = !self.expanded;
-        // Init the child cursor on first expand only; collapse keeps the cursor +
-        // already-scanned children so re-expand resumes instead of rescanning.
-        if self.expanded && self.cursor.is_none() && self.children.is_empty() && !self.done {
-            self.cursor = Some(self.make_cursor());
-        }
-    }
-
-    /// Ensure `children[i]` exists, scanning more from the cursor if needed.
-    /// Eager: a deferred end-skip is resolved in one shot (used by jumps/goto/
-    /// search, which must reach a specific node now).
-    fn ensure_child(&mut self, b: &[u8], i: usize) {
-        while self.children.len() <= i {
-            let nx = match self.cursor.as_mut() {
-                Some(c) => c.next(b),
-                None => None,
-            };
-            match nx {
-                Some(rc) => self.children.push(Node::from_raw(rc, b)),
-                None => {
-                    self.done = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Cooperative `ensure_child`: drive the cursor in resumable chunks until
-    /// `children[i]` exists or `deadline` passes. Returns `Ready` (available),
-    /// `Done` (level ended before `i`), or `Busy` (deadline hit mid skip — call
-    /// again next frame; cursor state is preserved). This is what lets a huge
-    /// level (or a giant value standing between two on-screen rows) flatten a
-    /// frame's worth at a time instead of blocking.
-    fn ensure_child_until(&mut self, b: &[u8], i: usize, deadline: Instant) -> EnsureChild {
-        while self.children.len() <= i {
-            let Some(c) = self.cursor.as_mut() else {
-                return EnsureChild::Done;
-            };
-            match c.step(b, SKIP_CHUNK_BYTES) {
-                Step::Child(rc) => self.children.push(Node::from_raw(rc, b)),
-                Step::Done => {
-                    self.done = true;
-                    return EnsureChild::Done;
-                }
-                Step::Yield => {
-                    if Instant::now() >= deadline {
-                        return EnsureChild::Busy; // out of frame time, skip in flight
-                    }
-                    // time left — keep stepping the same skip
-                }
-            }
-        }
-        EnsureChild::Ready
-    }
-
-    /// The value text shown after the label. Collapsed containers get a real
-    /// one-line preview of their first few children; expanded ones get the
-    /// opening brace; scalars get their (truncated) literal.
-    fn preview(&self, b: &[u8]) -> String {
-        match self.kind {
-            Kind::Object | Kind::Array => {
-                let arr = matches!(self.kind, Kind::Array);
-                if !self.has_children {
-                    if arr {
-                        "[]".into()
-                    } else {
-                        "{}".into()
-                    }
-                } else if self.expanded {
-                    if arr {
-                        "[".into()
-                    } else {
-                        "{".into()
-                    }
-                } else {
-                    self.collapsed_preview(b)
-                }
-            }
-            Kind::Str => {
-                let e = decode_cap(self.start, self.end);
-                format!("\"{}\"", truncate(&decode_str(b, self.start, e), 70))
-            }
-            _ => {
-                let e = decode_cap(self.start, self.end);
-                truncate(&String::from_utf8_lossy(&b[self.start..e]), 70)
-            }
-        }
-    }
-
-    /// Scan the first few children of a collapsed container and render them
-    /// inline, e.g. `{ version: "0.3.2", deps: {…}, … }`. Uses a fresh resumable
-    /// `Cursor`, capped at `PREVIEW_ITEMS`, so it's O(few) regardless of size.
-    ///
-    /// Crucially it scans with a small per-sibling budget (`step`, not the eager
-    /// `next`): if reaching the next child would mean skipping a value bigger than
-    /// `PREVIEW_SKIP_BUDGET` (e.g. `meta` behind a 1 GB `users`), it stops with `…`
-    /// rather than blocking. Without this, the *collapsed* row would re-scan 1 GB
-    /// every frame — which is why collapsing a giant container felt slow.
-    fn collapsed_preview(&self, b: &[u8]) -> String {
-        let arr = matches!(self.kind, Kind::Array);
-        let (open, close) = if arr { ("[", "]") } else { ("{", "}") };
-        let mut cur = self.make_cursor();
-        let mut parts: Vec<String> = Vec::new();
-        let mut more = false;
-        loop {
-            if parts.len() == PREVIEW_ITEMS {
-                // Is there at least one more? `Yield` (next child behind a big
-                // value) counts as "yes" without paying the skip.
-                more = !matches!(cur.step(b, PREVIEW_SKIP_BUDGET), Step::Done);
-                break;
-            }
-            match cur.step(b, PREVIEW_SKIP_BUDGET) {
-                Step::Child(rc) => {
-                    let v = brief(b, &rc);
-                    parts.push(if arr {
-                        v
-                    } else {
-                        format!("{}: {}", rc.label, v)
-                    });
-                }
-                // The next sibling is behind a value too big to scan for a preview.
-                Step::Yield => {
-                    more = true;
-                    break;
-                }
-                Step::Done => break,
-            }
-        }
-        if parts.is_empty() {
-            return format!("{open}{close}");
-        }
-        let mut body = parts.join(", ");
-        if more {
-            body.push_str(", …");
-        }
-        truncate(&format!("{open} {body} {close}"), PREVIEW_WIDTH)
-    }
-}
-
-/// Upper bound for a display decode: never touch more than `PREVIEW_DECODE_BYTES`
-/// past `start`, so a giant string/number value isn't fully decoded just to show
-/// a truncated preview of it.
-fn decode_cap(start: usize, end: usize) -> usize {
-    end.min(start.saturating_add(PREVIEW_DECODE_BYTES))
-}
-
-/// A brief one-level rendering of a value for use inside a parent's preview:
-/// nested containers collapse to `{…}`/`[…]`, scalars show their literal.
-fn brief(b: &[u8], rc: &RawChild) -> String {
-    match rc.kind {
-        Kind::Object => {
-            if container_empty(b, rc.start, rc.end) {
-                "{}".into()
-            } else {
-                "{…}".into()
-            }
-        }
-        Kind::Array => {
-            if container_empty(b, rc.start, rc.end) {
-                "[]".into()
-            } else {
-                "[…]".into()
-            }
-        }
-        Kind::Str => {
-            let e = decode_cap(rc.start, rc.end);
-            format!("\"{}\"", truncate(&decode_str(b, rc.start, e), 24))
-        }
-        _ => {
-            let e = decode_cap(rc.start, rc.end);
-            truncate(&String::from_utf8_lossy(&b[rc.start..e]), 24)
-        }
-    }
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let t: String = s.chars().take(n).collect();
-        format!("{t}…")
-    }
-}
-
-/// A flattened, on-screen row plus the index path back to its node. Carries the
-/// label/value/kind separately so the renderer can syntax-color each segment.
-struct Row {
-    depth: usize,
-    label: String,
-    value: String,
-    kind: Kind,
-    is_index: bool,
-    has_children: bool,
-    expanded: bool,
-    path: Vec<usize>,
-    /// A synthetic, non-navigable placeholder rendered while a huge value is being
-    /// stepped over (the inline "⠋ loading…" line at the spot where the next
-    /// sibling will appear). Always the last row; focus is clamped above it.
-    loading: bool,
-}
-
-/// Windowed flatten: walk the expanded tree DFS, scanning children on demand,
-/// and stop once `budget` rows exist. A pathologically flat level (millions of
-/// keys) therefore only flattens ~a screenful, not the whole thing.
-/// Outcome of a cooperative child-scan (see [`Node::ensure_child_until`]).
-enum EnsureChild {
-    /// `children[i]` is available.
-    Ready,
-    /// The deadline was hit mid-skip — repaint and resume next frame.
-    Busy,
-    /// The level ended before index `i`.
-    Done,
-}
-
-/// Windowed flatten: walk the expanded tree DFS, scanning children on demand,
-/// and stop once `budget` rows exist. With `deadline = Some(_)` it is also
-/// *cooperative*: if reaching the next row means skipping a huge value past the
-/// frame's time budget, it sets `*incomplete = true` and returns early so the
-/// caller can paint what's flattened and resume next frame (the skip is
-/// preserved on the cursor). `deadline = None` drains eagerly (used by jumps,
-/// which must reach a target row synchronously).
-#[allow(clippy::too_many_arguments)]
-fn flatten(
-    node: &mut Node,
-    b: &[u8],
-    depth: usize,
-    budget: usize,
-    out: &mut Vec<Row>,
-    path: &mut Vec<usize>,
-    deadline: Option<Instant>,
-    incomplete: &mut bool,
-) {
-    if *incomplete || out.len() >= budget {
-        return;
-    }
-    out.push(Row {
-        depth,
-        label: node.label.clone(),
-        value: node.preview(b),
-        kind: node.kind,
-        is_index: node.is_index,
-        has_children: node.has_children,
-        expanded: node.expanded,
-        path: path.clone(),
-        loading: false,
-    });
-    // Stop descending past the depth cap so a deeply-nested (possibly hostile)
-    // document can't recurse the stack to a fault. Real data never reaches it.
-    if depth < MAX_DEPTH && node.expanded && node.is_container() {
-        let mut i = 0;
-        while out.len() < budget {
-            match deadline {
-                Some(dl) => match node.ensure_child_until(b, i, dl) {
-                    EnsureChild::Ready => {}
-                    EnsureChild::Done => break, // level fully enumerated
-                    EnsureChild::Busy => {
-                        *incomplete = true; // skip in flight — paint now, resume next frame
-                                            // Inline placeholder at the spot the next child will fill,
-                                            // indented to the child level, so the wait reads as "this
-                                            // node is still loading" rather than a frozen screen.
-                        if out.len() < budget {
-                            out.push(Row {
-                                depth: depth + 1,
-                                label: String::new(),
-                                value: String::new(),
-                                kind: Kind::Null,
-                                is_index: false,
-                                has_children: false,
-                                expanded: false,
-                                path: Vec::new(),
-                                loading: true,
-                            });
-                        }
-                        return;
-                    }
-                },
-                None => {
-                    node.ensure_child(b, i);
-                    if i >= node.children.len() {
-                        break; // level fully enumerated
-                    }
-                }
-            }
-            path.push(i);
-            flatten(
-                &mut node.children[i],
-                b,
-                depth + 1,
-                budget,
-                out,
-                path,
-                deadline,
-                incomplete,
-            );
-            path.pop();
-            if *incomplete {
-                return;
-            }
-            i += 1;
-        }
-    }
-}
-
-fn get<'a>(mut n: &'a Node, path: &[usize]) -> &'a Node {
-    for &i in path {
-        n = &n.children[i];
-    }
-    n
-}
-
-fn get_mut<'a>(mut n: &'a mut Node, path: &[usize]) -> &'a mut Node {
-    for &i in path {
-        n = &mut n.children[i];
-    }
-    n
-}
-
-/// Expand every ancestor of `path` (scanning children up to each step) so the
-/// target node becomes reachable in the flattened rows. The target itself is
-/// left as-is — only the chain above it is opened.
-fn expand_to(n: &mut Node, b: &[u8], path: &[usize]) {
-    // Recursion depth equals the path length; cap it so a deep path can't fault
-    // the stack. (Search matches are already capped at MAX_DEPTH, so this only
-    // bites pathological input — the deepest reachable rows simply aren't opened.)
-    if path.is_empty() || path.len() > MAX_DEPTH {
-        return;
-    }
-    if n.is_container() && n.has_children && !n.expanded {
-        n.toggle();
-    }
-    n.ensure_child(b, path[0]);
-    if path[0] < n.children.len() {
-        expand_to(&mut n.children[path[0]], b, &path[1..]);
-    }
-}
-
 #[derive(PartialEq)]
-enum Mode {
+pub(crate) enum Mode {
     Normal,
     Search,
     /// Typing a path to jump to (`:` prompt, e.g. `data.users[3].city`).
@@ -539,28 +96,28 @@ enum Mode {
 /// once when the overlay opens (with JSON escapes rendered — `\n` becomes a real
 /// line break) so it can be read wrapped and scrolled without touching the source
 /// again. `scroll` is the top wrapped-line offset.
-struct Peek {
+pub(crate) struct Peek {
     /// The focused node's label, shown in the card title.
-    title: String,
+    pub(crate) title: String,
     /// The decoded value; may be capped at `PEEK_MAX_BYTES` of source.
-    text: String,
+    pub(crate) text: String,
     /// True when the decode hit the cap, so the title can flag it.
-    truncated: bool,
+    pub(crate) truncated: bool,
     /// Top visible wrapped line (advanced by the scroll keys).
-    scroll: usize,
+    pub(crate) scroll: usize,
 }
 
 /// The `t` schema overlay: the focused node's inferred structural type (see
 /// [`schema`]), rendered TypeScript-style and scrollable, plus its copyable source.
-struct SchemaView {
+pub(crate) struct SchemaView {
     /// The focused node's label, for the card title.
-    title: String,
+    pub(crate) title: String,
     /// The rendered type as display lines.
-    lines: Vec<String>,
+    pub(crate) lines: Vec<String>,
     /// The same type as copyable text (`y` yanks it).
-    source: String,
+    pub(crate) source: String,
     /// Top visible line (advanced by the scroll keys).
-    scroll: usize,
+    pub(crate) scroll: usize,
 }
 
 /// What a key press asks the run loop to do that it can't do itself: quit, or
@@ -582,405 +139,87 @@ enum KeyOutcome {
 /// match paths (the worker indexes children from 0) can be lifted back to
 /// absolute paths that line up with the rows.
 #[derive(Clone)]
-struct Scope {
-    start: usize,
-    end: usize,
-    kind: Kind,
-    jsonl: bool,
-    path: Vec<usize>,
-    label: String,
+pub(crate) struct Scope {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) kind: Kind,
+    pub(crate) jsonl: bool,
+    pub(crate) path: Vec<usize>,
+    pub(crate) label: String,
 }
 
 /// One pane: an independent lazy tree + viewport over a byte range of the shared
 /// `Source`. The main pane is the whole document; a split pane (`derived`) is
 /// rooted at another pane's focused node. Each keeps its own focus, scroll,
 /// expansion, and search.
-struct View {
-    root: Node,
-    name: String,
+pub(crate) struct View {
+    pub(crate) root: Node,
+    pub(crate) name: String,
     /// True for a pane spun off by `s` (rooted at a sub-range), false for the
     /// original document pane. Drives the `↳` title marker and which pane the
     /// streaming re-parse feeds.
-    derived: bool,
+    pub(crate) derived: bool,
     /// Relative size in the workspace layout (a `Fill` weight); `+`/`-` adjust it.
-    weight: u16,
+    pub(crate) weight: u16,
     /// Stable identity for parent/child links (Vec indices shift when a pane is
     /// closed, so links can't be indices).
-    id: u64,
+    pub(crate) id: u64,
     /// The pane this was split from. Closing a pane closes its descendants too.
-    parent: Option<u64>,
+    pub(crate) parent: Option<u64>,
     /// The child reused by `o` (open-or-replace): re-rooted in place rather than
     /// opening yet another pane.
-    preview_child: Option<u64>,
-    focus: usize,
-    scroll: usize,
-    rows: Vec<Row>,
-    mode: Mode,
+    pub(crate) preview_child: Option<u64>,
+    pub(crate) focus: usize,
+    pub(crate) scroll: usize,
+    pub(crate) rows: Vec<Row>,
+    pub(crate) mode: Mode,
     /// Live search-input buffer (typed while in `Mode::Search`).
-    query: TextInput,
+    pub(crate) query: TextInput,
     /// Set when the typed `re:`/`g:` query failed to compile, so the footer can
     /// surface "(bad pattern)" without re-parsing. Cleared on a clean compile.
-    query_error: Option<String>,
+    pub(crate) query_error: Option<String>,
     /// The running search, if any. `None` once cleared/cancelled.
-    search: Option<Search>,
+    pub(crate) search: Option<Search>,
     /// The focused container captured when `/` opened, or `None` if the focus
     /// wasn't a container. `Tab` in the prompt flips `scoped` to search just this
     /// subtree (faster and quieter in a huge document) vs. the whole pane.
-    search_scope: Option<Scope>,
-    scoped: bool,
+    pub(crate) search_scope: Option<Scope>,
+    pub(crate) scoped: bool,
     /// Which match the cursor is currently on.
-    match_idx: usize,
+    pub(crate) match_idx: usize,
     /// Whether match-cycling has landed on a result yet (so the first
     /// next/prev press goes to the first/last match, not the second).
-    landed: bool,
+    pub(crate) landed: bool,
     /// Set of match paths, for O(1) row highlighting. Grown incrementally.
-    match_set: HashSet<Vec<usize>>,
+    pub(crate) match_set: HashSet<Vec<usize>>,
     /// How many of `search.matches` are already in `match_set`.
-    indexed: usize,
+    pub(crate) indexed: usize,
     /// A pending jump target: the next frame flattens far enough to land on it.
-    want_path: Option<Vec<usize>>,
+    pub(crate) want_path: Option<Vec<usize>>,
     /// Set when the last cooperative `flatten_window` yielded mid-skip (a huge
     /// value still being stepped over). The run loop keeps flattening — without
     /// blocking on input — until it clears. Always false after a jump.
-    flatten_incomplete: bool,
+    pub(crate) flatten_incomplete: bool,
     /// Live path-input buffer (typed while in `Mode::Goto`).
-    goto: TextInput,
+    pub(crate) goto: TextInput,
     /// Saved node paths (`m` toggles), jumped to via the `'` picker overlay.
-    bookmarks: Vec<Vec<usize>>,
+    pub(crate) bookmarks: Vec<Vec<usize>>,
     /// Selected row in the bookmark picker.
-    mark_idx: usize,
+    pub(crate) mark_idx: usize,
     /// Live filter-input buffer (typed while in `Mode::Filter`).
-    filter_query: TextInput,
+    pub(crate) filter_query: TextInput,
     /// Set when the typed filter failed to parse, so the footer can surface why
     /// without closing the prompt. Cleared on the next edit.
-    filter_error: Option<String>,
+    pub(crate) filter_error: Option<String>,
     /// The running filter for a *result* pane: its streamed hits become this
     /// pane's synthetic-array children. `None` for ordinary panes.
-    filter: Option<Filter>,
+    pub(crate) filter: Option<Filter>,
     /// How many of `filter.hits` are already materialized as root children.
-    filter_added: usize,
+    pub(crate) filter_added: usize,
     /// The open value-peek overlay, if any (`Mode::Peek`).
-    peek: Option<Peek>,
+    pub(crate) peek: Option<Peek>,
     /// The open schema overlay, if any (`Mode::Schema`).
-    schema: Option<SchemaView>,
-}
-
-/// Build the root node for a buffer. Shared by `App::new` and `App::rebuild`
-/// (the streaming re-parse), so a growing buffer always produces a consistent
-/// root. The root is auto-expanded (like `--depth 1`) when it has children.
-fn make_root(b: &[u8], name: &str, jsonl: bool) -> Node {
-    // NDJSON: a synthetic array root spanning the whole buffer, with at least one
-    // document if there's any non-whitespace. Single-doc: the first value.
-    let (start, kind, has) = if jsonl {
-        (0, Kind::Array, skip_ws(b, 0, b.len()) < b.len())
-    } else {
-        let rstart = skip_ws(b, 0, b.len());
-        if rstart >= b.len() {
-            // Empty / whitespace-only input (e.g. `jview </dev/null`, or a stream
-            // with no data yet): show an empty root rather than indexing past the
-            // buffer in value_kind.
-            (rstart, Kind::Null, false)
-        } else {
-            let k = value_kind(b, rstart);
-            let cont = matches!(k, Kind::Object | Kind::Array);
-            (rstart, k, cont && !container_empty(b, rstart, b.len()))
-        }
-    };
-    let mut root = Node {
-        label: name.into(),
-        start,
-        end: b.len(),     // root spans to EOF; the scanner stops at the real closer
-        end_exact: false, // provisional (to EOF) — copy re-resolves bounded by its cap
-        kind,
-        is_index: false,
-        jsonl,
-        has_children: has,
-        expanded: false,
-        done: false,
-        children: Vec::new(),
-        cursor: None,
-    };
-    if has {
-        root.toggle(); // auto-expand the root (like --depth 1)
-    }
-    root
-}
-
-/// Build a pane root over the byte range `[start, end)` of an existing node (the
-/// focused node of the pane being split). Unlike `make_root` this is a real
-/// bounded container, not the to-EOF document root, so its cursor stops at the
-/// node's own closer. Auto-expanded like the document root.
-fn make_subroot(b: &[u8], label: String, start: usize, end: usize, kind: Kind) -> Node {
-    let cont = matches!(kind, Kind::Object | Kind::Array);
-    let has = cont && !container_empty(b, start, end);
-    let mut root = Node {
-        label,
-        start,
-        end,
-        end_exact: true, // caller passed the node's already-resolved real end
-        kind,
-        is_index: false,
-        jsonl: false,
-        has_children: has,
-        expanded: false,
-        done: false,
-        children: Vec::new(),
-        cursor: None,
-    };
-    if has {
-        root.toggle();
-    }
-    root
-}
-
-/// Render a node path as a JSON accessor string (`users[1].address`), used as a
-/// split pane's title. `base` is the source pane's own origin (empty for the
-/// document pane) so chained splits accumulate (`users[1].address.city`).
-fn join_path(base: &str, segs: &[(String, bool)]) -> String {
-    let mut s = base.to_string();
-    for (label, is_idx) in segs {
-        if *is_idx {
-            s.push_str(&format!("[{label}]"));
-        } else {
-            if !s.is_empty() {
-                s.push('.');
-            }
-            s.push_str(label);
-        }
-    }
-    if s.is_empty() {
-        "root".into()
-    } else {
-        s
-    }
-}
-
-/// A parsed `goto` path segment: an object key or an array index.
-#[derive(Debug, PartialEq)]
-enum Seg {
-    Key(String),
-    Index(usize),
-}
-
-/// A parsed `goto` path: where resolution starts, then the segments to descend.
-#[derive(Debug, PartialEq)]
-struct ParsedPath {
-    /// `None` → **absolute**: resolve from the document root.
-    /// `Some(up)` → **relative**: start at the focused node and climb `up` levels
-    /// first (0 = the focused node itself, 1 = its parent, …), then descend `segs`.
-    up: Option<usize>,
-    segs: Vec<Seg>,
-}
-
-/// Parse a `goto` path string. Three forms, all lenient (it's an interactive
-/// jump, not a validator):
-/// - **absolute** — a bare path (`data.users[3].city`) or a `$`-prefixed one
-///   (`$.data`, the dot after `$` optional) resolves from the document root.
-/// - **relative** — a leading run of dots resolves from the focused node,
-///   Python-import style: `.child` (from the focus), `..sibling` (climb to the
-///   parent first), `...x` (climb two), and bare `.`/`..` jump to the
-///   focus/parent with no descent.
-///
-/// Bracketed (optionally quoted) keys may hold literal dots: `["x.y"][2]`.
-fn parse_path(input: &str) -> ParsedPath {
-    let s = input.trim();
-    if let Some(rest) = s.strip_prefix('$') {
-        // Explicit absolute. Drop one optional separating dot (`$.a` == `$a`).
-        let rest = rest.strip_prefix('.').unwrap_or(rest);
-        return ParsedPath {
-            up: None,
-            segs: tokenize_segments(rest),
-        };
-    }
-    if s.starts_with('.') {
-        // Relative: the leading dots say how far up to climb (d dots → up d-1).
-        // Dots are ASCII, so the count is also a byte offset into `s`.
-        let dots = s.chars().take_while(|&c| c == '.').count();
-        return ParsedPath {
-            up: Some(dots - 1),
-            segs: tokenize_segments(&s[dots..]),
-        };
-    }
-    ParsedPath {
-        up: None,
-        segs: tokenize_segments(s),
-    }
-}
-
-/// Split a path *body* (after any `$`/leading-dot prefix is stripped) into
-/// key/index segments on `.` and `[…]`.
-fn tokenize_segments(input: &str) -> Vec<Seg> {
-    let mut segs = Vec::new();
-    let mut cur = String::new();
-    let mut chars = input.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '.' => {
-                if !cur.is_empty() {
-                    segs.push(Seg::Key(std::mem::take(&mut cur)));
-                }
-            }
-            '[' => {
-                if !cur.is_empty() {
-                    segs.push(Seg::Key(std::mem::take(&mut cur)));
-                }
-                let mut inner = String::new();
-                for d in chars.by_ref() {
-                    if d == ']' {
-                        break;
-                    }
-                    inner.push(d);
-                }
-                let inner = inner.trim().trim_matches(|q| q == '"' || q == '\'');
-                match inner.parse::<usize>() {
-                    Ok(i) => segs.push(Seg::Index(i)),
-                    Err(_) => segs.push(Seg::Key(inner.to_string())),
-                }
-            }
-            _ => cur.push(c),
-        }
-    }
-    if !cur.is_empty() {
-        segs.push(Seg::Key(cur));
-    }
-    segs
-}
-
-/// Resolve parsed segments to an index-path into `root`, starting from `base`
-/// (the empty slice for an absolute path; the focused node's path, already
-/// climbed, for a relative one), expanding and scanning each container as it
-/// descends (so a collapsed level still resolves). Returns `None` if a segment
-/// doesn't exist (missing key, out-of-range index, or a scalar hit mid-path).
-/// Object-key lookup scans up to `GOTO_SCAN_CAP` children.
-fn resolve_path(root: &mut Node, b: &[u8], base: &[usize], segs: &[Seg]) -> Option<Vec<usize>> {
-    let mut out: Vec<usize> = base.to_vec();
-    for seg in segs {
-        let node = get_mut(root, &out);
-        if !node.is_container() || !node.has_children {
-            return None;
-        }
-        if !node.expanded {
-            node.toggle(); // create the child cursor so ensure_child can scan
-        }
-        match seg {
-            Seg::Index(i) => {
-                node.ensure_child(b, *i);
-                if *i >= node.children.len() {
-                    return None;
-                }
-                out.push(*i);
-            }
-            Seg::Key(k) => {
-                // Glob keys (`*`, `?`) widen the lookup to "first child whose
-                // label matches the whole pattern", letting the user jump with
-                // partial recall (`data.user*` / `data.*name*`). Plain keys
-                // keep the exact-match fast path.
-                let re = if k.contains('*') || k.contains('?') {
-                    Some(
-                        regex::RegexBuilder::new(&format!("^{}$", glob_to_regex(k)))
-                            .case_insensitive(true)
-                            .build()
-                            .ok()?,
-                    )
-                } else {
-                    None
-                };
-                let mut i = 0;
-                let mut found = None;
-                while i < GOTO_SCAN_CAP {
-                    node.ensure_child(b, i);
-                    if i >= node.children.len() {
-                        break;
-                    }
-                    let label = &node.children[i].label;
-                    let hit = match &re {
-                        Some(re) => re.is_match(label),
-                        None => label == k,
-                    };
-                    if hit {
-                        found = Some(i);
-                        break;
-                    }
-                    i += 1;
-                }
-                out.push(found?);
-            }
-        }
-    }
-    Some(out)
-}
-
-/// Resolve `parsed`, climbing toward the root on a miss so a path that doesn't
-/// exist where it was typed still lands if it exists higher up. The candidate
-/// bases, tried in order, are:
-/// - **absolute / bare** (`up == None`): the root first (the literal reading),
-///   then the focused node's ancestry from the cursor up — `.seg`, `..seg`,
-///   `...seg`, … — so `:city` falls back to `..city`, then `...city`, and so on.
-/// - **relative** (`up == Some(n)`): the cursor climbed `n` levels (the level you
-///   asked for), then each ancestor above it up to the root.
-///
-/// Returns the first base at which every segment resolves, or `None` if none do.
-fn resolve_with_climb(
-    root: &mut Node,
-    b: &[u8],
-    focus_path: &[usize],
-    parsed: &ParsedPath,
-) -> Option<Vec<usize>> {
-    let mut bases: Vec<Vec<usize>> = Vec::new();
-    if parsed.up.is_none() {
-        bases.push(Vec::new()); // literal absolute, from the root
-    }
-    // Climb the focus ancestry from the requested level up to the root. For an
-    // absolute path that's the whole chain (cursor → root); for a relative one it
-    // starts `up` levels above the cursor.
-    let start = focus_path.len().saturating_sub(parsed.up.unwrap_or(0));
-    for keep in (0..=start).rev() {
-        bases.push(focus_path[..keep].to_vec());
-    }
-    let mut tried: Vec<Vec<usize>> = Vec::new();
-    for base in bases {
-        if tried.contains(&base) {
-            continue; // root can appear twice (absolute case); resolve it once
-        }
-        if let Some(path) = resolve_path(root, b, &base, &parsed.segs) {
-            return Some(path);
-        }
-        tried.push(base);
-    }
-    None
-}
-
-/// Collect the index-paths of every expanded container in the tree, in DFS
-/// preorder (parents before children). Used to carry expansion state across a
-/// streaming re-parse.
-fn collect_expanded(node: &Node, path: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
-    if node.expanded {
-        out.push(path.clone());
-        for (i, ch) in node.children.iter().enumerate() {
-            path.push(i);
-            collect_expanded(ch, path, out);
-            path.pop();
-        }
-    }
-}
-
-/// Re-expand the node at `path`, opening (and scanning) each ancestor as needed.
-/// A no-op if the path isn't reachable yet (data hasn't arrived for it).
-fn set_expanded(root: &mut Node, b: &[u8], path: &[usize]) {
-    let mut n = root;
-    for &idx in path {
-        if n.is_container() && n.has_children && !n.expanded {
-            n.toggle();
-        }
-        n.ensure_child(b, idx);
-        if idx >= n.children.len() {
-            return; // child not present in the buffer yet
-        }
-        n = &mut n.children[idx];
-    }
-    if n.is_container() && n.has_children && !n.expanded {
-        n.toggle();
-    }
+    pub(crate) schema: Option<SchemaView>,
 }
 
 impl View {
@@ -1468,42 +707,42 @@ impl View {
 /// The workspace: one or more panes side by side, with `active` receiving keys.
 /// Splitting pushes a new pane rooted at the active pane's focused node; closing
 /// removes it. All panes share the same byte `Source`, so a split is O(1).
-struct App {
-    views: Vec<View>,
-    active: usize,
+pub(crate) struct App {
+    pub(crate) views: Vec<View>,
+    pub(crate) active: usize,
     /// Pane orientation: false = side by side (columns), true = stacked (rows).
     /// Toggled with `\`.
-    stacked: bool,
+    pub(crate) stacked: bool,
     /// Monotonic source of pane ids (never reused, so links stay unambiguous).
-    next_id: u64,
+    pub(crate) next_id: u64,
     /// Transient status line (e.g. "copied 42 B") shown in the footer until the
     /// next key press. `None` = show the normal key hint.
-    flash: Option<String>,
+    pub(crate) flash: Option<String>,
     /// True when stdout was redirected (a pipe or file), so `p` can extract the
     /// focused node into it. Set by `run_file`/`run_stdin` after reserving
     /// stdout; into a terminal there's nowhere to pipe, so `p` is a hint instead.
-    can_extract: bool,
+    pub(crate) can_extract: bool,
     /// Set by `p` to the focused node's byte range; the viewer quits and the
     /// caller writes that slice to the reserved stdout on the way out.
-    extract: Option<(usize, usize)>,
+    pub(crate) extract: Option<(usize, usize)>,
     /// Set by `p` on a filter-result pane: the byte range of *every* hit, emitted
     /// as NDJSON (one per line) on the way out — batch-carving many subtrees at
     /// once, the same zero-copy way `extract` carves one.
-    extract_batch: Option<Vec<(usize, usize)>>,
+    pub(crate) extract_batch: Option<Vec<(usize, usize)>>,
     /// A filter awaiting launch: stashed by the `|` prompt, consumed by the run
     /// loop (which has the owned byte `Source` the worker needs).
-    pending_filter: Option<PendingFilter>,
+    pub(crate) pending_filter: Option<PendingFilter>,
 }
 
 /// A parsed, ready-to-run filter plus the pane range it should evaluate over.
-struct PendingFilter {
-    program: Program,
+pub(crate) struct PendingFilter {
+    pub(crate) program: Program,
     /// The raw expression, kept for the result pane's title.
-    expr: String,
-    start: usize,
-    end: usize,
-    kind: Kind,
-    jsonl: bool,
+    pub(crate) expr: String,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) kind: Kind,
+    pub(crate) jsonl: bool,
 }
 
 impl App {
@@ -1589,7 +828,7 @@ impl App {
         self.views.iter().position(|v| v.id == id)
     }
 
-    fn active_view(&self) -> &View {
+    pub(crate) fn active_view(&self) -> &View {
         &self.views[self.active]
     }
 
@@ -1621,15 +860,15 @@ impl App {
     }
 
     /// Each pane's layout weight, in order — the `Fill` factors handed to
-    /// [`pane_layout`].
-    fn weights(&self) -> Vec<u16> {
+    /// [`ui::pane_layout`].
+    pub(crate) fn weights(&self) -> Vec<u16> {
         self.views.iter().map(|v| v.weight).collect()
     }
 
     /// The active pane's content height (rows) for a given screen area — used to
     /// size paging jumps, since each pane reserves a title + footer row.
     fn active_height(&self, area: Rect) -> usize {
-        let rects = pane_layout(panes_area(area), &self.weights(), self.stacked);
+        let rects = ui::pane_layout(ui::panes_area(area), &self.weights(), self.stacked);
         (rects[self.active * 2].height as usize)
             .saturating_sub(1)
             .max(1)
@@ -1809,22 +1048,6 @@ impl App {
     }
 }
 
-/// Walk the focus `path` from the root, collecting each ancestor's label and a
-/// flag for whether it's an array element. The root (the filename) is excluded —
-/// it's already shown at the start of the top bar.
-fn breadcrumb_segments(root: &Node, path: &[usize]) -> Vec<(String, bool)> {
-    let mut out = Vec::with_capacity(path.len());
-    let mut n = root;
-    for &i in path {
-        if i >= n.children.len() {
-            break; // path points past what's scanned (shouldn't happen for a row)
-        }
-        n = &n.children[i];
-        out.push((n.label.clone(), n.is_index));
-    }
-    out
-}
-
 /// Copy `data` to the terminal clipboard via OSC 52. This goes through the
 /// terminal itself (not a system clipboard library), so it works over SSH and
 /// needs no platform-specific dependency. Written straight to stdout and flushed;
@@ -1864,769 +1087,6 @@ fn base64_encode(data: &[u8]) -> String {
     out
 }
 
-/// Render the focus breadcrumb (`users › [2] › city`) as styled spans that fit
-/// within `avail` columns, **left-truncating** with a leading `…` so the tail
-/// nearest the focused node always stays visible. Array elements are bracketed;
-/// the last (current) segment is bold.
-fn breadcrumb_spans(segs: &[(String, bool)], avail: usize) -> Vec<Span<'static>> {
-    if segs.is_empty() || avail == 0 {
-        return Vec::new();
-    }
-    const SEP: &str = " › ";
-    const SEP_W: usize = 3;
-    let texts: Vec<String> = segs
-        .iter()
-        .map(|(l, is_idx)| if *is_idx { format!("[{l}]") } else { l.clone() })
-        .collect();
-    let widths: Vec<usize> = texts.iter().map(|t| t.chars().count()).collect();
-    let total: usize = widths.iter().sum::<usize>() + SEP_W * segs.len().saturating_sub(1);
-
-    // Find the first segment to show. 0 = the whole path fits, no ellipsis. Else
-    // pick the smallest start ≥ 1 whose suffix (plus a leading `…`) fits.
-    let mut start = 0usize;
-    if total > avail {
-        start = segs.len(); // nothing fits yet
-        let mut acc = 0usize; // width of the accepted suffix (excluding the `…`)
-        for i in (0..segs.len()).rev() {
-            let add = SEP_W + widths[i]; // each shown segment gets a leading separator
-            if 1 + acc + add <= avail {
-                acc += add;
-                start = i;
-            } else {
-                break;
-            }
-        }
-    }
-
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    if start > 0 {
-        spans.push(Span::styled("…", Style::default().fg(C_PUNCT)));
-        if start >= segs.len() {
-            return spans; // too narrow for even the last segment — just the `…`
-        }
-    }
-    for i in start..segs.len() {
-        if i > 0 || start > 0 {
-            spans.push(Span::styled(SEP, Style::default().fg(C_PUNCT)));
-        }
-        let color = if segs[i].1 { C_INDEX } else { C_KEY };
-        let mut st = Style::default().fg(color);
-        if i == segs.len() - 1 {
-            st = st.add_modifier(Modifier::BOLD); // the focused node
-        }
-        spans.push(Span::styled(texts[i].clone(), st));
-    }
-    spans
-}
-
-/// Split the screen into pane rects interleaved with 1-cell separator rects:
-/// `[pane0, sep, pane1, sep, …]`. Side by side (columns) by default, stacked
-/// (rows) when `stacked`. Each pane is a `Fill(weight)`, so the leftover space
-/// (after the fixed-size separators) divides in proportion to the weights.
-fn pane_layout(area: Rect, weights: &[u16], stacked: bool) -> std::rc::Rc<[Rect]> {
-    let n = weights.len();
-    let mut constraints = Vec::with_capacity(n * 2 - 1);
-    for (i, &w) in weights.iter().enumerate() {
-        if i > 0 {
-            constraints.push(Constraint::Length(1)); // separator row/column
-        }
-        constraints.push(Constraint::Fill(w.max(1)));
-    }
-    if stacked {
-        Layout::vertical(constraints).split(area)
-    } else {
-        Layout::horizontal(constraints).split(area)
-    }
-}
-
-/// The rule between panes: a vertical `│` column (side by side) or a horizontal
-/// `─` row (stacked).
-fn render_separator(f: &mut Frame, sep: Rect, stacked: bool) {
-    let style = Style::default().fg(C_PUNCT);
-    if stacked {
-        let rule = "─".repeat(sep.width as usize);
-        f.render_widget(Paragraph::new(Line::from(Span::styled(rule, style))), sep);
-    } else {
-        let rule: Vec<Line> = (0..sep.height)
-            .map(|_| Line::from(Span::styled("│", style)))
-            .collect();
-        f.render_widget(Paragraph::new(rule), sep);
-    }
-}
-
-/// Draw every pane (side by side or stacked, per `app.stacked`), separated by a
-/// rule. `streaming` only affects the (non-derived) document pane's title.
-/// The vertical span used for panes: everything above the global footer row.
-fn panes_area(area: Rect) -> Rect {
-    Rect {
-        height: area.height.saturating_sub(1),
-        ..area
-    }
-}
-
-/// Draw every pane (side by side or stacked) above a single global footer that
-/// spans the full width. `streaming` only affects the (non-derived) document
-/// pane's title.
-fn ui(f: &mut Frame, app: &App, streaming: bool) {
-    let area = f.area();
-    let n = app.views.len();
-    let rects = pane_layout(panes_area(area), &app.weights(), app.stacked);
-    for i in 0..n {
-        if i > 0 {
-            render_separator(f, rects[i * 2 - 1], app.stacked);
-        }
-        let view = &app.views[i];
-        render_pane(
-            f,
-            rects[i * 2],
-            view,
-            i == app.active,
-            streaming && !view.derived,
-        );
-    }
-    // One global footer at the very bottom, reflecting the active pane's mode.
-    let footer_row = Rect {
-        y: area.y + area.height.saturating_sub(1),
-        height: 1,
-        ..area
-    };
-    render_footer(f, footer_row, app.active_view(), app.flash.as_deref());
-
-    // An overlay floats over everything when open (only one at a time).
-    match app.active_view().mode {
-        Mode::Marks => render_marks(f, area, app.active_view()),
-        Mode::Help => render_help(f, area),
-        Mode::Peek => render_peek(f, area, app.active_view()),
-        Mode::Schema => render_schema(f, area, app.active_view()),
-        _ => {}
-    }
-}
-
-/// The single global key/search-status bar, reflecting the active pane. A
-/// transient `flash` (e.g. a copy confirmation) takes the bar over the key hint.
-fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Option<&str>) {
-    let line = if view.mode == Mode::Search {
-        let count = view.search.as_ref().map_or(0, |s| s.matches.len());
-        let more = match &view.search {
-            Some(s) if !s.finished => "+",
-            _ => "",
-        };
-        // Show pattern-parse failures verbatim so the user can fix the typed
-        // `re:`/`g:` expression. Else show position (after landing) or running
-        // total.
-        let pos = if let Some(err) = view.query_error.as_deref() {
-            format!("({err})")
-        } else if view.landed && count > 0 {
-            format!("{}/{}{}", view.match_idx + 1, count, more)
-        } else {
-            format!("{}{} matches", count, more)
-        };
-        // Scope hint: show where a scoped search is aimed, or that Tab can scope.
-        let scope = match (&view.search_scope, view.scoped) {
-            (Some(s), true) => format!(" · in {} · ⇥ all", s.label),
-            (Some(_), false) => " · ⇥ scope".to_string(),
-            (None, _) => String::new(),
-        };
-        prompt_line(
-            '/',
-            &view.query,
-            &format!("{pos}{scope} · ↵/↓ next · esc close"),
-        )
-    } else if view.mode == Mode::Goto {
-        prompt_line(':', &view.goto, "↵ jump · esc cancel")
-    } else if view.mode == Mode::Filter {
-        let hint = match view.filter_error.as_deref() {
-            Some(e) => format!("({e})"),
-            None => "↵ run → new pane · esc cancel".to_string(),
-        };
-        prompt_line('|', &view.filter_query, &hint)
-    } else if let Some(msg) = flash {
-        Line::from(Span::styled(
-            format!(" {msg}"),
-            Style::default().fg(Color::Green),
-        ))
-    } else {
-        Line::from(Span::styled(
-            " ↑/↓ move · enter expand · / search · : goto · | filter · y copy · ? help · q quit",
-            Style::default().fg(Color::DarkGray),
-        ))
-    };
-    f.render_widget(Paragraph::new(line), area);
-}
-
-/// Build a prompt footer line with a visible block caret at the edit position.
-/// The character under the caret is drawn reverse-video (a blank cell when the
-/// caret sits at the end of the line), so the `/`, `:`, and `|` prompts read
-/// like real input fields — the split at `input.caret` is always on a char
-/// boundary, so it never slices a multi-byte character.
-fn prompt_line(prefix: char, input: &TextInput, hint: &str) -> Line<'static> {
-    let base = Style::default().fg(Color::Yellow);
-    let (before, rest) = input.as_str().split_at(input.caret);
-    let under = rest.chars().next();
-    let after = &rest[under.map_or(0, char::len_utf8)..];
-    Line::from(vec![
-        Span::styled(format!(" {prefix}{before}"), base),
-        Span::styled(
-            under.unwrap_or(' ').to_string(),
-            base.add_modifier(Modifier::REVERSED),
-        ),
-        Span::styled(format!("{after}   {hint}"), base),
-    ])
-}
-
-/// Draw the bookmark picker as a centered overlay listing each saved node's
-/// path; the selected row is highlighted. Jumped/edited via [`process_key`].
-fn render_marks(f: &mut Frame, area: Rect, view: &View) {
-    let items: Vec<String> = view
-        .bookmarks
-        .iter()
-        .map(|p| join_path("", &breadcrumb_segments(&view.root, p)))
-        .collect();
-    // Size to the wider of the longest bookmark or the title, so the title can't
-    // be truncated to "… d de" on a narrow box.
-    let title = " bookmarks · ↵ jump · d delete · esc ";
-    let title_w = title.chars().count();
-    let longest = items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
-    let inner_w = longest
-        .max(title_w)
-        .min(area.width.saturating_sub(4) as usize);
-    let w = inner_w as u16 + 4;
-    let h = (items.len() as u16 + 2)
-        .min(area.height.saturating_sub(2))
-        .max(3);
-    let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    let rect = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-
-    // Read as a floating card above the dimmed content: a solid dark fill with a
-    // bright, bold border/title, and a full-width selection bar (padded out so the
-    // highlight spans the row instead of clipping to the label).
-    let panel_bg = Color::Indexed(236); // dark gray; degrades gracefully on 16-color terms
-    let lines: Vec<Line> = items
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let pad = " ".repeat(inner_w.saturating_sub(s.chars().count()));
-            let text = format!(" {s}{pad} ");
-            let st = if i == view.mark_idx {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray).bg(panel_bg)
-            };
-            Line::from(Span::styled(text, st))
-        })
-        .collect();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .style(Style::default().bg(panel_bg))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    f.render_widget(Clear, rect);
-    f.render_widget(Paragraph::new(lines).block(block), rect);
-}
-
-/// Draw the keyboard-shortcut cheatsheet as a centered overlay (opened with `?`,
-/// closed by any key). Two columns of key → action in the same floating-card
-/// style as the bookmark picker — this is where the keys trimmed off the footer
-/// live.
-fn render_help(f: &mut Frame, area: Rect) {
-    const ENTRIES: &[(&str, &str)] = &[
-        ("↑/↓  k/j", "move focus"),
-        ("J / K", "next / prev sibling"),
-        ("PgUp/PgDn", "page up / down"),
-        ("Ctrl-D/U", "half page"),
-        ("g  Home", "jump to top"),
-        ("Enter  →", "expand · peek a leaf"),
-        ("←", "collapse / parent"),
-        ("wheel", "scroll the pane"),
-        ("t", "infer type (TS) · y copy"),
-        ("c", "count children"),
-        ("/", "search · ⇥ scope subtree"),
-        ("↵  ⇧↵", "next / prev match"),
-        (":", "jump to a path · *? in keys"),
-        ("|", "jq-style filter → new pane"),
-        ("m", "toggle bookmark"),
-        ("'", "bookmark picker"),
-        ("y / Y", "copy value / path"),
-        ("p", "pipe node · all hits on a filter pane"),
-        ("s", "split pane at node"),
-        ("o", "preview pane"),
-        ("\\", "toggle pane layout"),
-        ("+ / -", "grow / shrink pane"),
-        ("Tab/⇧Tab", "switch pane"),
-        ("x", "close pane"),
-        ("?", "toggle this help"),
-        ("q  Esc", "close pane / quit"),
-    ];
-    let key_w = ENTRIES
-        .iter()
-        .map(|(k, _)| k.chars().count())
-        .max()
-        .unwrap_or(0);
-    let desc_w = ENTRIES
-        .iter()
-        .map(|(_, d)| d.chars().count())
-        .max()
-        .unwrap_or(0);
-    let rows = ENTRIES.len().div_ceil(2);
-
-    // Worked examples for the two syntaxes that don't fit a one-line key hint:
-    // the `/` search prefixes and the `|` jq-style filter. Shown full-width
-    // below the key grid, `prefix code — description`.
-    const EXAMPLES: &[(&str, &str, &str)] = &[
-        ("/", "re:^id_\\d+$", "regex search"),
-        ("/", "g:log-*", "glob search (*, ? wildcards)"),
-        (
-            "|",
-            ".users[] | select(.age > 30) | .name",
-            "names of users over 30",
-        ),
-        ("|", ".. | .id", "every .id at any depth"),
-        (
-            "|",
-            "select(.name ~ \"re:^a\")",
-            "field value matches a regex",
-        ),
-        (
-            "|",
-            ".items[] | select(.f ~ \"g:*.log\")",
-            "field value matches a glob",
-        ),
-    ];
-    let ex_code_w = EXAMPLES
-        .iter()
-        .map(|(_, c, _)| c.chars().count())
-        .max()
-        .unwrap_or(0);
-
-    let key_st = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let desc_st = Style::default().fg(Color::Gray);
-    let code_st = Style::default().fg(Color::Yellow);
-    let panel_bg = Color::Indexed(236);
-
-    // One "key  description" cell, key right-aligned so the columns line up.
-    let cell = |k: &str, d: &str| -> Vec<Span<'static>> {
-        vec![
-            Span::styled(format!(" {k:>key_w$}  "), key_st),
-            Span::styled(format!("{d:<desc_w$} "), desc_st),
-        ]
-    };
-
-    // Pair entry i with entry i+rows, so the list reads top-to-bottom per column.
-    let mut lines: Vec<Line> = (0..rows)
-        .map(|r| {
-            let (k1, d1) = ENTRIES[r];
-            let mut spans = cell(k1, d1);
-            if let Some(&(k2, d2)) = ENTRIES.get(r + rows) {
-                spans.push(Span::styled("  ", desc_st));
-                spans.extend(cell(k2, d2));
-            }
-            Line::from(spans)
-        })
-        .collect();
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        " examples · / search · | filter",
-        key_st,
-    )));
-    for &(p, c, d) in EXAMPLES {
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {p} "), key_st),
-            Span::styled(format!("{c:<ex_code_w$}"), code_st),
-            Span::styled(format!("  {d}"), desc_st),
-        ]));
-    }
-
-    let title = " keyboard shortcuts · any key to close ";
-    let col_w = key_w + desc_w + 4; // " " + key + "  " + desc + " "
-    let ex_w = 3
-        + ex_code_w
-        + 2
-        + EXAMPLES
-            .iter()
-            .map(|(_, _, d)| d.chars().count())
-            .max()
-            .unwrap_or(0);
-    let inner_w = (col_w * 2 + 2)
-        .max(ex_w)
-        .max(title.chars().count())
-        .min(area.width.saturating_sub(2) as usize);
-    let w = inner_w as u16 + 2;
-    let h = (lines.len() as u16 + 2).min(area.height);
-    let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    let rect = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .style(Style::default().bg(panel_bg))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    f.render_widget(Clear, rect);
-    f.render_widget(Paragraph::new(lines).block(block), rect);
-}
-
-/// The centered peek card and its inner (text) dimensions `(rect, inner_w,
-/// inner_h)`. A near-full-screen box so a long value has room to breathe. Shared
-/// by [`render_peek`] and the peek scroll handler so the scroll clamp matches what
-/// is actually drawn.
-fn peek_layout(area: Rect) -> (Rect, usize, usize) {
-    let w = area.width.saturating_sub(6).clamp(8, area.width.max(8));
-    let h = area.height.saturating_sub(4).clamp(3, area.height.max(3));
-    let rect = Rect {
-        x: area.x + area.width.saturating_sub(w) / 2,
-        y: area.y + area.height.saturating_sub(h) / 2,
-        width: w,
-        height: h,
-    };
-    (
-        rect,
-        w.saturating_sub(2) as usize,
-        h.saturating_sub(2) as usize,
-    )
-}
-
-/// Lay a decoded value out for the peek overlay: hard-break on `\n`, expand tabs,
-/// drop other control chars, and char-wrap each logical line to `width` columns.
-/// Char counts (not display columns) mirror the width accounting the rest of the
-/// UI uses (`truncate`, breadcrumbs), so wide glyphs are treated the same here.
-fn wrap_for_peek(text: &str, width: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![String::new()];
-    }
-    let mut out = Vec::new();
-    for logical in text.split('\n') {
-        // Sanitize: tabs to spaces, strip other control chars (a raw \r or NUL
-        // would garble the terminal).
-        let mut clean = String::with_capacity(logical.len());
-        for c in logical.chars() {
-            match c {
-                '\t' => clean.push_str("    "),
-                c if c.is_control() => {}
-                c => clean.push(c),
-            }
-        }
-        if clean.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        let mut cur = String::new();
-        let mut n = 0;
-        for c in clean.chars() {
-            cur.push(c);
-            n += 1;
-            if n == width {
-                out.push(std::mem::take(&mut cur));
-                n = 0;
-            }
-        }
-        if !cur.is_empty() {
-            out.push(cur);
-        }
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
-}
-
-/// Draw the value-peek overlay: the focused scalar's full value, wrapped and
-/// vertically scrolled to `peek.scroll`, in the same floating-card style as the
-/// other overlays. Opened by `Enter`/`Space` on a leaf; closed by `esc`/`q`.
-fn render_peek(f: &mut Frame, area: Rect, view: &View) {
-    let Some(pk) = view.peek.as_ref() else {
-        return;
-    };
-    let (rect, inner_w, inner_h) = peek_layout(area);
-    let all = wrap_for_peek(&pk.text, inner_w);
-    let total = all.len();
-    let top = pk.scroll.min(total.saturating_sub(inner_h));
-    let bottom = (top + inner_h).min(total);
-
-    let panel_bg = Color::Indexed(236);
-    let lines: Vec<Line> = all[top..bottom]
-        .iter()
-        .map(|s| Line::from(Span::styled(s.clone(), Style::default().fg(Color::Gray))))
-        .collect();
-
-    // Title carries the label and a position readout so a long value shows how far
-    // down you are; the `⚠ capped` flag marks a value clipped at PEEK_MAX_BYTES.
-    let cap = if pk.truncated { " · ⚠ capped" } else { "" };
-    let title = format!(
-        " peek · {} · lines {}–{}/{}{cap} · j/k scroll · esc ",
-        pk.title,
-        top + 1,
-        bottom,
-        total,
-    );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .style(Style::default().bg(panel_bg))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    f.render_widget(Clear, rect);
-    f.render_widget(Paragraph::new(lines).block(block), rect);
-}
-
-/// Syntax-highlight one line of a rendered type: type keywords green, field
-/// names cyan, punctuation dim, and a trailing `// %` comment dimmer. Word runs
-/// are classified by a fixed keyword set, so a field name colours as a key while
-/// `string`/`number`/`Record`/… colour as types.
-fn highlight_type_line(s: &str) -> Line<'static> {
-    const KEYWORDS: &[&str] = &["string", "number", "boolean", "null", "any", "Record"];
-    let (code, comment) = match s.split_once("//") {
-        Some((c, n)) => (c, Some(format!("//{n}"))),
-        None => (s, None),
-    };
-    let mut spans: Vec<Span> = Vec::new();
-    let mut run = String::new();
-    let mut run_word = false;
-    let flush = |run: &mut String, is_word: bool, spans: &mut Vec<Span>| {
-        if run.is_empty() {
-            return;
-        }
-        let color = if !is_word {
-            C_PUNCT
-        } else if KEYWORDS.contains(&run.as_str()) {
-            C_STR // type keywords reuse the string-value green
-        } else {
-            C_KEY // field names
-        };
-        spans.push(Span::styled(
-            std::mem::take(run),
-            Style::default().fg(color),
-        ));
-    };
-    for ch in code.chars() {
-        let is_word = ch.is_ascii_alphanumeric() || ch == '_';
-        if !run.is_empty() && is_word != run_word {
-            flush(&mut run, run_word, &mut spans);
-        }
-        run_word = is_word;
-        run.push(ch);
-    }
-    flush(&mut run, run_word, &mut spans);
-    if let Some(c) = comment {
-        spans.push(Span::styled(c, Style::default().fg(Color::DarkGray)));
-    }
-    Line::from(spans)
-}
-
-/// Draw the schema overlay: the focused node's inferred type (TypeScript-style),
-/// scrolled to `schema.scroll`, in the same floating-card style as the other
-/// overlays. Opened by `t`; `y` copies it; closed by `esc`/`q`/`t`.
-fn render_schema(f: &mut Frame, area: Rect, view: &View) {
-    let Some(sc) = view.schema.as_ref() else {
-        return;
-    };
-    let (rect, _inner_w, inner_h) = peek_layout(area);
-    let panel_bg = Color::Indexed(236);
-
-    let total = sc.lines.len();
-    let top = sc.scroll.min(total.saturating_sub(inner_h));
-    let bottom = (top + inner_h).min(total);
-    let lines: Vec<Line> = sc.lines[top..bottom]
-        .iter()
-        .map(|s| highlight_type_line(s))
-        .collect();
-
-    let title = format!(
-        " type · {} · lines {}–{}/{} · y copy · esc ",
-        sc.title,
-        top + 1,
-        bottom,
-        total,
-    );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .style(Style::default().bg(panel_bg))
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    f.render_widget(Clear, rect);
-    f.render_widget(Paragraph::new(lines).block(block), rect);
-}
-
-/// Braille spinner frames for the inline "still scanning a huge value" row.
-/// Advanced by wall-clock time so it animates across the drain's repaints without
-/// threading a frame counter through the render path.
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-fn spinner_frame() -> &'static str {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    SPINNER[(ms / 80) as usize % SPINNER.len()]
-}
-
-/// Draw one pane (title + breadcrumb, then content rows) into `rect`. The active
-/// pane gets a bright title and is the only one to show its cursor bar; the
-/// key/search footer is global (see [`render_footer`]), not per-pane.
-fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: bool) {
-    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(rect);
-
-    // Title: `↳ origin   focus/rows+` plus the focus breadcrumb. Count only real
-    // rows (the trailing loading placeholder isn't a node), and clamp the shown
-    // position to that count.
-    let marker = if view.derived { "↳ " } else { "" };
-    let n_rows = view.rows.iter().filter(|r| !r.loading).count();
-    let pos = (view.focus + 1).min(n_rows.max(1));
-    let mut prefix = format!(" {marker}{}   {}/{}+", view.name, pos, n_rows);
-    if let Some(f) = view.filter.as_ref() {
-        // A filter result pane: show how many nodes matched, with a `+` while the
-        // worker is still scanning.
-        let more = if f.finished { "" } else { "+" };
-        prefix.push_str(&format!("   {} hits{more}", f.hits.len()));
-    }
-    if streaming {
-        prefix.push_str("   ⟳ streaming");
-    }
-    let prefix_w = prefix.chars().count();
-    let title_style = if active {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let mut title = vec![Span::styled(prefix, title_style)];
-    // Breadcrumb to the focused row, left-truncated to whatever space is left.
-    let segs = view
-        .rows
-        .get(view.focus)
-        .map(|r| breadcrumb_segments(&view.root, &r.path))
-        .unwrap_or_default();
-    if !segs.is_empty() {
-        const GAP: usize = 3;
-        let avail = (chunks[0].width as usize).saturating_sub(prefix_w + GAP);
-        let crumb = breadcrumb_spans(&segs, avail);
-        if !crumb.is_empty() {
-            title.push(Span::raw("   "));
-            title.extend(crumb);
-        }
-    }
-    f.render_widget(Paragraph::new(Line::from(title)), chunks[0]);
-
-    let cur_match = view
-        .search
-        .as_ref()
-        .and_then(|s| s.matches.get(view.match_idx));
-
-    let h = chunks[1].height as usize;
-    let mut lines = Vec::new();
-    let end = (view.scroll + h).min(view.rows.len());
-    for i in view.scroll..end {
-        let r = &view.rows[i];
-        if r.loading {
-            // Inline drain indicator: a dim, animated "⠋ loading…" at the child
-            // indent, where the next sibling will appear once it's scanned in.
-            let indent = "  ".repeat(r.depth);
-            lines.push(Line::from(Span::styled(
-                format!("{indent}{} loading…", spinner_frame()),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-            )));
-            continue;
-        }
-        let marker = if r.has_children {
-            if r.expanded {
-                "▼"
-            } else {
-                "▶"
-            }
-        } else {
-            " "
-        };
-        let indent = "  ".repeat(r.depth);
-
-        let line = if active && i == view.focus {
-            // Selection bar: only the active pane shows its cursor, so the one
-            // highlighted row unambiguously marks which pane is live. Inactive
-            // panes keep their focus (it returns on Tab) but draw it as a normal
-            // row.
-            let text = format!("{indent}{marker} {}: {}", r.label, r.value);
-            Line::from(Span::styled(
-                text,
-                Style::default().add_modifier(Modifier::REVERSED),
-            ))
-        } else if cur_match == Some(&r.path) || view.match_set.contains(&r.path) {
-            // A search hit: whole row yellow (current match also bold).
-            let text = format!("{indent}{marker} {}: {}", r.label, r.value);
-            let mut st = Style::default().fg(Color::Yellow);
-            if cur_match == Some(&r.path) {
-                st = st.add_modifier(Modifier::BOLD);
-            }
-            Line::from(Span::styled(text, st))
-        } else {
-            // Normal row: syntax-colored segments.
-            let key_color = if r.is_index { C_INDEX } else { C_KEY };
-            Line::from(vec![
-                Span::raw(indent),
-                Span::styled(marker, Style::default().fg(C_PUNCT)),
-                Span::raw(" "),
-                Span::styled(r.label.clone(), Style::default().fg(key_color)),
-                Span::styled(": ", Style::default().fg(C_PUNCT)),
-                Span::styled(r.value.clone(), Style::default().fg(value_color(r.kind))),
-            ])
-        };
-        lines.push(line);
-    }
-    f.render_widget(Paragraph::new(lines), chunks[1]);
-}
-
 /// Flatten the visible window, land any pending jump, clamp focus/scroll, and
 /// draw one frame. Shared by the file and streaming loops.
 fn render_frame(
@@ -2638,12 +1098,12 @@ fn render_frame(
     // Each pane flattens to its own content height (which depends on orientation
     // and pane count), so a stacked pane only walks its shorter window. Each pane
     // reserves one title row; the footer is global, below the panes.
-    let rects = pane_layout(panes_area(term_area()?), &app.weights(), app.stacked);
+    let rects = ui::pane_layout(ui::panes_area(term_area()?), &app.weights(), app.stacked);
     for (i, v) in app.views.iter_mut().enumerate() {
         let h = (rects[i * 2].height as usize).saturating_sub(1).max(1);
         v.flatten_window(b, h);
     }
-    term.draw(|f| ui(f, app, streaming))?;
+    term.draw(|f| ui::draw(f, app, streaming))?;
     Ok(())
 }
 
@@ -2816,10 +1276,10 @@ fn process_key(
     // close. Clamp against the same wrap the renderer uses so `k` after the bottom
     // reacts immediately instead of eating dead presses.
     if app.active_view().mode == Mode::Peek {
-        let (_, inner_w, inner_h) = peek_layout(term_area().unwrap_or(Rect::new(0, 0, 80, 24)));
+        let (_, inner_w, inner_h) = ui::peek_layout(term_area().unwrap_or(Rect::new(0, 0, 80, 24)));
         let v = app.active_mut();
         if let Some(pk) = v.peek.as_mut() {
-            let max = wrap_for_peek(&pk.text, inner_w)
+            let max = ui::wrap_for_peek(&pk.text, inner_w)
                 .len()
                 .saturating_sub(inner_h);
             match k.code {
@@ -2848,7 +1308,7 @@ fn process_key(
     // Schema mode: the inferred-type overlay. Scroll the type; `y` copies it;
     // Esc/q/t/Enter close.
     if app.active_view().mode == Mode::Schema {
-        let (_, _, inner_h) = peek_layout(term_area().unwrap_or(Rect::new(0, 0, 80, 24)));
+        let (_, _, inner_h) = ui::peek_layout(term_area().unwrap_or(Rect::new(0, 0, 80, 24)));
         // `y` copies the whole type to the clipboard (handled before the mutable
         // borrow so it can set the app-level flash).
         if matches!(k.code, KeyCode::Char('y')) {
@@ -3103,22 +1563,6 @@ fn process_key(
     KeyOutcome::Continue
 }
 
-/// Count a container's direct children by scanning them (bounded only by the
-/// data — a resumable cursor, so it's the same walk `expand` does, just to the
-/// end). `None` for a scalar. Backs the `c` key: "how big is this?" without
-/// expanding a possibly-huge level.
-fn count_children(node: &Node, b: &[u8]) -> Option<usize> {
-    if !node.jsonl && !matches!(node.kind, Kind::Object | Kind::Array) {
-        return None;
-    }
-    let mut cur = node.make_cursor();
-    let mut n = 0usize;
-    while cur.next(b).is_some() {
-        n += 1;
-    }
-    Some(n)
-}
-
 /// Group an integer with thousands separators: `1234567` → `"1,234,567"`.
 fn group(n: usize) -> String {
     let s = n.to_string();
@@ -3141,7 +1585,7 @@ fn term_area() -> std::io::Result<Rect> {
 /// Which pane (index) the screen cell `(col, row)` falls in, if any — for
 /// routing a mouse-wheel scroll to the pane under the cursor.
 fn pane_at(app: &App, col: u16, row: u16) -> std::io::Result<Option<usize>> {
-    let rects = pane_layout(panes_area(term_area()?), &app.weights(), app.stacked);
+    let rects = ui::pane_layout(ui::panes_area(term_area()?), &app.weights(), app.stacked);
     for i in 0..app.views.len() {
         let r = rects[i * 2];
         if col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height {
@@ -3640,6 +2084,7 @@ fn main() -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree::{resolve_path, ParsedPath, Seg};
 
     /// Diagnostic: how long does *opening* big.json take (mmap → root →
     /// first windowed flatten)? `#[ignore]`d so it never runs in CI and never
