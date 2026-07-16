@@ -2526,6 +2526,50 @@ fn render_peek(f: &mut Frame, area: Rect, view: &View) {
     f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
+/// Syntax-highlight one line of a rendered type: type keywords green, field
+/// names cyan, punctuation dim, and a trailing `// %` comment dimmer. Word runs
+/// are classified by a fixed keyword set, so a field name colours as a key while
+/// `string`/`number`/`Record`/… colour as types.
+fn highlight_type_line(s: &str) -> Line<'static> {
+    const KEYWORDS: &[&str] = &["string", "number", "boolean", "null", "any", "Record"];
+    let (code, comment) = match s.split_once("//") {
+        Some((c, n)) => (c, Some(format!("//{n}"))),
+        None => (s, None),
+    };
+    let mut spans: Vec<Span> = Vec::new();
+    let mut run = String::new();
+    let mut run_word = false;
+    let flush = |run: &mut String, is_word: bool, spans: &mut Vec<Span>| {
+        if run.is_empty() {
+            return;
+        }
+        let color = if !is_word {
+            C_PUNCT
+        } else if KEYWORDS.contains(&run.as_str()) {
+            C_STR // type keywords reuse the string-value green
+        } else {
+            C_KEY // field names
+        };
+        spans.push(Span::styled(
+            std::mem::take(run),
+            Style::default().fg(color),
+        ));
+    };
+    for ch in code.chars() {
+        let is_word = ch.is_ascii_alphanumeric() || ch == '_';
+        if !run.is_empty() && is_word != run_word {
+            flush(&mut run, run_word, &mut spans);
+        }
+        run_word = is_word;
+        run.push(ch);
+    }
+    flush(&mut run, run_word, &mut spans);
+    if let Some(c) = comment {
+        spans.push(Span::styled(c, Style::default().fg(Color::DarkGray)));
+    }
+    Line::from(spans)
+}
+
 /// Draw the schema overlay: the focused node's inferred type (TypeScript-style),
 /// scrolled to `schema.scroll`, in the same floating-card style as the other
 /// overlays. Opened by `t`; `y` copies it; closed by `esc`/`q`/`t`.
@@ -2539,16 +2583,9 @@ fn render_schema(f: &mut Frame, area: Rect, view: &View) {
     let total = sc.lines.len();
     let top = sc.scroll.min(total.saturating_sub(inner_h));
     let bottom = (top + inner_h).min(total);
-    // Comments (fill-rate `// %`) are dimmed; the type itself is gray.
     let lines: Vec<Line> = sc.lines[top..bottom]
         .iter()
-        .map(|s| match s.split_once("//") {
-            Some((code, note)) => Line::from(vec![
-                Span::styled(code.to_string(), Style::default().fg(Color::Gray)),
-                Span::styled(format!("//{note}"), Style::default().fg(Color::DarkGray)),
-            ]),
-            None => Line::from(Span::styled(s.clone(), Style::default().fg(Color::Gray))),
-        })
+        .map(|s| highlight_type_line(s))
         .collect();
 
     let title = format!(
