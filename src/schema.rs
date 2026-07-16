@@ -35,8 +35,6 @@ const MAP_KEY_CAP: usize = 32;
 const MAP_MIN_OBJ: usize = 3;
 /// Key-set self-similarity (percent) for an object map.
 const MAP_SIMILARITY_PCT: usize = 70;
-/// Entries at/above which sheer count alone marks a homogeneous object a map.
-const MAP_MANY: usize = 8;
 /// Value-kind homogeneity (percent) required for a map.
 const MAP_RATIO_PCT: usize = 80;
 /// Share (percent) of keys that must be *non-identifier* (data-like) for the
@@ -66,10 +64,11 @@ fn is_ident_key(k: &str) -> bool {
 /// values, values share a shape) rather than a record. Returns the inferred key
 /// type — `Num` when every sampled key parses as a number, else `Str`.
 ///
-/// Three independent triggers, all gated on homogeneous values: **key shape**
-/// (most keys aren't identifiers — catches `{8960: …, 8970: …}` even with a few
-/// entries), **object similarity** (object values with alike key-sets), and
-/// **sheer count** (many uniform entries).
+/// Two triggers, both gated on homogeneous values: **key shape** (most keys
+/// aren't identifiers — catches `{8960: …, 8970: …}` even with a few entries) and
+/// **object similarity** (object values with alike key-sets). Sheer entry count
+/// is deliberately *not* a trigger: a stats record like `{buys_placed: 22464,
+/// tick: …, …}` has many homogeneous numeric fields and would be misread as a map.
 pub fn looks_like_map(b: &[u8], start: usize, end: usize) -> Option<MapKey> {
     let mut n = 0usize;
     let mut kind_counts = [0usize; 5]; // obj, arr, str, num, bool+null
@@ -129,7 +128,7 @@ pub fn looks_like_map(b: &[u8], start: usize, end: usize) -> Option<MapKey> {
     };
     // Key shape: most keys aren't identifiers → they're data.
     let data_keys = n_nonident * 100 >= n * MAP_DATAKEY_PCT;
-    if obj_similar || data_keys || n >= MAP_MANY {
+    if obj_similar || data_keys {
         Some(if n_numeric == n {
             MapKey::Num
         } else {
@@ -551,5 +550,17 @@ mod tests {
         let t = ts(r#"{"x":[1],"y":[2],"z":[3]}"#);
         assert!(t.contains("x: number[]"), "{t}");
         assert!(!t.contains("Record<"), "should not be a map: {t}");
+    }
+
+    #[test]
+    fn stats_record_with_many_numeric_fields_stays_a_record() {
+        // A counters/stats object: many identifier keys, mostly numbers, one nested
+        // map. It must stay a record (the nested `dict` becomes a Record<>).
+        let t = ts(
+            r#"{"buys_placed":22464,"cold_book_skips":75173,"dict":{"AAA":{"v":1},"AAM":{"v":2},"AAT":{"v":3}},"last_update":1784169321396,"sells_placed":177,"signals_blocked":12707811,"thin_book_skips":139091,"tick":19481645}"#,
+        );
+        assert!(t.starts_with('{'), "top must be a record, not a map: {t}");
+        assert!(t.contains("buys_placed: number"), "{t}");
+        assert!(t.contains("dict: Record<string, {"), "{t}");
     }
 }
