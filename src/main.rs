@@ -6,19 +6,23 @@
 //! (windowing). Opening a multi-GB file stays near-constant memory.
 
 mod filter;
+mod input;
 mod scanner;
 mod schema;
 mod search;
 mod source;
+mod stream;
 use filter::{parse_pipeline, Filter, Program};
+use input::TextInput;
 use scanner::{
     container_empty, decode_str, skip_value, skip_ws, value_kind, Cursor, Kind, RawChild, Step,
     MAX_DEPTH,
 };
 use search::{glob_to_regex, Pattern, Search};
 use source::Source;
+use stream::{spawn_reader, take_pipe_reader, StreamStore, STREAM_REBUILD_MS};
 
-use memmap2::{Mmap, MmapOptions};
+use memmap2::Mmap;
 use ratatui::{
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
     layout::{Constraint, Layout, Rect},
@@ -30,12 +34,11 @@ use ratatui::{
 use std::{
     collections::HashSet,
     fs::File,
-    io::{IsTerminal, Read, Write},
+    io::{IsTerminal, Write},
     sync::{
-        mpsc::{self, Receiver, TryRecvError},
+        mpsc::{Receiver, TryRecvError},
         Arc, Weak,
     },
-    thread,
     time::{Duration, Instant},
 };
 
@@ -571,124 +574,6 @@ enum KeyOutcome {
     /// Deferred to the run loop because spawning the worker needs an owned byte
     /// `Source` (a fixed mmap for files, a fresh snapshot for streams).
     LaunchFilter,
-}
-
-/// A single-line editable text field — the model behind the `/`, `:`, and `|`
-/// prompts. It tracks a caret so the prompts support real in-place editing
-/// (arrow keys, Home/End, delete-forward, word/line kill) instead of the old
-/// append-only "type at the end, backspace off the end".
-#[derive(Default)]
-struct TextInput {
-    text: String,
-    /// Caret as a byte offset into `text`, always on a char boundary and in
-    /// `0..=text.len()`; equal to `text.len()` at the end of the line.
-    caret: usize,
-}
-
-impl TextInput {
-    fn as_str(&self) -> &str {
-        &self.text
-    }
-    fn is_empty(&self) -> bool {
-        self.text.is_empty()
-    }
-    fn clear(&mut self) {
-        self.text.clear();
-        self.caret = 0;
-    }
-    /// Insert a char at the caret and step over it.
-    fn insert(&mut self, c: char) {
-        self.text.insert(self.caret, c);
-        self.caret += c.len_utf8();
-    }
-    /// Delete the char before the caret (Backspace); no-op at the start.
-    fn backspace(&mut self) {
-        if let Some(c) = self.text[..self.caret].chars().next_back() {
-            self.caret -= c.len_utf8();
-            self.text.remove(self.caret);
-        }
-    }
-    /// Delete the char at the caret (Delete); no-op at the end.
-    fn delete(&mut self) {
-        if self.caret < self.text.len() {
-            self.text.remove(self.caret);
-        }
-    }
-    fn left(&mut self) {
-        if let Some(c) = self.text[..self.caret].chars().next_back() {
-            self.caret -= c.len_utf8();
-        }
-    }
-    fn right(&mut self) {
-        if let Some(c) = self.text[self.caret..].chars().next() {
-            self.caret += c.len_utf8();
-        }
-    }
-    fn home(&mut self) {
-        self.caret = 0;
-    }
-    fn end(&mut self) {
-        self.caret = self.text.len();
-    }
-    /// Delete the word before the caret (Ctrl-W): trailing spaces, then the run
-    /// of non-spaces up to the previous boundary.
-    fn delete_word(&mut self) {
-        let head = self.text[..self.caret].trim_end_matches(' ');
-        let cut = head.rfind(' ').map_or(0, |i| i + 1);
-        self.text.replace_range(cut..self.caret, "");
-        self.caret = cut;
-    }
-    /// Delete everything before the caret (Ctrl-U).
-    fn clear_to_start(&mut self) {
-        self.text.replace_range(..self.caret, "");
-        self.caret = 0;
-    }
-    /// Delete everything from the caret to the end (Ctrl-K).
-    fn kill_to_end(&mut self) {
-        self.text.truncate(self.caret);
-    }
-    /// Apply one line-editing key. Returns `Some(changed)` when `code` is an
-    /// editing/navigation key (`changed` = whether the text was modified; caret
-    /// moves count as handled-but-unchanged), or `None` when the key isn't ours
-    /// (Enter/Esc/Up/Down — the caller decides those).
-    fn edit(&mut self, code: KeyCode, ctrl: bool) -> Option<bool> {
-        match code {
-            KeyCode::Char(c) if ctrl => match c {
-                'a' => Some(self.moved(Self::home)),
-                'e' => Some(self.moved(Self::end)),
-                'b' => Some(self.moved(Self::left)),
-                'f' => Some(self.moved(Self::right)),
-                'h' => Some(self.changed(Self::backspace)),
-                'd' => Some(self.changed(Self::delete)),
-                'w' => Some(self.changed(Self::delete_word)),
-                'u' => Some(self.changed(Self::clear_to_start)),
-                'k' => Some(self.changed(Self::kill_to_end)),
-                _ => None,
-            },
-            KeyCode::Char(c) => {
-                self.insert(c);
-                Some(true)
-            }
-            KeyCode::Backspace => Some(self.changed(Self::backspace)),
-            KeyCode::Delete => Some(self.changed(Self::delete)),
-            KeyCode::Left => Some(self.moved(Self::left)),
-            KeyCode::Right => Some(self.moved(Self::right)),
-            KeyCode::Home => Some(self.moved(Self::home)),
-            KeyCode::End => Some(self.moved(Self::end)),
-            _ => None,
-        }
-    }
-    /// Run a caret move; always reports "unchanged" (text is untouched).
-    fn moved(&mut self, f: impl FnOnce(&mut Self)) -> bool {
-        f(self);
-        false
-    }
-    /// Run an edit and report whether it actually changed the text.
-    fn changed(&mut self, f: impl FnOnce(&mut Self)) -> bool {
-        let before = self.text.len();
-        f(self);
-        self.text.len() != before
-    }
 }
 
 /// A search scope: the focused container's subtree, captured when the `/` prompt
@@ -3341,157 +3226,9 @@ fn run(
     }
 }
 
-/// How often a growing stream is re-parsed into the tree. Short enough to feel
-/// live, long enough not to thrash on a fast pipe.
-const STREAM_REBUILD_MS: u128 = 100;
-
 /// The streaming loop: bytes arrive on `rx` from the reader thread, the buffer
 /// grows, and the tree is re-parsed on a throttle (preserving cursor/expansion).
 /// Search snapshots the buffer at launch (so it covers the bytes parsed so far).
-/// The growing byte store behind a streamed (piped) document.
-///
-/// A pipe can't be mmap'd directly, but its bytes can be spilled to a temp file
-/// and *that* mmap'd — so the document lives in evictable, file-backed page
-/// cache instead of resident anonymous RAM, and RSS stays ~flat however large
-/// the stream (the same property the file path has). The temp file is unlinked
-/// the instant it's opened: it has no name on disk, the open fd keeps the inode
-/// alive, and the OS reclaims the space when jview exits — cleanly, even on a
-/// panic or `SIGKILL`. Where spilling isn't available (non-unix, or no writable
-/// temp dir) it falls back to an in-RAM `Vec`, the fully-resident behaviour.
-enum StreamStore {
-    /// Spilled to an unlinked temp file, mmap'd and re-mapped as it grows. Old
-    /// mappings stay valid because a stream only ever appends.
-    Spilled {
-        /// Read+append handle to the unlinked file; keeps the inode alive.
-        file: File,
-        /// Current mapping over the first `len` bytes, refreshed on growth.
-        map: Option<Mmap>,
-        /// Bytes durably written so far (`<= file size`; a partial failed write
-        /// is never counted, so the mapped prefix is always consistent).
-        len: usize,
-    },
-    /// In-RAM fallback: the whole document is resident.
-    Ram(Vec<u8>),
-}
-
-impl StreamStore {
-    /// Spill to a temp file where possible, else buffer in RAM.
-    fn new() -> StreamStore {
-        #[cfg(unix)]
-        if let Some(s) = Self::try_spill() {
-            return s;
-        }
-        StreamStore::Ram(Vec::new())
-    }
-
-    /// Create an unlinked temp file to spill into. `None` if no temp file could
-    /// be opened (read-only temp dir, etc.) — the caller falls back to RAM.
-    #[cfg(unix)]
-    fn try_spill() -> Option<StreamStore> {
-        use std::fs::OpenOptions;
-        let dir = std::env::temp_dir();
-        // A per-process name; unlinked immediately, so a collision only happens
-        // if a prior run was killed in the microseconds before its own unlink —
-        // try a few suffixes to be safe.
-        for n in 0..8 {
-            let path = dir.join(format!("jview-stream-{}-{}.json", std::process::id(), n));
-            if let Ok(file) = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .create_new(true)
-                .open(&path)
-            {
-                // Unlink now: no directory entry to clean up, so the space is
-                // reclaimed on exit however jview dies. The fd (and any mmap of
-                // it) keeps the bytes readable meanwhile.
-                let _ = std::fs::remove_file(&path);
-                return Some(StreamStore::Spilled {
-                    file,
-                    map: None,
-                    len: 0,
-                });
-            }
-        }
-        None
-    }
-
-    /// Append a freshly-read chunk. Best-effort on a spill write failure (disk
-    /// full): `len` simply doesn't advance, so the mapped prefix stays valid and
-    /// the view just stops growing rather than crashing.
-    fn append(&mut self, chunk: &[u8]) {
-        match self {
-            StreamStore::Spilled { file, len, .. } => {
-                if file.write_all(chunk).is_ok() {
-                    *len += chunk.len();
-                }
-            }
-            StreamStore::Ram(v) => v.extend_from_slice(chunk),
-        }
-    }
-
-    /// Refresh the mapping so [`bytes`](Self::bytes) covers everything appended
-    /// so far. Cheap and zero-copy (mmap sets up page tables lazily); a failure
-    /// keeps the previous, shorter map and is retried next tick.
-    fn sync(&mut self) {
-        if let StreamStore::Spilled { file, map, len } = self {
-            if *len > 0 && map.as_ref().map_or(0, |m| m.len()) != *len {
-                if let Ok(m) = unsafe { MmapOptions::new().len(*len).map(&*file) } {
-                    *map = Some(m);
-                }
-            }
-        }
-    }
-
-    /// The document bytes parsed/rendered this frame.
-    fn bytes(&self) -> &[u8] {
-        match self {
-            StreamStore::Spilled { map, len, .. } => match map {
-                Some(m) => &m[..(*len).min(m.len())],
-                None => &[],
-            },
-            StreamStore::Ram(v) => v,
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            StreamStore::Spilled { len, .. } => *len,
-            StreamStore::Ram(v) => v.len(),
-        }
-    }
-
-    /// Hand a search/filter worker an owned `Source` over the bytes arrived so
-    /// far, reusing the last one when the store hasn't grown since.
-    ///
-    /// The worker outlives this frame, so it needs an owned source. For a spill
-    /// that's a fresh mmap of the same file — zero-copy; for the RAM fallback
-    /// it's an unavoidable buffer copy. Either way, because a stream only
-    /// appends, a source of length N stays a byte-identical prefix of any longer
-    /// store: while `cache` still points at a live source of the current length
-    /// we hand back the same `Arc` (search relaunches once per keystroke, so
-    /// this collapses per-character work to per-growth). The cache is weak, so
-    /// the source is freed the moment the last worker drops it.
-    fn snapshot(&self, cache: &mut Weak<Source>) -> Arc<Source> {
-        let len = self.len();
-        if let Some(snap) = cache.upgrade() {
-            if snap.len() == len {
-                return snap;
-            }
-        }
-        let snap = match self {
-            StreamStore::Spilled { file, len, .. } if *len > 0 => {
-                match unsafe { MmapOptions::new().len(*len).map(file) } {
-                    Ok(m) => Arc::new(Source::Mapped(m)),
-                    Err(_) => Arc::new(Source::Buffered(self.bytes().to_vec())),
-                }
-            }
-            _ => Arc::new(Source::Buffered(self.bytes().to_vec())),
-        };
-        *cache = Arc::downgrade(&snap);
-        snap
-    }
-}
-
 fn run_stream(
     term: &mut ratatui::DefaultTerminal,
     app: &mut App,
@@ -3597,84 +3334,6 @@ fn sniff_multi(b: &[u8]) -> bool {
     }
     let after = skip_value(b, i, b.len());
     skip_ws(b, after, b.len()) < b.len()
-}
-
-/// Point fd 0 back at the real terminal so crossterm reads keys from it (the
-/// reader thread keeps its own dup'd handle to the pipe for the JSON).
-///
-/// crossterm's own fallback — open `/dev/tty` when stdin isn't a tty — is fatal
-/// on macOS: a `/dev/tty` fd can't be registered with kqueue (it returns
-/// EINVAL), so the key-event reader never initializes and the first keypress
-/// errors out. The actual terminal device *can* be registered, so resolve its
-/// path via `ttyname()` on stdout/stderr (still ttys here — only stdin was
-/// piped), open it read-write, and dup it over stdin. Then `isatty(0)` is true,
-/// crossterm uses fd 0 directly, and kqueue accepts it. Linux's `/dev/tty` is
-/// pollable so this is redundant there, but it's harmless.
-#[cfg(unix)]
-fn reattach_terminal_to_stdin() {
-    unsafe {
-        for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
-            if libc::isatty(fd) != 1 {
-                continue;
-            }
-            let name = libc::ttyname(fd);
-            if name.is_null() {
-                continue;
-            }
-            let f = libc::open(name, libc::O_RDWR);
-            if f >= 0 {
-                libc::dup2(f, libc::STDIN_FILENO);
-                if f != libc::STDIN_FILENO {
-                    libc::close(f);
-                }
-                return;
-            }
-        }
-    }
-}
-
-/// Hand back a readable handle to the piped stdin for the background reader.
-///
-/// On unix the reader needs its own fd because we hand fd 0 back to the
-/// terminal (see `reattach_terminal_to_stdin`): dup the pipe first, then
-/// reattach. On Windows, crossterm reads keys from the console (not stdin), so
-/// the reader can just take stdin directly.
-#[cfg(unix)]
-fn take_pipe_reader() -> Box<dyn Read + Send> {
-    use std::os::fd::FromRawFd;
-    unsafe {
-        let dup = libc::dup(libc::STDIN_FILENO);
-        reattach_terminal_to_stdin();
-        Box::new(File::from_raw_fd(dup))
-    }
-}
-
-#[cfg(not(unix))]
-fn take_pipe_reader() -> Box<dyn Read + Send> {
-    Box::new(std::io::stdin())
-}
-
-/// Read the pipe in chunks on a background thread, streaming each to the UI loop
-/// over a channel. The thread ends (and the channel disconnects, signalling EOF)
-/// when the pipe closes or the receiver is dropped.
-fn spawn_reader(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
-                        break; // receiver gone — viewer quit
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    });
-    rx
 }
 
 /// Ask the terminal to report modifiers on keys it normally wouldn't (so
