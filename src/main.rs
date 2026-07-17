@@ -15,15 +15,15 @@ mod stream;
 mod tree;
 mod ui;
 use filter::{parse_pipeline, Filter, Program};
-use input::TextInput;
+use input::{History, TextInput};
 use scanner::{container_empty, decode_str, skip_value, skip_ws, Kind};
 use search::{Pattern, Search};
 use source::Source;
 use stream::{spawn_reader, take_pipe_reader, StreamStore, STREAM_REBUILD_MS};
 use tree::{
-    breadcrumb_segments, collect_expanded, count_children, expand_to, flatten, get, get_mut,
-    join_path, make_root, make_subroot, parse_path, resolve_with_climb, set_expanded, truncate,
-    Node, Row,
+    aggregate_numbers, breadcrumb_segments, collect_expanded, count_children, expand_to, flatten,
+    get, get_mut, join_path, make_root, make_subroot, parse_path, resolve_with_climb, set_expanded,
+    truncate, Node, Row,
 };
 
 use memmap2::Mmap;
@@ -732,6 +732,11 @@ pub(crate) struct App {
     /// A filter awaiting launch: stashed by the `|` prompt, consumed by the run
     /// loop (which has the owned byte `Source` the worker needs).
     pub(crate) pending_filter: Option<PendingFilter>,
+    /// Session-scoped recall rings for the `:` and `|` prompts: `↑`/`↓` walk past
+    /// submissions so a long path or filter can be tweaked instead of retyped.
+    /// Shared across panes (history is a user habit, not a per-pane thing).
+    pub(crate) goto_history: History,
+    pub(crate) filter_history: History,
 }
 
 /// A parsed, ready-to-run filter plus the pane range it should evaluate over.
@@ -758,6 +763,8 @@ impl App {
             extract: None,
             extract_batch: None,
             pending_filter: None,
+            goto_history: History::default(),
+            filter_history: History::default(),
         }
     }
 
@@ -1161,6 +1168,7 @@ fn process_key(
                 v.goto.clear();
             }
             KeyCode::Enter => {
+                let entry = app.active_view().goto.as_str().trim().to_string();
                 let msg = {
                     let v = app.active_mut();
                     let msg = v.goto_path(b);
@@ -1168,7 +1176,21 @@ fn process_key(
                     v.goto.clear();
                     msg
                 };
+                app.goto_history.record(&entry);
                 app.flash = Some(msg);
+            }
+            // ↑/↓ recall past `:` jumps (dead keys otherwise) so a long path can
+            // be tweaked instead of retyped.
+            KeyCode::Up => {
+                let cur = app.active_view().goto.as_str().to_string();
+                if let Some(s) = app.goto_history.prev(&cur) {
+                    app.active_mut().goto.set(s);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(s) = app.goto_history.next() {
+                    app.active_mut().goto.set(s);
+                }
             }
             other => {
                 app.active_mut().goto.edit(other, ctrl);
@@ -1201,6 +1223,7 @@ fn process_key(
                             let r = &app.active_view().root;
                             (r.start, r.end, r.kind, r.jsonl)
                         };
+                        app.filter_history.record(&expr);
                         app.pending_filter = Some(PendingFilter {
                             program,
                             expr,
@@ -1216,6 +1239,23 @@ fn process_key(
                         return KeyOutcome::LaunchFilter;
                     }
                     Err(e) => app.active_mut().filter_error = Some(e),
+                }
+            }
+            // ↑/↓ recall past `|` filters (dead keys otherwise); loading one
+            // clears any stale parse error from the previous attempt.
+            KeyCode::Up => {
+                let cur = app.active_view().filter_query.as_str().to_string();
+                if let Some(s) = app.filter_history.prev(&cur) {
+                    let v = app.active_mut();
+                    v.filter_query.set(s);
+                    v.filter_error = None;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(s) = app.filter_history.next() {
+                    let v = app.active_mut();
+                    v.filter_query.set(s);
+                    v.filter_error = None;
                 }
             }
             other => {
@@ -1414,6 +1454,39 @@ fn process_key(
             }
             return KeyOutcome::Continue;
         }
+        // `#` aggregates the focused container's direct numeric children —
+        // count/sum/min/max/mean — the numeric companion to `c` and `t`.
+        KeyCode::Char('#') => {
+            let v = app.active_view();
+            let msg = v.rows.get(v.focus).map(|row| {
+                let node = get(&v.root, &row.path);
+                match aggregate_numbers(node, b) {
+                    None => format!("{}: not a container", row.label),
+                    Some(s) if s.count == 0 => format!("{}: no numbers", row.label),
+                    Some(s) => {
+                        // Note when some children were skipped, so the stats
+                        // aren't mistaken for covering the whole container.
+                        let scope = if s.count == s.total {
+                            format!("{} numbers", group(s.count))
+                        } else {
+                            format!("{} of {} numeric", group(s.count), group(s.total))
+                        };
+                        format!(
+                            "{}: {scope} · Σ {} · min {} · max {} · avg {}",
+                            row.label,
+                            fmt_f64(s.sum),
+                            fmt_f64(s.min),
+                            fmt_f64(s.max),
+                            fmt_f64(s.mean()),
+                        )
+                    }
+                }
+            });
+            if let Some(m) = msg {
+                app.flash = Some(m);
+            }
+            return KeyOutcome::Continue;
+        }
         // `t` shows the focused container's shape: a sampled field→type summary.
         // `t` infers the focused node's structural type (JSON→TypeScript-style).
         KeyCode::Char('t') => {
@@ -1445,6 +1518,7 @@ fn process_key(
         // `:` opens the path-jump prompt; `m` bookmarks the focused node; `'`
         // opens the bookmark picker.
         KeyCode::Char(':') => {
+            app.goto_history.reset();
             let v = app.active_mut();
             v.mode = Mode::Goto;
             v.goto.clear();
@@ -1452,6 +1526,7 @@ fn process_key(
         }
         // `|` opens the jq-style filter prompt; Enter opens a result pane.
         KeyCode::Char('|') => {
+            app.filter_history.reset();
             let v = app.active_mut();
             v.mode = Mode::Filter;
             v.filter_query.clear();
@@ -1573,6 +1648,48 @@ fn group(n: usize) -> String {
             out.push(',');
         }
         out.push(c as char);
+    }
+    out
+}
+
+/// Format an aggregate value for the `=` status line: whole numbers get
+/// thousands grouping (`1,234,567`), fractional ones a few trimmed decimals
+/// (`4,321.5`), and the non-finite edges a short word instead of `inf`/`NaN`.
+fn fmt_f64(x: f64) -> String {
+    if !x.is_finite() {
+        return if x.is_nan() {
+            "NaN".into()
+        } else if x > 0.0 {
+            "∞".into()
+        } else {
+            "-∞".into()
+        };
+    }
+    // Integers (and values rounding to one within f64's exact-integer range)
+    // read best grouped without a decimal point.
+    if x.fract() == 0.0 && x.abs() < 9.007_199_254_740_992e15 {
+        let mag = group(x.abs() as usize);
+        return if x.is_sign_negative() {
+            format!("-{mag}")
+        } else {
+            mag
+        };
+    }
+    // Otherwise up to 3 decimals, trailing zeros trimmed, integer part grouped.
+    let rounded = format!("{x:.3}");
+    let (int, frac) = rounded.split_once('.').unwrap_or((rounded.as_str(), ""));
+    let neg = int.starts_with('-');
+    let int_abs = int.trim_start_matches('-');
+    let grouped = group(int_abs.parse::<usize>().unwrap_or(0));
+    let frac = frac.trim_end_matches('0');
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    out.push_str(&grouped);
+    if !frac.is_empty() {
+        out.push('.');
+        out.push_str(frac);
     }
     out
 }

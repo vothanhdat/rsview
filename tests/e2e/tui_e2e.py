@@ -179,6 +179,44 @@ def scenario_line_editing(binary):
         t.close()
 
 
+def scenario_aggregate_and_history(binary):
+    print("aggregate (#) + prompt history recall (:/| ↑↓)")
+    t = Tui(binary, {"prices": [10, 20, 30], "gamma": 2})
+    try:
+        # `#` summarizes a container's direct numeric children in the footer.
+        t.send(":"); t.send("prices"); t.send("\r")   # focus the array (records it)
+        t.send("#")
+        foot = t.footer()
+        check("# reports count/sum/min/max/avg",
+              "3 numbers" in foot and "60" in foot and "min 10" in foot
+              and "max 30" in foot and "avg 20" in foot, t)
+
+        # Reopen `:` and press ↑ — the submitted "prices" comes back.
+        t.send(":")
+        t.send("\x1b[A")                              # ↑  → recall newest
+        check("↑ in : recalls the last jump",
+              "prices" in t.footer(), t)
+        # Type a fresh draft, ↑ (stash it + show history), ↓ (restore the draft).
+        t.send("\x1b"); t.send(":")
+        t.send("draft")
+        t.send("\x1b[A")                              # ↑  → "prices", draft stashed
+        check("↑ replaces the draft with history",
+              "prices" in t.footer() and "draft" not in t.footer(), t)
+        t.send("\x1b[B")                              # ↓  → back past newest = draft
+        check("↓ past the newest restores the draft",
+              "draft" in t.footer(), t)
+        t.send("\x1b")                                # cancel
+
+        # The `|` filter prompt has its own recall ring.
+        t.send("|"); t.send(".gamma"); t.send("\r")   # run a filter (records it)
+        t.send("|"); t.send("\x1b[A")                 # reopen, ↑ recalls ".gamma"
+        check("↑ in | recalls the last filter",
+              ".gamma" in t.footer(), t)
+        t.send("\x1b")
+    finally:
+        t.close()
+
+
 def scenario_sibling_nav(binary):
     print("siblings: J / K step over subtrees")
     t = Tui(binary, {"events": [
@@ -455,6 +493,7 @@ def main():
 
     scenario_jump_relative_and_climb(binary)
     scenario_line_editing(binary)
+    scenario_aggregate_and_history(binary)
     scenario_sibling_nav(binary)
     scenario_filter(binary)
     scenario_peek(binary)

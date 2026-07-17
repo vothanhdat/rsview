@@ -773,6 +773,60 @@ pub fn count_children(node: &Node, b: &[u8]) -> Option<usize> {
     Some(n)
 }
 
+/// Count / sum / min / max / mean of a container's **direct** numeric children.
+/// The numeric companion to [`count_children`] (`c`) and `t` (type): "what's in
+/// this array of numbers?" without materializing it. See [`aggregate_numbers`].
+pub struct NumStats {
+    /// Direct children that parsed as a JSON number.
+    pub count: usize,
+    /// All direct children scanned (so the caller can say "12 of 20 numeric").
+    pub total: usize,
+    pub sum: f64,
+    pub min: f64,
+    pub max: f64,
+}
+
+impl NumStats {
+    pub fn mean(&self) -> f64 {
+        self.sum / self.count as f64
+    }
+}
+
+/// Summarize a container's **direct** numeric children in one streaming pass —
+/// the same resumable walk `c` (count) does, accumulating the values that parse
+/// as JSON numbers into an `f64` running total/min/max instead of copying
+/// anything (so it stays constant-memory over a huge array). Non-numbers are
+/// counted in `total` but skipped; `None` for a scalar (not a container), and
+/// `count == 0` when a container holds no numbers.
+pub fn aggregate_numbers(node: &Node, b: &[u8]) -> Option<NumStats> {
+    if !node.jsonl && !matches!(node.kind, Kind::Object | Kind::Array) {
+        return None;
+    }
+    let mut cur = node.make_cursor();
+    let mut s = NumStats {
+        count: 0,
+        total: 0,
+        sum: 0.0,
+        min: f64::INFINITY,
+        max: f64::NEG_INFINITY,
+    };
+    while let Some(rc) = cur.next(b) {
+        s.total += 1;
+        if rc.kind == Kind::Number {
+            if let Some(x) = std::str::from_utf8(&b[rc.start..rc.end])
+                .ok()
+                .and_then(|t| t.trim().parse::<f64>().ok())
+            {
+                s.count += 1;
+                s.sum += x;
+                s.min = s.min.min(x);
+                s.max = s.max.max(x);
+            }
+        }
+    }
+    Some(s)
+}
+
 /// The label/is-index pairs from the root down to `path`, for the focus
 /// breadcrumb and split-pane titles.
 pub fn breadcrumb_segments(root: &Node, path: &[usize]) -> Vec<(String, bool)> {
@@ -786,4 +840,50 @@ pub fn breadcrumb_segments(root: &Node, path: &[usize]) -> Vec<(String, bool)> {
         out.push((n.label.clone(), n.is_index));
     }
     out
+}
+
+#[cfg(test)]
+mod agg_tests {
+    use super::{aggregate_numbers, make_root};
+
+    fn stats(json: &str) -> Option<(usize, usize, f64, f64, f64, f64)> {
+        let root = make_root(json.as_bytes(), "root", false);
+        aggregate_numbers(&root, json.as_bytes())
+            .map(|s| (s.count, s.total, s.sum, s.min, s.max, s.mean()))
+    }
+
+    #[test]
+    fn sums_a_plain_number_array() {
+        let (count, total, sum, min, max, mean) = stats("[1, 2, 3, 4]").unwrap();
+        assert_eq!((count, total), (4, 4));
+        assert_eq!((sum, min, max, mean), (10.0, 1.0, 4.0, 2.5));
+    }
+
+    #[test]
+    fn skips_non_numeric_children_but_counts_them_in_total() {
+        // Two numbers, two non-numbers among four direct children.
+        let (count, total, sum, min, max, _) = stats(r#"[1, "x", true, 5]"#).unwrap();
+        assert_eq!((count, total), (2, 4));
+        assert_eq!((sum, min, max), (6.0, 1.0, 5.0));
+    }
+
+    #[test]
+    fn aggregates_object_values_and_handles_negatives_and_floats() {
+        let (count, sum, min, max) = stats(r#"{"a": -1.5, "b": 2.5, "c": 10}"#)
+            .map(|(c, _, s, mn, mx, _)| (c, s, mn, mx))
+            .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!((sum, min, max), (11.0, -1.5, 10.0));
+    }
+
+    #[test]
+    fn no_numbers_reports_zero_count() {
+        let (count, total, ..) = stats(r#"["a", "b"]"#).unwrap();
+        assert_eq!((count, total), (0, 2));
+    }
+
+    #[test]
+    fn scalar_is_not_a_container() {
+        assert!(stats("42").is_none());
+    }
 }

@@ -62,7 +62,7 @@ From a checkout: `cargo run --release -- file.json`.
 | `g`, `Home` | top |
 | `Enter`/`→`/`Space` | expand / collapse a container — or peek a leaf's full value |
 | `←` | collapse, or jump to parent if already collapsed |
-| `t` · `c` | infer the value's type (TypeScript-style; `y` copies it) · count a container's children |
+| `t` · `c` · `#` | infer the value's type (TypeScript-style; `y` copies it) · count a container's children · aggregate its numeric children (count/sum/min/max/mean) |
 | `/` | search (live — results stream as you type; `Tab` scopes it to the focused subtree) |
 | `Enter`/`↓` · `Shift-Enter`/`↑` (in search) | next / previous match |
 | `:` | jump to a path — absolute or relative to the cursor |
@@ -83,7 +83,10 @@ the richer ones:
   jump to the ends, `Backspace`/`Delete` remove either side of it, and
   `Ctrl-W`/`Ctrl-U`/`Ctrl-K` delete the previous word / to the start / to the end.
   Editing anywhere in a `/` query re-runs the live search; moving the caret alone
-  doesn't.
+  doesn't. In the `:` and `|` prompts, `↑`/`↓` walk a **history** of the paths and
+  filters you've submitted this session, so a long one can be recalled and tweaked
+  instead of retyped (a half-typed line is stashed and comes back when you arrow
+  past the newest entry).
 - **Jump (`:`)** — type a path, **absolute** (`data.users[3].city`; leading `$`
   optional, `["odd.key"]` brackets allowed) or **relative** to the cursor,
   Python-import style: `.actor` descends, `..sibling` climbs to the parent, `...x`
@@ -119,6 +122,13 @@ the richer ones:
   inference lives in its own module, [src/schema.rs](src/schema.rs).
 - **Count (`c`)** — a container's exact child count (`1,234,567 elements`), a full
   scan but on demand, so you can size a collapsed level without opening it.
+- **Aggregate (`#`)** — the numeric companion to `c`: a one-line **count · sum ·
+  min · max · mean** of the focused container's *direct* numeric children, in the
+  same streaming pass (it accumulates into an `f64`, never materializing the
+  array, so it stays constant-memory on a huge one). Non-numbers are skipped and
+  the footer notes when only some children counted (`12 of 20 numeric`). Pairs
+  naturally with the `|` filter: `.[].price` into a result pane, then `#` to total
+  it.
 - **Search (`/`)** — plain queries are case-insensitive substring matches (the
   default). Prefix with `re:` for a full regex (`re:^id_\w+$`) or `g:` for a
   glob (`g:user*`); a bad pattern shows `(bad pattern: …)` in the footer so you

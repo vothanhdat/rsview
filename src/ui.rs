@@ -328,6 +328,7 @@ pub(crate) fn render_help(f: &mut Frame, area: Rect) {
         ("wheel", "scroll the pane"),
         ("t", "infer type (TS) · y copy"),
         ("c", "count children"),
+        ("#", "aggregate numbers (Σ min/max/avg)"),
         ("/", "search · ⇥ scope subtree"),
         ("↵  ⇧↵", "next / prev match"),
         (":", "jump to a path · *? in keys"),
