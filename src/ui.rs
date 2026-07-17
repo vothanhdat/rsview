@@ -633,10 +633,35 @@ pub(crate) fn render_schema(f: &mut Frame, area: Rect, view: &View) {
     let Some(sc) = view.schema.as_ref() else {
         return;
     };
-    let (rect, _inner_w, inner_h) = peek_layout(area);
+    // The peek card is near-full-screen, right for a long scalar but oversized for
+    // a schema — usually a few short type lines. Use the peek box only as an upper
+    // bound and shrink the card to fit its content, so a small type gets a small
+    // card and only a large one grows toward full-screen.
+    let (max_rect, max_inner_w, max_inner_h) = peek_layout(area);
     let panel_bg = Color::Indexed(236);
 
     let total = sc.lines.len();
+    let content_w = sc
+        .lines
+        .iter()
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0);
+    // Floor the width so the title chrome (" type · … · esc ") mostly fits, cap it
+    // at the peek bound. Height fits every line up to the same bound.
+    let title_w = sc.title.chars().count() + 38;
+    let inner_w = content_w.max(title_w.min(62)).clamp(1, max_inner_w);
+    let inner_h = total.clamp(1, max_inner_h);
+    let w = (inner_w as u16 + 2).min(max_rect.width);
+    let h = (inner_h as u16 + 2).min(max_rect.height);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    let inner_h = h.saturating_sub(2) as usize;
+
     let top = sc.scroll.min(total.saturating_sub(inner_h));
     let bottom = (top + inner_h).min(total);
     let lines: Vec<Line> = sc.lines[top..bottom]

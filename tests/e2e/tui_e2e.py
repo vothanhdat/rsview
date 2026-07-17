@@ -101,6 +101,20 @@ class Tui:
     def dump(self):
         return "\n".join(self.line(y) for y in range(ROWS))
 
+    def card(self):
+        """Text inside the floating overlay box only (between its border rows).
+
+        Overlays shrink to fit their content, so the surrounding tree stays
+        visible around a small card — use this, not dump(), when an assertion
+        means "…is (not) in the overlay" rather than "…anywhere on screen".
+        """
+        rows = [self.line(y) for y in range(ROWS)]
+        top = next((i for i, r in enumerate(rows) if "┌" in r), None)
+        bot = next((i for i in range(ROWS - 1, -1, -1) if "└" in rows[i]), None)
+        if top is None or bot is None or bot < top:
+            return self.dump()
+        return "\n".join(rows[top : bot + 1])
+
     def close(self):
         try:
             os.write(self.fd, b"q")
@@ -424,7 +438,7 @@ def scenario_explore(binary):
         # A data-keyed object becomes Record<string, V> — values, not keys.
         t.send(":"); t.send("prices"); t.send("\r")
         t.send("t")
-        m = t.dump()
+        m = t.card()
         check("a data-keyed object infers as Record<string, …>",
               "Record<string, {" in m, t)
         check("the map's value fields are inferred, not its data keys",
