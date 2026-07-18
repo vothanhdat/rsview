@@ -218,10 +218,23 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Optio
             Style::default().fg(Color::Green),
         ))
     } else {
-        Line::from(Span::styled(
+        let mut spans = vec![Span::styled(
             " ↑/↓ move · enter expand · / search · : goto · | filter · y copy · ? help · q quit",
             Style::default().fg(Color::DarkGray),
-        ))
+        )];
+        // When the active pane has bookmarks, surface the count as a status —
+        // styled with the same `▎` bar as the marked rows (the `'` key that opens
+        // the picker lives in the `?` help overlay). Kept short so it fits beside
+        // the key hints on a narrow (~100-col) terminal.
+        let n = view.bookmarks.len();
+        if n > 0 {
+            let noun = if n == 1 { "bookmark" } else { "bookmarks" };
+            spans.push(Span::styled(
+                format!(" · ▎ {n} {noun}"),
+                Style::default().fg(C_BOOKMARK),
+            ));
+        }
+        Line::from(spans)
     };
     f.render_widget(Paragraph::new(line), area);
 }

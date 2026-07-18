@@ -504,6 +504,8 @@ def scenario_bookmark_indicator(binary):
     t = Tui(binary, {"alpha": 1, "beta": 2, "gamma": 3})
     try:
         check("no ▎ before anything is bookmarked", "▎" not in t.dump(), t)
+        check("footer has no bookmark status when there are none",
+              "bookmark" not in t.footer(), t)
         t.send("j")  # step off the root onto the alpha child
         t.send("m")  # bookmark the focused row (alpha)
         rows = [t.line(y) for y in range(ROWS)]
@@ -512,11 +514,24 @@ def scenario_bookmark_indicator(binary):
               "▎" in starred and "alpha" in starred, t)
         check("only the bookmarked row is marked",
               sum("▎" in r for r in rows) == 1, t)
-        t.send("j")  # move focus to beta; alpha keeps its bar
+        # `m` leaves a flash ("bookmarked alpha") in the footer; the next key
+        # dismisses it, revealing the persistent bookmark-count status.
+        t.send("j")  # move focus to beta (clears the flash); alpha keeps its bar
         check("▎ persists on alpha after focus moves away", "▎" in t.dump(), t)
-        t.send("k"); t.send("m")  # back to alpha, toggle it off
-        check("▎ is removed when the bookmark is toggled off",
-              "▎" not in t.dump(), t)
+        check("footer shows the bookmark count once one exists",
+              "▎ 1 bookmark" in t.footer(), t)
+        t.send("m")  # bookmark beta too
+        t.send("k")  # move up (clears flash) → count pluralizes
+        check("footer pluralizes with two bookmarks",
+              "2 bookmarks" in t.footer(), t)
+        t.send("m")  # toggle alpha (current focus) off
+        t.send("j")  # move to beta (clears flash) → back to one
+        check("▎ still shown and footer back to one after removing one",
+              "▎" in t.dump() and "1 bookmark" in t.footer(), t)
+        t.send("m")  # remove the last bookmark (beta)
+        t.send("k")  # move up (clears flash) → status clears entirely
+        check("footer bookmark status clears when none remain",
+              "▎" not in t.dump() and "bookmark" not in t.footer(), t)
     finally:
         t.close()
 
