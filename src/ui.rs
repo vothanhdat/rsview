@@ -23,7 +23,8 @@ const C_STR: Color = Color::Green; // string values
 const C_NUM: Color = Color::Yellow; // numbers
 const C_BOOL: Color = Color::Magenta; // true / false
 const C_PUNCT: Color = Color::DarkGray; // braces, colon, markers, previews
-const C_BOOKMARK: Color = Color::LightYellow; // the `★` gutter marker on bookmarked rows
+const C_BOOKMARK: Color = Color::LightYellow; // the `▎` gutter bar on bookmarked rows
+const C_BOOKMARK_BG: Color = Color::Indexed(237); // faint row tint behind a bookmarked line
 
 /// The foreground color for a value of the given kind.
 pub(crate) fn value_color(kind: Kind) -> Color {
@@ -762,6 +763,7 @@ pub(crate) fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, 
         .and_then(|s| s.matches.get(view.match_idx));
 
     let h = chunks[1].height as usize;
+    let width = chunks[1].width as usize;
     let mut lines = Vec::new();
     let end = (view.scroll + h).min(view.rows.len());
     for i in view.scroll..end {
@@ -779,11 +781,12 @@ pub(crate) fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, 
             )));
             continue;
         }
-        // A one-column gutter carries the `★` bookmark marker (a space when the
-        // row isn't bookmarked) so bookmarked nodes are visible at a glance and
-        // every row stays aligned whether or not it's marked.
+        // A one-column gutter carries the `▎` bookmark bar (a space when the row
+        // isn't bookmarked) so bookmarked nodes are visible at a glance and every
+        // row stays aligned whether or not it's marked. Marked rows also get a
+        // faint full-width background tint so the whole line reads as bookmarked.
         let bookmarked = view.bookmarks.contains(&r.path);
-        let gutter = if bookmarked { "★" } else { " " };
+        let gutter = if bookmarked { "▎" } else { " " };
         let marker = if r.has_children {
             if r.expanded {
                 "▼"
@@ -812,19 +815,48 @@ pub(crate) fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, 
             if cur_match == Some(&r.path) {
                 st = st.add_modifier(Modifier::BOLD);
             }
-            Line::from(Span::styled(text, st))
+            if bookmarked {
+                st = st.bg(C_BOOKMARK_BG);
+            }
+            // Pad to full width so the tint spans the row, not just the text.
+            let pad = " ".repeat(width.saturating_sub(text.chars().count()));
+            Line::from(Span::styled(format!("{text}{pad}"), st))
         } else {
-            // Normal row: syntax-colored segments.
+            // Normal row: syntax-colored segments (bookmarked rows carry a faint
+            // background tint on every span plus a trailing pad to fill the row).
             let key_color = if r.is_index { C_INDEX } else { C_KEY };
-            Line::from(vec![
-                Span::styled(gutter, Style::default().fg(C_BOOKMARK)),
-                Span::raw(indent),
-                Span::styled(marker, Style::default().fg(C_PUNCT)),
-                Span::raw(" "),
-                Span::styled(r.label.clone(), Style::default().fg(key_color)),
-                Span::styled(": ", Style::default().fg(C_PUNCT)),
-                Span::styled(r.value.clone(), Style::default().fg(value_color(r.kind))),
-            ])
+            let bg = |st: Style| {
+                if bookmarked {
+                    st.bg(C_BOOKMARK_BG)
+                } else {
+                    st
+                }
+            };
+            // width already spent by the visible text: gutter(1) + indent +
+            // marker(1) + " "(1) + label + ": "(2) + value.
+            let used = 1
+                + indent.chars().count()
+                + 2
+                + r.label.chars().count()
+                + 2
+                + r.value.chars().count();
+            let mut spans = vec![
+                Span::styled(gutter, bg(Style::default().fg(C_BOOKMARK))),
+                Span::styled(indent, bg(Style::default())),
+                Span::styled(marker, bg(Style::default().fg(C_PUNCT))),
+                Span::styled(" ", bg(Style::default())),
+                Span::styled(r.label.clone(), bg(Style::default().fg(key_color))),
+                Span::styled(": ", bg(Style::default().fg(C_PUNCT))),
+                Span::styled(
+                    r.value.clone(),
+                    bg(Style::default().fg(value_color(r.kind))),
+                ),
+            ];
+            if bookmarked {
+                let pad = " ".repeat(width.saturating_sub(used));
+                spans.push(Span::styled(pad, Style::default().bg(C_BOOKMARK_BG)));
+            }
+            Line::from(spans)
         };
         lines.push(line);
     }

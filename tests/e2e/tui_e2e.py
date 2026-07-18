@@ -500,23 +500,23 @@ def scenario_help_overlay(binary):
 
 
 def scenario_bookmark_indicator(binary):
-    print("bookmarks: m toggles a ★ gutter marker on the row")
+    print("bookmarks: m toggles a ▎ gutter marker on the row")
     t = Tui(binary, {"alpha": 1, "beta": 2, "gamma": 3})
     try:
-        check("no ★ before anything is bookmarked", "★" not in t.dump(), t)
+        check("no ▎ before anything is bookmarked", "▎" not in t.dump(), t)
         t.send("j")  # step off the root onto the alpha child
         t.send("m")  # bookmark the focused row (alpha)
         rows = [t.line(y) for y in range(ROWS)]
-        starred = next((r for r in rows if "★" in r), "")
-        check("★ appears in the gutter of the bookmarked row",
-              "★" in starred and "alpha" in starred, t)
-        check("only the bookmarked row is starred",
-              sum("★" in r for r in rows) == 1, t)
-        t.send("j")  # move focus to beta; alpha keeps its star
-        check("★ persists on alpha after focus moves away", "★" in t.dump(), t)
+        starred = next((r for r in rows if "▎" in r), "")
+        check("▎ appears in the gutter of the bookmarked row",
+              "▎" in starred and "alpha" in starred, t)
+        check("only the bookmarked row is marked",
+              sum("▎" in r for r in rows) == 1, t)
+        t.send("j")  # move focus to beta; alpha keeps its bar
+        check("▎ persists on alpha after focus moves away", "▎" in t.dump(), t)
         t.send("k"); t.send("m")  # back to alpha, toggle it off
-        check("★ is removed when the bookmark is toggled off",
-              "★" not in t.dump(), t)
+        check("▎ is removed when the bookmark is toggled off",
+              "▎" not in t.dump(), t)
     finally:
         t.close()
 
