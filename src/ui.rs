@@ -26,6 +26,11 @@ const C_PUNCT: Color = Color::DarkGray; // braces, colon, markers, previews
 const C_BOOKMARK: Color = Color::LightYellow; // the `▎` gutter bar on bookmarked rows
 const C_BOOKMARK_BG: Color = Color::Indexed(237); // faint row tint behind a bookmarked line
 
+// Every floating overlay (bookmarks, help, peek, schema) fills its card with this.
+// `Reset` = the terminal's own background, so the card blends with the active theme
+// instead of forcing a dark-gray box that reads as too-high-contrast in light mode.
+const C_PANEL_BG: Color = Color::Reset;
+
 /// The foreground color for a value of the given kind.
 pub(crate) fn value_color(kind: Kind) -> Color {
     match kind {
@@ -291,7 +296,7 @@ pub(crate) fn render_marks(f: &mut Frame, area: Rect, view: &View) {
     // Read as a floating card above the dimmed content: a solid dark fill with a
     // bright, bold border/title, and a full-width selection bar (padded out so the
     // highlight spans the row instead of clipping to the label).
-    let panel_bg = Color::Indexed(236); // dark gray; degrades gracefully on 16-color terms
+    let panel_bg = C_PANEL_BG;
     let lines: Vec<Line> = items
         .iter()
         .enumerate()
@@ -407,7 +412,7 @@ pub(crate) fn render_help(f: &mut Frame, area: Rect) {
         .add_modifier(Modifier::BOLD);
     let desc_st = Style::default().fg(Color::Gray);
     let code_st = Style::default().fg(Color::Yellow);
-    let panel_bg = Color::Indexed(236);
+    let panel_bg = C_PANEL_BG;
 
     // One "key  description" cell, key right-aligned so the columns line up.
     let cell = |k: &str, d: &str| -> Vec<Span<'static>> {
@@ -563,7 +568,7 @@ pub(crate) fn render_peek(f: &mut Frame, area: Rect, view: &View) {
     let top = pk.scroll.min(total.saturating_sub(inner_h));
     let bottom = (top + inner_h).min(total);
 
-    let panel_bg = Color::Indexed(236);
+    let panel_bg = C_PANEL_BG;
     let lines: Vec<Line> = all[top..bottom]
         .iter()
         .map(|s| Line::from(Span::styled(s.clone(), Style::default().fg(Color::Gray))))
@@ -653,7 +658,7 @@ pub(crate) fn render_schema(f: &mut Frame, area: Rect, view: &View) {
     // bound and shrink the card to fit its content, so a small type gets a small
     // card and only a large one grows toward full-screen.
     let (max_rect, max_inner_w, max_inner_h) = peek_layout(area);
-    let panel_bg = Color::Indexed(236);
+    let panel_bg = C_PANEL_BG;
 
     let total = sc.lines.len();
     let content_w = sc
