@@ -23,6 +23,7 @@ const C_STR: Color = Color::Green; // string values
 const C_NUM: Color = Color::Yellow; // numbers
 const C_BOOL: Color = Color::Magenta; // true / false
 const C_PUNCT: Color = Color::DarkGray; // braces, colon, markers, previews
+const C_BOOKMARK: Color = Color::LightYellow; // the `★` gutter marker on bookmarked rows
 
 /// The foreground color for a value of the given kind.
 pub(crate) fn value_color(kind: Kind) -> Color {
@@ -768,15 +769,21 @@ pub(crate) fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, 
         if r.loading {
             // Inline drain indicator: a dim, animated "⠋ loading…" at the child
             // indent, where the next sibling will appear once it's scanned in.
+            // The leading space keeps it aligned with the bookmark gutter below.
             let indent = "  ".repeat(r.depth);
             lines.push(Line::from(Span::styled(
-                format!("{indent}{} loading…", spinner_frame()),
+                format!(" {indent}{} loading…", spinner_frame()),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),
             )));
             continue;
         }
+        // A one-column gutter carries the `★` bookmark marker (a space when the
+        // row isn't bookmarked) so bookmarked nodes are visible at a glance and
+        // every row stays aligned whether or not it's marked.
+        let bookmarked = view.bookmarks.contains(&r.path);
+        let gutter = if bookmarked { "★" } else { " " };
         let marker = if r.has_children {
             if r.expanded {
                 "▼"
@@ -793,14 +800,14 @@ pub(crate) fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, 
             // highlighted row unambiguously marks which pane is live. Inactive
             // panes keep their focus (it returns on Tab) but draw it as a normal
             // row.
-            let text = format!("{indent}{marker} {}: {}", r.label, r.value);
+            let text = format!("{gutter}{indent}{marker} {}: {}", r.label, r.value);
             Line::from(Span::styled(
                 text,
                 Style::default().add_modifier(Modifier::REVERSED),
             ))
         } else if cur_match == Some(&r.path) || view.match_set.contains(&r.path) {
             // A search hit: whole row yellow (current match also bold).
-            let text = format!("{indent}{marker} {}: {}", r.label, r.value);
+            let text = format!("{gutter}{indent}{marker} {}: {}", r.label, r.value);
             let mut st = Style::default().fg(Color::Yellow);
             if cur_match == Some(&r.path) {
                 st = st.add_modifier(Modifier::BOLD);
@@ -810,6 +817,7 @@ pub(crate) fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, 
             // Normal row: syntax-colored segments.
             let key_color = if r.is_index { C_INDEX } else { C_KEY };
             Line::from(vec![
+                Span::styled(gutter, Style::default().fg(C_BOOKMARK)),
                 Span::raw(indent),
                 Span::styled(marker, Style::default().fg(C_PUNCT)),
                 Span::raw(" "),
