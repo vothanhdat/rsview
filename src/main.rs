@@ -1748,6 +1748,11 @@ fn pump_input(app: &mut App, b: &[u8], h: usize, poll_ms: u64) -> std::io::Resul
                     }
                 }
             }
+            // The user may have flipped their OS/terminal light–dark theme while
+            // the app was in the background; re-probe on refocus so the shades
+            // follow. Cheap and bounded (see THEME_QUERY_TIMEOUT); the next frame
+            // — always redrawn at the top of the run loop — picks up the change.
+            Event::FocusGained => ui::set_dark_theme(detect_dark_background()),
             _ => {}
         }
         // Stop once the input queue is empty, then render the coalesced result.
@@ -1931,6 +1936,12 @@ fn disable_enhanced_keys() {
     let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
 }
 
+/// How long to wait for the terminal to answer a background-color query before
+/// falling back to dark. Short so it never visibly stalls startup or a refocus
+/// re-probe; terminals that don't support the query are detected even faster (via
+/// feature detection), so this only bounds the wait for a slow/absent reply.
+const THEME_QUERY_TIMEOUT: Duration = Duration::from_millis(300);
+
 /// Detect whether the terminal has a dark or light background, so the few
 /// absolute background shades (overlay panels, the bookmark row tint/bar) suit
 /// the theme — every other color is a named ANSI color that already follows the
@@ -1938,8 +1949,12 @@ fn disable_enhanced_keys() {
 /// tmux/screen handling and a fast fall-through for terminals that don't support
 /// it); we default to dark on any error. `JVIEW_THEME=light|dark` forces the
 /// result and skips the query — used by the demo recording and the e2e harness,
-/// where the emulated terminal never answers. Called before `ratatui::init()`
-/// (terminal still cooked) so the very first frame already uses the right shades.
+/// where the emulated terminal never answers.
+///
+/// Called once before `ratatui::init()` (terminal still cooked) so the first
+/// frame already uses the right shades, and again on `FocusGained` (see
+/// `pump_input`) so a theme flip while the app was in the background is picked up
+/// when the user returns to it.
 fn detect_dark_background() -> bool {
     match std::env::var("JVIEW_THEME").ok().as_deref() {
         Some("light") => return false,
@@ -1947,10 +1962,15 @@ fn detect_dark_background() -> bool {
         _ => {}
     }
     use terminal_colorsaurus::{color_scheme, ColorScheme, QueryOptions};
-    !matches!(
-        color_scheme(QueryOptions::default()),
-        Ok(ColorScheme::Light)
-    )
+    // QueryOptions is #[non_exhaustive], so it can't be built with a struct
+    // literal here — start from the default and set the one public field.
+    #[allow(clippy::field_reassign_with_default)]
+    let opts = {
+        let mut o = QueryOptions::default();
+        o.timeout = THEME_QUERY_TIMEOUT;
+        o
+    };
+    !matches!(color_scheme(opts), Ok(ColorScheme::Light))
 }
 
 /// Capture the mouse so wheel events reach the app (for scrolling). Like tmux,
@@ -1965,6 +1985,21 @@ fn disable_mouse() {
     use ratatui::crossterm::event::DisableMouseCapture;
     use ratatui::crossterm::execute;
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
+}
+
+/// Ask the terminal to report focus in/out (so `Event::FocusGained` fires). Used
+/// to re-probe the light/dark theme when the user returns to the app. A no-op on
+/// terminals that don't support it — the theme just stays as detected at startup.
+fn enable_focus() {
+    use ratatui::crossterm::event::EnableFocusChange;
+    use ratatui::crossterm::execute;
+    let _ = execute!(std::io::stdout(), EnableFocusChange);
+}
+
+fn disable_focus() {
+    use ratatui::crossterm::event::DisableFocusChange;
+    use ratatui::crossterm::execute;
+    let _ = execute!(std::io::stdout(), DisableFocusChange);
 }
 
 /// First-run footer hint shown when stdout is piped, so the `p` extract key is
@@ -2138,8 +2173,10 @@ fn run_file(path: String) -> std::io::Result<()> {
     let _ = render_frame(&mut term, &mut app, b, false);
     let enhanced = enable_enhanced_keys();
     enable_mouse();
+    enable_focus();
     let res = run(&mut term, &mut app, b, &mmap);
     disable_mouse();
+    disable_focus();
     if enhanced {
         disable_enhanced_keys();
     }
@@ -2176,8 +2213,10 @@ fn run_stdin() -> std::io::Result<()> {
     let _ = render_frame(&mut term, &mut app, store.bytes(), true);
     let enhanced = enable_enhanced_keys();
     enable_mouse();
+    enable_focus();
     let res = run_stream(&mut term, &mut app, &mut store, &mut jsonl, rx);
     disable_mouse();
+    disable_focus();
     if enhanced {
         disable_enhanced_keys();
     }
