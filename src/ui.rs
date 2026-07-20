@@ -49,13 +49,14 @@ fn c_bookmark() -> Color {
     }
 }
 
-/// Faint tint behind a bookmarked row — one step off the terminal background so
-/// it reads as a subtle highlight in either theme.
+/// Faint tint behind a bookmarked row — barely a step off the terminal
+/// background, since the `▎` bar already marks the row; the tint is just a
+/// whisper of a highlight in either theme.
 fn c_bookmark_bg() -> Color {
     if dark_theme() {
-        Color::Indexed(237) // a touch lighter than a dark background
+        Color::Indexed(235) // a hair lighter than a dark background
     } else {
-        Color::Indexed(253) // a touch darker than a light background
+        Color::Indexed(255) // a hair darker than a light background
     }
 }
 
