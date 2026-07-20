@@ -48,6 +48,10 @@ class Tui:
                 f.write(raw)
         self.pid, self.fd = pty.fork()
         if self.pid == 0:  # child
+            # Pin the theme so the background probe (terminal-colorsaurus) is
+            # skipped: pyte never answers an OSC 11 query, so leaving it unset
+            # would just wait out the timeout on every spawn.
+            os.environ["JVIEW_THEME"] = "dark"
             if pipe:
                 r, w = os.pipe()
                 if os.fork() == 0:  # grandchild feeds the pipe, then EOFs

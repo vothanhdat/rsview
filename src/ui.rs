@@ -23,13 +23,52 @@ const C_STR: Color = Color::Green; // string values
 const C_NUM: Color = Color::Yellow; // numbers
 const C_BOOL: Color = Color::Magenta; // true / false
 const C_PUNCT: Color = Color::DarkGray; // braces, colon, markers, previews
-const C_BOOKMARK: Color = Color::LightYellow; // the `▎` gutter bar on bookmarked rows
-const C_BOOKMARK_BG: Color = Color::Indexed(237); // faint row tint behind a bookmarked line
 
-// Every floating overlay (bookmarks, help, peek, schema) fills its card with this.
-// `Reset` = the terminal's own background, so the card blends with the active theme
-// instead of forcing a dark-gray box that reads as too-high-contrast in light mode.
-const C_PANEL_BG: Color = Color::Reset;
+// Whether the terminal has a dark background, detected once at startup (see
+// `detect_dark_background` in main.rs) and stored here. The named colors above
+// already follow the terminal palette; only the few *absolute* background shades
+// below need to know the theme, so this gates them. Defaults to dark until set.
+static DARK_THEME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub(crate) fn set_dark_theme(dark: bool) {
+    DARK_THEME.store(dark, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn dark_theme() -> bool {
+    DARK_THEME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The `▎` bar marking a bookmarked row (gutter) and the footer count: bright
+/// yellow on a dark background, a darker gold on a light one (bright yellow would
+/// wash out on white).
+fn c_bookmark() -> Color {
+    if dark_theme() {
+        Color::LightYellow
+    } else {
+        Color::Indexed(136) // dark gold
+    }
+}
+
+/// Faint tint behind a bookmarked row — one step off the terminal background so
+/// it reads as a subtle highlight in either theme.
+fn c_bookmark_bg() -> Color {
+    if dark_theme() {
+        Color::Indexed(237) // a touch lighter than a dark background
+    } else {
+        Color::Indexed(253) // a touch darker than a light background
+    }
+}
+
+/// Overlay card fill — a subtle "frosted" panel a step off the terminal
+/// background, so a floating card reads as raised without becoming a jarring
+/// dark box on a light theme.
+fn c_panel_bg() -> Color {
+    if dark_theme() {
+        Color::Indexed(236)
+    } else {
+        Color::Indexed(254)
+    }
+}
 
 /// The foreground color for a value of the given kind.
 pub(crate) fn value_color(kind: Kind) -> Color {
@@ -236,7 +275,7 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Optio
             let noun = if n == 1 { "bookmark" } else { "bookmarks" };
             spans.push(Span::styled(
                 format!(" · ▎ {n} {noun}"),
-                Style::default().fg(C_BOOKMARK),
+                Style::default().fg(c_bookmark()),
             ));
         }
         Line::from(spans)
@@ -296,7 +335,7 @@ pub(crate) fn render_marks(f: &mut Frame, area: Rect, view: &View) {
     // Read as a floating card above the dimmed content: a solid dark fill with a
     // bright, bold border/title, and a full-width selection bar (padded out so the
     // highlight spans the row instead of clipping to the label).
-    let panel_bg = C_PANEL_BG;
+    let panel_bg = c_panel_bg();
     let lines: Vec<Line> = items
         .iter()
         .enumerate()
@@ -412,7 +451,7 @@ pub(crate) fn render_help(f: &mut Frame, area: Rect) {
         .add_modifier(Modifier::BOLD);
     let desc_st = Style::default().fg(Color::Gray);
     let code_st = Style::default().fg(Color::Yellow);
-    let panel_bg = C_PANEL_BG;
+    let panel_bg = c_panel_bg();
 
     // One "key  description" cell, key right-aligned so the columns line up.
     let cell = |k: &str, d: &str| -> Vec<Span<'static>> {
@@ -568,7 +607,7 @@ pub(crate) fn render_peek(f: &mut Frame, area: Rect, view: &View) {
     let top = pk.scroll.min(total.saturating_sub(inner_h));
     let bottom = (top + inner_h).min(total);
 
-    let panel_bg = C_PANEL_BG;
+    let panel_bg = c_panel_bg();
     let lines: Vec<Line> = all[top..bottom]
         .iter()
         .map(|s| Line::from(Span::styled(s.clone(), Style::default().fg(Color::Gray))))
@@ -658,7 +697,7 @@ pub(crate) fn render_schema(f: &mut Frame, area: Rect, view: &View) {
     // bound and shrink the card to fit its content, so a small type gets a small
     // card and only a large one grows toward full-screen.
     let (max_rect, max_inner_w, max_inner_h) = peek_layout(area);
-    let panel_bg = C_PANEL_BG;
+    let panel_bg = c_panel_bg();
 
     let total = sc.lines.len();
     let content_w = sc
@@ -834,7 +873,7 @@ pub(crate) fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, 
                 st = st.add_modifier(Modifier::BOLD);
             }
             if bookmarked {
-                st = st.bg(C_BOOKMARK_BG);
+                st = st.bg(c_bookmark_bg());
             }
             // Pad to full width so the tint spans the row, not just the text.
             let pad = " ".repeat(width.saturating_sub(text.chars().count()));
@@ -845,7 +884,7 @@ pub(crate) fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, 
             let key_color = if r.is_index { C_INDEX } else { C_KEY };
             let bg = |st: Style| {
                 if bookmarked {
-                    st.bg(C_BOOKMARK_BG)
+                    st.bg(c_bookmark_bg())
                 } else {
                     st
                 }
@@ -859,7 +898,7 @@ pub(crate) fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, 
                 + 2
                 + r.value.chars().count();
             let mut spans = vec![
-                Span::styled(gutter, bg(Style::default().fg(C_BOOKMARK))),
+                Span::styled(gutter, bg(Style::default().fg(c_bookmark()))),
                 Span::styled(indent, bg(Style::default())),
                 Span::styled(marker, bg(Style::default().fg(C_PUNCT))),
                 Span::styled(" ", bg(Style::default())),
@@ -872,7 +911,7 @@ pub(crate) fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, 
             ];
             if bookmarked {
                 let pad = " ".repeat(width.saturating_sub(used));
-                spans.push(Span::styled(pad, Style::default().bg(C_BOOKMARK_BG)));
+                spans.push(Span::styled(pad, Style::default().bg(c_bookmark_bg())));
             }
             Line::from(spans)
         };

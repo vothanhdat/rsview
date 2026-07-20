@@ -1931,6 +1931,28 @@ fn disable_enhanced_keys() {
     let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
 }
 
+/// Detect whether the terminal has a dark or light background, so the few
+/// absolute background shades (overlay panels, the bookmark row tint/bar) suit
+/// the theme — every other color is a named ANSI color that already follows the
+/// terminal palette. `terminal-colorsaurus` queries the terminal (OSC 11, with
+/// tmux/screen handling and a fast fall-through for terminals that don't support
+/// it); we default to dark on any error. `JVIEW_THEME=light|dark` forces the
+/// result and skips the query — used by the demo recording and the e2e harness,
+/// where the emulated terminal never answers. Called before `ratatui::init()`
+/// (terminal still cooked) so the very first frame already uses the right shades.
+fn detect_dark_background() -> bool {
+    match std::env::var("JVIEW_THEME").ok().as_deref() {
+        Some("light") => return false,
+        Some("dark") => return true,
+        _ => {}
+    }
+    use terminal_colorsaurus::{color_scheme, ColorScheme, QueryOptions};
+    !matches!(
+        color_scheme(QueryOptions::default()),
+        Ok(ColorScheme::Light)
+    )
+}
+
 /// Capture the mouse so wheel events reach the app (for scrolling). Like tmux,
 /// this takes over the terminal's native selection — hold Shift to select text.
 fn enable_mouse() {
@@ -2101,6 +2123,9 @@ fn run_file(path: String) -> std::io::Result<()> {
         // Make `p` discoverable: this first-frame hint clears on any keypress.
         app.flash = Some(EXTRACT_HINT.to_string());
     }
+    // Probe light/dark before entering the alt screen, so the first paint already
+    // uses theme-appropriate background shades.
+    ui::set_dark_theme(detect_dark_background());
     let mut term = ratatui::init();
     // Paint the first frame *before* probing keyboard-enhancement support.
     // `supports_keyboard_enhancement()` (in enable_enhanced_keys) blocks up to
@@ -2144,6 +2169,7 @@ fn run_stdin() -> std::io::Result<()> {
     if app.can_extract {
         app.flash = Some(EXTRACT_HINT.to_string());
     }
+    ui::set_dark_theme(detect_dark_background());
     let mut term = ratatui::init();
     // Same as run_file: paint before the up-to-2s keyboard-enhancement probe so
     // the (initially empty) streaming pane shows immediately, not a blank screen.

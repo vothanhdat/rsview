@@ -16,6 +16,9 @@ exclude = ["/.github"]
 memmap2 = "0.9"
 ratatui = "0.29"
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
+# Detect the terminal's background (OSC 11, with tmux/screen + timeout handling)
+# so the few absolute background shades can suit a light or dark theme.
+terminal-colorsaurus = "0.4"
 
 # Only for the piped-stdin path: reopen the real terminal device onto fd 0 so
 # crossterm reads keys from it (see reattach_terminal_to_stdin in main.rs).
