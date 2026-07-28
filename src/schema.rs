@@ -5,7 +5,8 @@
 //! object shapes are unified (a key missing from some samples becomes optional),
 //! array elements and map values are unified into a single element type, mixed
 //! scalars become unions, and a data-keyed object becomes `Record<string, T>`.
-//! It's rendered TypeScript-style and is copyable.
+//! It's rendered TypeScript-style as a foldable outline (each object block
+//! collapses to `{…}`) and is copyable in full.
 //!
 //! Zero-copy: it reads byte ranges through the scanner's `Cursor` and never
 //! materializes a value. Bounded by sampling caps and a global node budget, so it
@@ -379,19 +380,56 @@ fn word(ty: &Type) -> Option<&'static str> {
     }
 }
 
-/// Render the type as indented lines. `note` is appended to the *first* line
-/// (used for a field's `// %` fill comment).
+/// One node of the rendered outline. A node with `children` is a foldable block
+/// — an object body: its opening line (`user: {`), the child nodes, then
+/// `close_text` (`}` plus any `[]`/`Record<>` suffix that trails the block).
+/// Folded, the whole block collapses onto `folded_text` (`user: {…}  // 3 fields`).
+/// A leaf carries the same text in both, and an empty `close_text`.
+#[derive(Debug, PartialEq)]
+pub struct Outline {
+    pub open_text: String,
+    pub folded_text: String,
+    pub close_text: String,
+    /// Nesting level, matching the two-space indent already baked into the texts.
+    pub depth: usize,
+    pub children: Vec<Outline>,
+    /// Fold state, flipped by the overlay. Everything starts open.
+    pub open: bool,
+}
+
+impl Outline {
+    fn leaf(text: String, depth: usize) -> Self {
+        Outline {
+            open_text: text.clone(),
+            folded_text: text,
+            close_text: String::new(),
+            depth,
+            children: Vec::new(),
+            open: true,
+        }
+    }
+
+    pub fn foldable(&self) -> bool {
+        !self.children.is_empty()
+    }
+}
+
+/// Build the type's outline. `note` is appended to the *first* line (used for a
+/// field's `// %` fill comment).
 fn write_type(
     ty: &Type,
     indent: usize,
     prefix: &str,
     suffix: &str,
     note: &str,
-    out: &mut Vec<String>,
+    out: &mut Vec<Outline>,
 ) {
     let pad = "  ".repeat(indent);
     if let Some(w) = word(ty) {
-        out.push(format!("{pad}{prefix}{w}{suffix}{note}"));
+        out.push(Outline::leaf(
+            format!("{pad}{prefix}{w}{suffix}{note}"),
+            indent,
+        ));
         return;
     }
     match ty {
@@ -410,10 +448,13 @@ fn write_type(
         }
         Type::Object(fields) => {
             if fields.is_empty() {
-                out.push(format!("{pad}{prefix}{{}}{suffix}{note}"));
+                out.push(Outline::leaf(
+                    format!("{pad}{prefix}{{}}{suffix}{note}"),
+                    indent,
+                ));
                 return;
             }
-            out.push(format!("{pad}{prefix}{{{note}"));
+            let mut children = Vec::new();
             for f in fields {
                 let opt = if f.optional() { "?" } else { "" };
                 let fnote = if f.optional() && f.total > 0 {
@@ -422,9 +463,29 @@ fn write_type(
                     String::new()
                 };
                 let fpfx = format!("{}{opt}: ", f.name);
-                write_type(&f.ty, indent + 1, &fpfx, "", &fnote, out);
+                write_type(&f.ty, indent + 1, &fpfx, "", &fnote, &mut children);
             }
-            out.push(format!("{pad}}}{suffix}"));
+            // Folded, the field count stands in for the hidden body — appended to
+            // the fill-rate comment when there already is one.
+            let n = fields.len();
+            let count = if n == 1 {
+                "1 field".to_string()
+            } else {
+                format!("{n} fields")
+            };
+            let folded_note = if note.is_empty() {
+                format!("   // {count}")
+            } else {
+                format!("{note} · {count}")
+            };
+            out.push(Outline {
+                open_text: format!("{pad}{prefix}{{{note}"),
+                folded_text: format!("{pad}{prefix}{{…}}{suffix}{folded_note}"),
+                close_text: format!("{pad}}}{suffix}"),
+                depth: indent,
+                children,
+                open: true,
+            });
         }
         Type::Union(vs) => write_union(vs, indent, prefix, suffix, note, out),
         _ => {}
@@ -440,14 +501,17 @@ fn write_union(
     prefix: &str,
     suffix: &str,
     note: &str,
-    out: &mut Vec<String>,
+    out: &mut Vec<Outline>,
 ) {
     let scalars: Vec<&str> = vs.iter().filter_map(word).collect();
     let composites: Vec<&Type> = vs.iter().filter(|v| word(v).is_none()).collect();
     if composites.is_empty() {
         let joined = scalars.join(" | ");
         let pad = "  ".repeat(indent);
-        out.push(format!("{pad}{prefix}{joined}{suffix}{note}"));
+        out.push(Outline::leaf(
+            format!("{pad}{prefix}{joined}{suffix}{note}"),
+            indent,
+        ));
         return;
     }
     let mut tail = String::new();
@@ -461,19 +525,113 @@ fn write_union(
     write_type(composites[0], indent, prefix, &sfx, note, out);
 }
 
-/// The type as scrollable display lines for the overlay.
-pub fn render(ty: &Type) -> Vec<String> {
+/// The type as a foldable outline for the overlay — every block open.
+pub fn outline(ty: &Type) -> Vec<Outline> {
     let mut out = Vec::new();
     write_type(ty, 0, "", "", "", &mut out);
     if out.is_empty() {
-        out.push("any".into());
+        out.push(Outline::leaf("any".into(), 0));
     }
     out
 }
 
-/// The type as copyable source (what `y` yanks).
+fn push_lines(o: &Outline, out: &mut Vec<String>) {
+    out.push(o.open_text.clone());
+    if o.foldable() {
+        for c in &o.children {
+            push_lines(c, out);
+        }
+        out.push(o.close_text.clone());
+    }
+}
+
+/// The type as display lines, fully expanded regardless of fold state.
+pub fn render(ty: &Type) -> Vec<String> {
+    let mut out = Vec::new();
+    for o in outline(ty) {
+        push_lines(&o, &mut out);
+    }
+    out
+}
+
+/// The type as copyable source (what `y` yanks) — always the whole type, so a
+/// folded overlay still copies everything.
 pub fn to_source(ty: &Type) -> String {
     render(ty).join("\n")
+}
+
+/// One visible line of an [`Outline`], as drawn by the overlay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Row {
+    pub text: String,
+    pub depth: usize,
+    /// Index path into the outline tree. A block's closing line repeats its
+    /// opening line's path, so folding works from either end of the block.
+    pub path: Vec<usize>,
+    /// True on the opening (or folded) line of a foldable block.
+    pub foldable: bool,
+    /// Whether that block is currently open.
+    pub open: bool,
+    /// True on a block's closing line.
+    pub close: bool,
+}
+
+fn walk(nodes: &[Outline], path: &mut Vec<usize>, out: &mut Vec<Row>) {
+    for (i, o) in nodes.iter().enumerate() {
+        path.push(i);
+        let foldable = o.foldable();
+        out.push(Row {
+            text: if foldable && !o.open {
+                o.folded_text.clone()
+            } else {
+                o.open_text.clone()
+            },
+            depth: o.depth,
+            path: path.clone(),
+            foldable,
+            open: o.open,
+            close: false,
+        });
+        if foldable && o.open {
+            walk(&o.children, path, out);
+            out.push(Row {
+                text: o.close_text.clone(),
+                depth: o.depth,
+                path: path.clone(),
+                foldable: false,
+                open: true,
+                close: true,
+            });
+        }
+        path.pop();
+    }
+}
+
+/// The outline's currently visible lines, top to bottom.
+pub fn rows(nodes: &[Outline]) -> Vec<Row> {
+    let mut out = Vec::new();
+    walk(nodes, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The node a [`Row::path`] points at.
+pub fn node_mut<'a>(nodes: &'a mut [Outline], path: &[usize]) -> Option<&'a mut Outline> {
+    let (&i, rest) = path.split_first()?;
+    let n = nodes.get_mut(i)?;
+    if rest.is_empty() {
+        Some(n)
+    } else {
+        node_mut(&mut n.children, rest)
+    }
+}
+
+/// Open or fold every block. Folding leaves the outermost block open — a lone
+/// `{…}` would say nothing about the type.
+pub fn set_all_open(nodes: &mut [Outline], open: bool) {
+    for n in nodes.iter_mut() {
+        n.open = open || n.depth == 0;
+        set_all_open(&mut n.children, open);
+    }
 }
 
 #[cfg(test)]
@@ -550,6 +708,100 @@ mod tests {
         let t = ts(r#"{"x":[1],"y":[2],"z":[3]}"#);
         assert!(t.contains("x: number[]"), "{t}");
         assert!(!t.contains("Record<"), "should not be a map: {t}");
+    }
+
+    fn ty_of(json: &str) -> Type {
+        let b = json.as_bytes();
+        infer(b, 0, b.len(), crate::scanner::value_kind(b, 0), false)
+    }
+
+    #[test]
+    fn outline_starts_fully_open_and_matches_the_flat_render() {
+        let t = ty_of(r#"[{"a":1,"user":{"name":"x"}}]"#);
+        let o = outline(&t);
+        let texts: Vec<String> = rows(&o).into_iter().map(|r| r.text).collect();
+        assert_eq!(texts, render(&t), "open outline == the flat render");
+    }
+
+    #[test]
+    fn folding_a_block_hides_its_children_and_closing_line() {
+        let t = ty_of(r#"[{"a":1,"user":{"name":"x","age":2}}]"#);
+        let mut o = outline(&t);
+        let open = rows(&o);
+        // The nested object under `user`.
+        let path = open
+            .iter()
+            .find(|r| r.text.contains("user: {"))
+            .expect("a user block")
+            .path
+            .clone();
+        assert!(open.iter().any(|r| r.text.contains("name: string")));
+
+        node_mut(&mut o, &path).unwrap().open = false;
+        let folded = rows(&o);
+        assert!(folded.len() < open.len(), "folding must drop lines");
+        assert!(
+            !folded.iter().any(|r| r.text.contains("name: string")),
+            "children stay hidden: {folded:?}"
+        );
+        let line = folded
+            .iter()
+            .find(|r| r.path == path)
+            .expect("the folded line");
+        assert!(line.text.contains("user: {…}"), "{}", line.text);
+        assert!(line.text.contains("2 fields"), "{}", line.text);
+        assert!(line.foldable && !line.open);
+    }
+
+    #[test]
+    fn folding_keeps_the_type_suffix_on_the_folded_line() {
+        // Open, `[]` trails the closing brace; folded, it must trail `{…}`.
+        let t = ty_of(r#"[{"a":1}]"#);
+        let mut o = outline(&t);
+        set_all_open(&mut o, false);
+        // The outermost block stays open — folding it away would show nothing.
+        assert!(rows(&o).iter().any(|r| r.text.contains("a: number")));
+        o[0].open = false;
+        let r = rows(&o);
+        assert_eq!(r.len(), 1);
+        assert!(r[0].text.starts_with("{…}[]"), "{}", r[0].text);
+    }
+
+    #[test]
+    fn a_closing_line_carries_its_blocks_path() {
+        let t = ty_of(r#"{"a":{"b":1}}"#);
+        let o = outline(&t);
+        let r = rows(&o);
+        let close = r.last().unwrap();
+        assert!(close.close && close.text == "}");
+        assert_eq!(close.path, r[0].path, "closes the block it ends");
+    }
+
+    #[test]
+    fn collapse_all_folds_nested_blocks_but_keeps_the_root_open() {
+        let t = ty_of(r#"{"a":{"b":{"c":1}},"d":2}"#);
+        let mut o = outline(&t);
+        set_all_open(&mut o, false);
+        let r = rows(&o);
+        assert!(r.iter().any(|x| x.text.contains("d: number")), "{r:?}");
+        assert!(r.iter().any(|x| x.text.contains("a: {…}")), "{r:?}");
+        assert!(!r.iter().any(|x| x.text.contains("c: number")), "{r:?}");
+
+        set_all_open(&mut o, true);
+        assert_eq!(
+            rows(&o).into_iter().map(|x| x.text).collect::<Vec<_>>(),
+            render(&t),
+            "expand-all restores every line"
+        );
+    }
+
+    #[test]
+    fn scalars_and_empty_objects_are_not_foldable() {
+        let t = ty_of(r#"{"a":1,"e":{}}"#);
+        let r = rows(&outline(&t));
+        for line in r.iter().filter(|x| x.depth > 0) {
+            assert!(!line.foldable, "{}", line.text);
+        }
     }
 
     #[test]

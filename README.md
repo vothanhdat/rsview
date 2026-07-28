@@ -67,7 +67,7 @@ From a checkout: `cargo run --release -- file.json`.
 | `g`, `Home` | top |
 | `Enter`/`→`/`Space` | expand / collapse a container — or peek a leaf's full value |
 | `←` | collapse, or jump to parent if already collapsed |
-| `t` · `c` · `#` | infer the value's type (TypeScript-style; `y` copies it) · count a container's children · aggregate its numeric children (count/sum/min/max/mean) |
+| `t` · `c` · `#` | infer the value's type (TypeScript-style, foldable; `y` copies it) · count a container's children · aggregate its numeric children (count/sum/min/max/mean) |
 | `/` | search (live — results stream as you type; `Tab` scopes it to the focused subtree) |
 | `Enter`/`↓` · `Shift-Enter`/`↑` (in search) | next / previous match |
 | `:` | jump to a path — absolute or relative to the cursor |
@@ -121,8 +121,12 @@ the richer ones:
     cumulativeStats: Record<string, { buyCount: number; buyValCum: number }>
   }
   ```
-  falls out in one shot. Scroll it with `j`/`k`, and **`y` copies the whole type**
-  to your clipboard to paste straight into your code. Sampling is bounded (2000
+  falls out in one shot. The card is a **foldable outline**, like the tree itself:
+  `j`/`k` move the cursor, `Enter`/`Space` (or `←`/`→`) fold and unfold the
+  selected block to `{…}   // 12 fields`, and `C`/`E` collapse or expand every
+  block at once — so a wide type can be read one level at a time. Folding is
+  display-only: **`y` copies the whole type** to your clipboard, expanded, to
+  paste straight into your code. Sampling is bounded (2000
   records, a node budget), so it stays instant on huge, deeply-nested data. The
   inference lives in its own module, [src/schema.rs](src/schema.rs).
 - **Count (`c`)** — a container's exact child count (`1,234,567 elements`), a full

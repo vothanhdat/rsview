@@ -108,16 +108,126 @@ pub(crate) struct Peek {
 }
 
 /// The `t` schema overlay: the focused node's inferred structural type (see
-/// [`schema`]), rendered TypeScript-style and scrollable, plus its copyable source.
+/// [`schema`]), rendered TypeScript-style as a foldable outline, plus its
+/// copyable source. Each object block folds to `{…}` so a wide type can be read
+/// one level at a time.
 pub(crate) struct SchemaView {
     /// The focused node's label, for the card title.
     pub(crate) title: String,
-    /// The rendered type as display lines.
-    pub(crate) lines: Vec<String>,
-    /// The same type as copyable text (`y` yanks it).
+    /// The rendered type as a fold tree — the source of truth for `rows`.
+    pub(crate) outline: Vec<schema::Outline>,
+    /// The lines currently visible, rebuilt whenever a fold flips.
+    pub(crate) rows: Vec<schema::Row>,
+    /// The whole type as copyable text (`y` yanks it, folds and all).
     pub(crate) source: String,
-    /// Top visible line (advanced by the scroll keys).
+    /// Top visible line.
     pub(crate) scroll: usize,
+    /// Selected line — what Enter folds/unfolds.
+    pub(crate) cursor: usize,
+}
+
+impl SchemaView {
+    fn new(title: String, ty: &schema::Type) -> Self {
+        let outline = schema::outline(ty);
+        SchemaView {
+            title,
+            rows: schema::rows(&outline),
+            source: schema::to_source(ty),
+            outline,
+            scroll: 0,
+            cursor: 0,
+        }
+    }
+
+    /// Re-flatten after a fold change, keeping the cursor on `keep` — or, when
+    /// that line just folded away, on the nearest enclosing block still visible.
+    fn refresh(&mut self, keep: &[usize]) {
+        self.rows = schema::rows(&self.outline);
+        self.cursor = self
+            .rows
+            .iter()
+            .position(|r| r.path == keep)
+            .or_else(|| self.rows.iter().rposition(|r| keep.starts_with(&r.path)))
+            .unwrap_or(0);
+    }
+
+    fn set_open(&mut self, path: &[usize], open: bool) {
+        if let Some(n) = schema::node_mut(&mut self.outline, path) {
+            n.open = open;
+        }
+        self.refresh(path);
+    }
+
+    /// Enter/Space: fold an open block, unfold a folded one. A block's closing
+    /// line folds the block it ends; leaves do nothing.
+    fn toggle(&mut self) {
+        let Some(row) = self.rows.get(self.cursor) else {
+            return;
+        };
+        if !row.foldable && !row.close {
+            return;
+        }
+        let (path, open) = (row.path.clone(), row.open);
+        self.set_open(&path, !open);
+    }
+
+    /// `→`: unfold a folded block, else step into it.
+    fn open_or_child(&mut self) {
+        let Some(row) = self.rows.get(self.cursor) else {
+            return;
+        };
+        if row.foldable && !row.open {
+            let path = row.path.clone();
+            self.set_open(&path, true);
+        } else if self.cursor + 1 < self.rows.len() {
+            self.cursor += 1;
+        }
+    }
+
+    /// `←`: fold an open block, else jump to the enclosing block's opening line.
+    fn close_or_parent(&mut self) {
+        let Some(row) = self.rows.get(self.cursor) else {
+            return;
+        };
+        if row.foldable && row.open {
+            let path = row.path.clone();
+            self.set_open(&path, false);
+            return;
+        }
+        // A closing line belongs to its own block; anything else climbs one level.
+        let target = if row.close {
+            row.path.clone()
+        } else if row.path.len() > 1 {
+            row.path[..row.path.len() - 1].to_vec()
+        } else {
+            return;
+        };
+        if let Some(i) = self.rows.iter().position(|r| r.path == target && !r.close) {
+            self.cursor = i;
+        }
+    }
+
+    /// `E`/`C`: unfold or fold every block at once.
+    fn set_all(&mut self, open: bool) {
+        let keep = self
+            .rows
+            .get(self.cursor)
+            .map(|r| r.path.clone())
+            .unwrap_or_default();
+        schema::set_all_open(&mut self.outline, open);
+        self.refresh(&keep);
+    }
+
+    /// Scroll the card just enough to keep the cursor on screen.
+    fn ensure_visible(&mut self, inner_h: usize) {
+        let h = inner_h.max(1);
+        if self.cursor < self.scroll {
+            self.scroll = self.cursor;
+        } else if self.cursor >= self.scroll + h {
+            self.scroll = self.cursor + 1 - h;
+        }
+        self.scroll = self.scroll.min(self.rows.len().saturating_sub(h));
+    }
 }
 
 /// What a key press asks the run loop to do that it can't do itself: quit, or
@@ -1345,10 +1455,11 @@ fn process_key(
         return KeyOutcome::Continue;
     }
 
-    // Schema mode: the inferred-type overlay. Scroll the type; `y` copies it;
-    // Esc/q/t/Enter close.
+    // Schema mode: the inferred-type overlay. Move the cursor over the outline,
+    // Enter/Space/←/→ fold and unfold blocks, `y` copies the whole type, and
+    // Esc/q/t close.
     if app.active_view().mode == Mode::Schema {
-        let (_, _, inner_h) = ui::peek_layout(term_area().unwrap_or(Rect::new(0, 0, 80, 24)));
+        let area = term_area().unwrap_or(Rect::new(0, 0, 80, 24));
         // `y` copies the whole type to the clipboard (handled before the mutable
         // borrow so it can set the app-level flash).
         if matches!(k.code, KeyCode::Char('y')) {
@@ -1358,26 +1469,40 @@ fn process_key(
             }
             return KeyOutcome::Continue;
         }
+        if matches!(
+            k.code,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t')
+        ) {
+            let v = app.active_mut();
+            v.mode = Mode::Normal;
+            v.schema = None;
+            return KeyOutcome::Continue;
+        }
         let v = app.active_mut();
         if let Some(sc) = v.schema.as_mut() {
-            let max = sc.lines.len().saturating_sub(inner_h);
+            // The card shrinks to its content, so a page is the drawn height, not
+            // the peek box's.
+            let page = ui::schema_inner_h(area, sc.rows.len()).max(1);
+            let last = sc.rows.len().saturating_sub(1);
             match k.code {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t') | KeyCode::Enter => {
-                    v.mode = Mode::Normal;
-                    v.schema = None;
-                }
-                KeyCode::Down | KeyCode::Char('j') => sc.scroll = (sc.scroll + 1).min(max),
-                KeyCode::Up | KeyCode::Char('k') => sc.scroll = sc.scroll.saturating_sub(1),
-                KeyCode::PageDown | KeyCode::Char(' ') => {
-                    sc.scroll = (sc.scroll + inner_h).min(max)
-                }
-                KeyCode::PageUp => sc.scroll = sc.scroll.saturating_sub(inner_h),
-                KeyCode::Char('f') if ctrl => sc.scroll = (sc.scroll + inner_h).min(max),
-                KeyCode::Char('b') if ctrl => sc.scroll = sc.scroll.saturating_sub(inner_h),
-                KeyCode::Home | KeyCode::Char('g') => sc.scroll = 0,
-                KeyCode::End | KeyCode::Char('G') => sc.scroll = max,
+                KeyCode::Enter | KeyCode::Char(' ') => sc.toggle(),
+                KeyCode::Right | KeyCode::Char('l') => sc.open_or_child(),
+                KeyCode::Left | KeyCode::Char('h') => sc.close_or_parent(),
+                KeyCode::Char('E') => sc.set_all(true),
+                KeyCode::Char('C') => sc.set_all(false),
+                KeyCode::Down | KeyCode::Char('j') => sc.cursor = (sc.cursor + 1).min(last),
+                KeyCode::Up | KeyCode::Char('k') => sc.cursor = sc.cursor.saturating_sub(1),
+                KeyCode::PageDown => sc.cursor = (sc.cursor + page).min(last),
+                KeyCode::PageUp => sc.cursor = sc.cursor.saturating_sub(page),
+                KeyCode::Char('f') if ctrl => sc.cursor = (sc.cursor + page).min(last),
+                KeyCode::Char('b') if ctrl => sc.cursor = sc.cursor.saturating_sub(page),
+                KeyCode::Home | KeyCode::Char('g') => sc.cursor = 0,
+                KeyCode::End | KeyCode::Char('G') => sc.cursor = last,
                 _ => {}
             }
+            // Folding changes the line count, so re-measure before scrolling.
+            let page = ui::schema_inner_h(area, sc.rows.len()).max(1);
+            sc.ensure_visible(page);
         } else {
             v.mode = Mode::Normal;
         }
@@ -1497,13 +1622,7 @@ fn process_key(
                     return None;
                 }
                 let ty = schema::infer(b, node.start, node.end, node.kind, node.jsonl);
-                let lines = schema::render(&ty);
-                Some(SchemaView {
-                    title: row.label.clone(),
-                    source: schema::to_source(&ty),
-                    lines,
-                    scroll: 0,
-                })
+                Some(SchemaView::new(row.label.clone(), &ty))
             });
             match built {
                 Some(s) => {

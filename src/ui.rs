@@ -386,7 +386,7 @@ pub(crate) fn render_help(f: &mut Frame, area: Rect) {
         ("Enter  →", "expand · peek a leaf"),
         ("←", "collapse / parent"),
         ("wheel", "scroll the pane"),
-        ("t", "infer type (TS) · y copy"),
+        ("t", "infer type (TS) · ↵ fold · y copy"),
         ("c", "count children"),
         ("#", "aggregate numbers (Σ min/max/avg)"),
         ("/", "search · ⇥ scope subtree"),
@@ -686,9 +686,55 @@ pub(crate) fn highlight_type_line(s: &str) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Draw the schema overlay: the focused node's inferred type (TypeScript-style),
-/// scrolled to `schema.scroll`, in the same floating-card style as the other
-/// overlays. Opened by `t`; `y` copies it; closed by `esc`/`q`/`t`.
+/// Columns the schema outline's fold marker occupies, inserted at each line's
+/// own indent so `▼`/`▶` sit next to the block they open and every line still
+/// lines up.
+const FOLD_MARK_W: usize = 2;
+
+/// One outline line: `indent`, the fold marker (matching the tree pane's
+/// `▼`/`▶`), then the syntax-colored type text. The cursor line is drawn as a
+/// full-width selection bar, like the tree's focused row.
+fn schema_line(r: &crate::schema::Row, selected: bool, width: usize) -> Line<'static> {
+    let marker = if !r.foldable {
+        "  "
+    } else if r.open {
+        "▼ "
+    } else {
+        "▶ "
+    };
+    // The text's leading indent is `depth` two-space steps of plain ASCII, so the
+    // marker can be spliced in after it.
+    let split = (r.depth * 2).min(r.text.len());
+    let (pad, rest) = r.text.split_at(split);
+    if selected {
+        let text = format!("{pad}{marker}{rest}");
+        let fill = " ".repeat(width.saturating_sub(text.chars().count()));
+        return Line::from(Span::styled(
+            format!("{text}{fill}"),
+            Style::default().add_modifier(Modifier::REVERSED),
+        ));
+    }
+    let mut spans = vec![Span::styled(
+        format!("{pad}{marker}"),
+        Style::default().fg(Color::DarkGray),
+    )];
+    spans.extend(highlight_type_line(rest).spans);
+    Line::from(spans)
+}
+
+/// The schema card's inner height for `total` visible lines. The card shrinks to
+/// fit its content (the peek box is only an upper bound), so the key handler asks
+/// here rather than assuming a full-height page.
+pub(crate) fn schema_inner_h(area: Rect, total: usize) -> usize {
+    let (max_rect, _, max_inner_h) = peek_layout(area);
+    let h = (total.clamp(1, max_inner_h) as u16 + 2).min(max_rect.height);
+    h.saturating_sub(2) as usize
+}
+
+/// Draw the schema overlay: the focused node's inferred type (TypeScript-style)
+/// as a foldable outline, scrolled to `schema.scroll`, in the same floating-card
+/// style as the other overlays. Opened by `t`; Enter folds the selected block;
+/// `y` copies it; closed by `esc`/`q`/`t`.
 pub(crate) fn render_schema(f: &mut Frame, area: Rect, view: &View) {
     let Some(sc) = view.schema.as_ref() else {
         return;
@@ -700,11 +746,12 @@ pub(crate) fn render_schema(f: &mut Frame, area: Rect, view: &View) {
     let (max_rect, max_inner_w, max_inner_h) = peek_layout(area);
     let panel_bg = c_panel_bg();
 
-    let total = sc.lines.len();
+    let total = sc.rows.len();
+    // Every line carries a two-column fold marker after its indent.
     let content_w = sc
-        .lines
+        .rows
         .iter()
-        .map(|s| s.chars().count())
+        .map(|r| r.text.chars().count() + FOLD_MARK_W)
         .max()
         .unwrap_or(0);
     // Floor the width so the title chrome (" type · … · esc ") mostly fits, cap it
@@ -721,21 +768,33 @@ pub(crate) fn render_schema(f: &mut Frame, area: Rect, view: &View) {
         height: h,
     };
     let inner_h = h.saturating_sub(2) as usize;
+    let inner_w = w.saturating_sub(2) as usize;
 
     let top = sc.scroll.min(total.saturating_sub(inner_h));
     let bottom = (top + inner_h).min(total);
-    let lines: Vec<Line> = sc.lines[top..bottom]
+    let lines: Vec<Line> = sc.rows[top..bottom]
         .iter()
-        .map(|s| highlight_type_line(s))
+        .enumerate()
+        .map(|(i, r)| schema_line(r, top + i == sc.cursor, inner_w))
         .collect();
 
-    let title = format!(
-        " type · {} · lines {}–{}/{} · y copy · esc ",
-        sc.title,
-        top + 1,
-        bottom,
-        total,
-    );
+    let folds = sc.rows.iter().filter(|r| r.foldable).count();
+    let title = if folds > 0 {
+        format!(
+            " type · {} · {}/{} · ↵ fold · y copy · esc ",
+            sc.title,
+            sc.cursor + 1,
+            total,
+        )
+    } else {
+        format!(
+            " type · {} · lines {}–{}/{} · y copy · esc ",
+            sc.title,
+            top + 1,
+            bottom,
+            total,
+        )
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(

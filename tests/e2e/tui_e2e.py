@@ -434,9 +434,35 @@ def scenario_explore(binary):
         check("a field missing from some records is optional (?)",
               "contact?: {" in scr and "email: string" in scr, t)
         check("arrays render as T[]", "tags?: string[]" in scr, t)
-        # `y` copies the whole type to the clipboard.
+
+        # The card is a foldable outline: ▼ marks an open block, Enter folds the
+        # selected one to `{…}` with a count of what it hides, ▶ marks it folded.
+        check("open blocks carry a ▼ fold marker", "▼" in t.card(), t)
+        for _ in range(3):
+            t.send("j")  # cursor onto `contact?: {`
+        t.send("\r")
+        fold = t.card()
+        check("enter folds the selected block", "contact?: {…}" in fold, t)
+        check("a folded block hides its children", "email: string" not in fold, t)
+        check("a folded block says how much it hides",
+              "1 field" in fold and "▶" in fold, t)
+        t.send("\r")
+        check("enter unfolds it again", "email: string" in t.card(), t)
+        # C folds every nested block; E unfolds them all.
+        t.send("C")
+        col = t.card()
+        check("C folds every nested block", "email: string" not in col, t)
+        check("C keeps the outermost block open", "id: number" in col, t)
+        t.send("E")
+        check("E unfolds everything again", "email: string" in t.card(), t)
+
+        # `y` copies the whole type to the clipboard — folds and all.
         t.send("y")
-        check("y copies the inferred type", "copied type" in t.footer(), t)
+        copied = t.footer()
+        check("y copies the inferred type", "copied type" in copied, t)
+        t.send("C")
+        t.send("y")
+        check("folding doesn't change what y copies", t.footer() == copied, t)
         t.send("\x1b")  # close
 
         # A data-keyed object becomes Record<string, V> — values, not keys.
