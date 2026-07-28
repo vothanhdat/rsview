@@ -1,6 +1,6 @@
 [package]
 name = "jsonview"
-version = "0.21.4"
+version = "0.21.5"
 edition = "2021"
 description = "Browse, navigate and search multi-GB JSON in the terminal at near-constant memory (mmap + lazy byte-range parsing)"
 authors = ["Dat Vo <datvogpt@gmail.com>"]
