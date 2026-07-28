@@ -12,6 +12,7 @@ mod schema;
 mod search;
 mod source;
 mod stream;
+mod table;
 mod tree;
 mod ui;
 use filter::{parse_pipeline, Filter, Program};
@@ -20,6 +21,7 @@ use scanner::{container_empty, decode_str, skip_value, skip_ws, Kind};
 use search::{Pattern, Search};
 use source::Source;
 use stream::{spawn_reader, take_pipe_reader, StreamStore, STREAM_REBUILD_MS};
+use table::Table;
 use tree::{
     aggregate_numbers, breadcrumb_segments, collect_expanded, count_children, expand_to, flatten,
     get, get_mut, join_path, make_root, make_subroot, parse_path, resolve_with_climb, set_expanded,
@@ -64,6 +66,11 @@ const WHEEL_STEP: usize = 3;
 /// truncation rather than emit a megabytes-long escape. (To extract a big
 /// subtree wholesale, that's the export-to-file feature's job, not the clipboard.)
 const COPY_MAX_BYTES: usize = 1 << 20; // 1 MiB
+
+/// How far `G` will enumerate a table's rows to find the last one. Like `c`'s
+/// child count this is an on-demand full scan, but it materializes a node per
+/// row, so it stops here rather than walking a billion-element array.
+const TABLE_END_ROWS: usize = 200_000;
 
 /// Wall-clock budget for one cooperative `flatten` pass. When reaching the next
 /// on-screen row means skipping over a huge value (e.g. a 1 GB array to find the
@@ -330,6 +337,10 @@ pub(crate) struct View {
     pub(crate) peek: Option<Peek>,
     /// The open schema overlay, if any (`Mode::Schema`).
     pub(crate) schema: Option<SchemaView>,
+    /// The open table view (`T`), if any. While it's set the pane draws a grid
+    /// instead of the outline and navigation keys move the cell cursor; the tree
+    /// underneath is untouched, so `T` again steps back into it.
+    pub(crate) table: Option<Table>,
 }
 
 impl View {
@@ -377,6 +388,7 @@ impl View {
             filter_added: 0,
             peek: None,
             schema: None,
+            table: None,
         }
     }
 
@@ -449,22 +461,31 @@ impl View {
             return false; // a container — let Enter toggle it
         }
         let node = get(&self.root, &row.path);
-        let cap = node.start.saturating_add(PEEK_MAX_BYTES);
-        let e = node.end.min(cap);
-        let truncated = node.end > cap;
-        let text = match node.kind {
-            Kind::Str => decode_str(b, node.start, e),
+        let (title, start, end, kind) = (row.label.clone(), node.start, node.end, node.kind);
+        self.open_peek(b, title, start, end, kind);
+        true
+    }
+
+    /// Open the peek overlay on a byte range: decode it once (bounded by
+    /// `PEEK_MAX_BYTES`, escapes rendered) so the overlay reads and scrolls
+    /// without touching the source again. Shared by the tree's `Enter` and the
+    /// table's cell peek.
+    fn open_peek(&mut self, b: &[u8], title: String, start: usize, end: usize, kind: Kind) {
+        let cap = start.saturating_add(PEEK_MAX_BYTES);
+        let e = end.min(cap);
+        let truncated = end > cap;
+        let text = match kind {
+            Kind::Str => decode_str(b, start, e),
             // Other scalars are their literal bytes (a long bignum, say).
-            _ => String::from_utf8_lossy(&b[node.start..e]).into_owned(),
+            _ => String::from_utf8_lossy(&b[start..e]).into_owned(),
         };
         self.peek = Some(Peek {
-            title: row.label.clone(),
+            title,
             text,
             truncated,
             scroll: 0,
         });
         self.mode = Mode::Peek;
-        true
     }
 
     /// (Re)launch the live search for the current `query`. Dropping the previous
@@ -743,6 +764,94 @@ impl View {
         }
     }
 
+    /// The focused node's inferred type, with its label — what `t` renders and
+    /// `T` tabulates. `None` when the focus isn't a container.
+    fn infer_focused(&self, b: &[u8]) -> Option<(String, schema::Type)> {
+        let row = self.rows.get(self.focus)?;
+        let node = get(&self.root, &row.path);
+        if !node.jsonl && !matches!(node.kind, Kind::Object | Kind::Array) {
+            return None;
+        }
+        // A filter-result pane's root is synthetic: its children are hits from all
+        // over the document, so its type comes from *them*. Its byte range is the
+        // range that was searched, which would infer something else entirely.
+        let ty = if self.filter.is_some() && row.path.is_empty() {
+            schema::infer_seq(b, node.children.iter().map(|c| (c.start, c.end, c.kind)))
+        } else {
+            schema::infer(b, node.start, node.end, node.kind, node.jsonl)
+        };
+        Some((row.label.clone(), ty))
+    }
+
+    /// Put the pane into table view over the focused container, or explain why it
+    /// can't. The tree keeps its focus and expansion — `T` is a lens, not a jump.
+    fn open_table(&mut self, b: &[u8]) -> Option<String> {
+        let Some((label, ty)) = self.infer_focused(b) else {
+            return Some("table: focus an array or a map of records".to_string());
+        };
+        let path = self.rows.get(self.focus)?.path.clone();
+        let Some((cols, total)) = schema::columns(&ty) else {
+            return Some("table: that's one record, not a sequence of them".to_string());
+        };
+        self.table = Some(Table::new(path, label, cols, total));
+        None
+    }
+
+    /// Leave table view, landing the tree focus on the row that was under the
+    /// cursor — so stepping out keeps your place instead of resetting it.
+    fn close_table(&mut self, b: &[u8]) {
+        let Some(t) = self.table.take() else {
+            return;
+        };
+        let mut path = t.root.clone();
+        path.push(t.row);
+        expand_to(&mut self.root, b, &path);
+        self.want_path = Some(path);
+    }
+
+    /// `G` in table view: enumerate the rest of the level (up to
+    /// `TABLE_END_ROWS`) and put the cursor on the last row. Returns a status
+    /// line when the cap stopped it short of the real end.
+    fn table_end(&mut self, b: &[u8]) -> Option<String> {
+        let mut t = self.table.take()?;
+        let node = get_mut(&mut self.root, &t.root);
+        node.ensure_child(b, TABLE_END_ROWS);
+        t.known = node.children.len();
+        t.done = node.done;
+        t.row = t.known.saturating_sub(1);
+        let capped = !t.done && t.known >= TABLE_END_ROWS;
+        self.table = Some(t);
+        capped.then(|| {
+            format!(
+                "stopped at {} rows — G doesn't scan further",
+                group(TABLE_END_ROWS)
+            )
+        })
+    }
+
+    /// Refresh the table view's window: the table-mode counterpart of
+    /// [`View::flatten_window`], called once per frame with the pane's geometry.
+    fn refresh_table(&mut self, b: &[u8], h: usize, w: usize) {
+        let Some(mut t) = self.table.take() else {
+            return;
+        };
+        // One row of the pane goes to the column headers.
+        let vis = h.saturating_sub(1).max(1);
+        let node = get_mut(&mut self.root, &t.root);
+        // A collapsed container hasn't got a child cursor yet; the table needs one
+        // (this is also what leaves the tree expanded when the table closes).
+        if node.has_children && !node.expanded {
+            node.toggle();
+        }
+        t.refresh(node, b, vis, w);
+        // On a filter-result pane the rows arrive from the worker, not a cursor,
+        // so "is that all of them?" is the filter's answer, not the node's.
+        if let Some(f) = self.filter.as_ref() {
+            t.done = f.finished;
+        }
+        self.table = Some(t);
+    }
+
     /// Flatten this pane's visible window, land any pending jump, and clamp
     /// focus/scroll into range. `h` is the pane's content height.
     fn flatten_window(&mut self, b: &[u8], h: usize) {
@@ -890,37 +999,68 @@ impl App {
     /// the terminal clipboard. Clamped to `COPY_MAX_BYTES`. Returns a status line.
     fn yank_value(&self, b: &[u8]) -> String {
         match self.focused_range() {
-            Some((s, prov_end)) => {
-                // `prov_end` may be provisional (a container whose closer wasn't
-                // scanned — it spans to the parent's bound, so a naive slice would
-                // run into siblings). Find the real closer, but never scan past
-                // what we'd copy anyway: the copy cap. If the scan stops at the cap
-                // rather than a closer, the value is larger than the cap → truncated.
-                let cap = s.saturating_add(COPY_MAX_BYTES);
-                let scan_to = prov_end.min(cap);
-                let e = skip_value(b, s, scan_to);
-                let truncated = e >= cap && cap < prov_end;
-                let slice = &b[s..e];
-                // Trim trailing whitespace — the document root's range runs to EOF,
-                // so it would otherwise carry the file's final newline.
-                let cut = slice
-                    .iter()
-                    .rposition(|c| !c.is_ascii_whitespace())
-                    .map_or(0, |p| p + 1);
-                let slice = &slice[..cut];
-                copy_to_clipboard(slice);
-                let n = slice.len();
-                if truncated {
-                    format!(
-                        "copied {n} B (truncated at {} KiB cap)",
-                        COPY_MAX_BYTES >> 10
-                    )
-                } else {
-                    format!("copied value ({n} B)")
-                }
-            }
+            Some((s, prov_end)) => copy_range(b, s, prov_end),
             None => "nothing to copy".to_string(),
         }
+    }
+
+    /// The active pane's table and the container node it's drawn over.
+    fn table_ctx(&self) -> Option<(&Table, &Node)> {
+        let v = self.active_view();
+        let t = v.table.as_ref()?;
+        Some((t, get(&v.root, &t.root)))
+    }
+
+    /// Copy the cell under the table cursor (`y` in table view).
+    fn yank_cell(&self, b: &[u8]) -> String {
+        let Some((t, node)) = self.table_ctx() else {
+            return "nothing to copy".to_string();
+        };
+        match t.cursor_range(node, b) {
+            Some((s, e, _)) => copy_range(b, s, e),
+            None => format!("{}: no value in this row", t.cursor_label()),
+        }
+    }
+
+    /// Copy the whole row under the table cursor — the element's raw JSON.
+    fn yank_table_row(&self, b: &[u8]) -> String {
+        let Some((t, node)) = self.table_ctx() else {
+            return "nothing to copy".to_string();
+        };
+        match node.children.get(t.row) {
+            Some(c) => copy_range(b, c.start, c.end),
+            None => "nothing to copy".to_string(),
+        }
+    }
+
+    /// Peek the cell under the table cursor: a scalar decodes in full, a nested
+    /// container shows its raw JSON. Returns a status line when the row hasn't
+    /// got that field.
+    fn peek_cell(&mut self, b: &[u8]) -> Option<String> {
+        let (title, found) = {
+            let (t, node) = self.table_ctx()?;
+            (t.cursor_label(), t.cursor_range(node, b))
+        };
+        let Some((s, prov_end, kind)) = found else {
+            return Some(format!("{title}: no value in this row"));
+        };
+        // A container's end may be provisional (its closer isn't scanned yet), so
+        // resolve it before slicing — bounded by what the overlay would decode
+        // anyway. Hitting that bound means the value really is bigger, so hand the
+        // provisional end over and let the overlay clamp it and flag "truncated".
+        let end = if matches!(kind, Kind::Object | Kind::Array) {
+            let cap = s.saturating_add(PEEK_MAX_BYTES);
+            let e = skip_value(b, s, prov_end.min(cap));
+            if e >= cap && cap < prov_end {
+                prov_end
+            } else {
+                e
+            }
+        } else {
+            prov_end
+        };
+        self.active_mut().open_peek(b, title, s, end, kind);
+        None
     }
 
     /// Copy the path to the focused node (`data.users[3].city`) to the clipboard.
@@ -1165,6 +1305,36 @@ impl App {
     }
 }
 
+/// Copy the raw JSON at `[start, prov_end)` to the clipboard, returning a status
+/// line. `prov_end` may be provisional (a container whose closer wasn't scanned —
+/// it spans to the parent's bound, so a naive slice would run into siblings), so
+/// find the real closer, but never scan past what we'd copy anyway: the copy cap.
+/// If the scan stops at the cap rather than a closer, the value is larger than
+/// the cap → truncated.
+fn copy_range(b: &[u8], start: usize, prov_end: usize) -> String {
+    let cap = start.saturating_add(COPY_MAX_BYTES);
+    let e = skip_value(b, start, prov_end.min(cap));
+    let truncated = e >= cap && cap < prov_end;
+    let slice = &b[start..e];
+    // Trim trailing whitespace — the document root's range runs to EOF, so it
+    // would otherwise carry the file's final newline.
+    let cut = slice
+        .iter()
+        .rposition(|c| !c.is_ascii_whitespace())
+        .map_or(0, |p| p + 1);
+    let slice = &slice[..cut];
+    copy_to_clipboard(slice);
+    let n = slice.len();
+    if truncated {
+        format!(
+            "copied {n} B (truncated at {} KiB cap)",
+            COPY_MAX_BYTES >> 10
+        )
+    } else {
+        format!("copied value ({n} B)")
+    }
+}
+
 /// Copy `data` to the terminal clipboard via OSC 52. This goes through the
 /// terminal itself (not a system clipboard library), so it works over SSH and
 /// needs no platform-specific dependency. Written straight to stdout and flushed;
@@ -1217,8 +1387,13 @@ fn render_frame(
     // reserves one title row; the footer is global, below the panes.
     let rects = ui::pane_layout(ui::panes_area(term_area()?), &app.weights(), app.stacked);
     for (i, v) in app.views.iter_mut().enumerate() {
-        let h = (rects[i * 2].height as usize).saturating_sub(1).max(1);
-        v.flatten_window(b, h);
+        let rect = rects[i * 2];
+        let h = (rect.height as usize).saturating_sub(1).max(1);
+        if v.table.is_some() {
+            v.refresh_table(b, h, rect.width as usize);
+        } else {
+            v.flatten_window(b, h);
+        }
     }
     term.draw(|f| ui::draw(f, app, streaming))?;
     Ok(())
@@ -1513,6 +1688,15 @@ fn process_key(
     // keys below set a fresh one.
     app.flash = None;
 
+    // A pane in table view routes navigation to the grid. Whatever the table
+    // doesn't claim (pane splits, the prompts, `?`, `q`, `t`) falls through to the
+    // normal keys, which still act on the container the table was opened over.
+    if app.active_view().table.is_some() {
+        if let Some(out) = table_key(app, k, b, h, ctrl) {
+            return out;
+        }
+    }
+
     // Normal mode: workspace-level keys (pane management) first.
     match k.code {
         // Copy the focused value (raw JSON / subtree) or its path to the clipboard.
@@ -1615,15 +1799,10 @@ fn process_key(
         // `t` shows the focused container's shape: a sampled field→type summary.
         // `t` infers the focused node's structural type (JSON→TypeScript-style).
         KeyCode::Char('t') => {
-            let v = app.active_view();
-            let built = v.rows.get(v.focus).and_then(|row| {
-                let node = get(&v.root, &row.path);
-                if !node.jsonl && !matches!(node.kind, Kind::Object | Kind::Array) {
-                    return None;
-                }
-                let ty = schema::infer(b, node.start, node.end, node.kind, node.jsonl);
-                Some(SchemaView::new(row.label.clone(), &ty))
-            });
+            let built = app
+                .active_view()
+                .infer_focused(b)
+                .map(|(label, ty)| SchemaView::new(label, &ty));
             match built {
                 Some(s) => {
                     let v = app.active_mut();
@@ -1631,6 +1810,15 @@ fn process_key(
                     v.mode = Mode::Schema;
                 }
                 None => app.flash = Some("schema: focus an array or object".to_string()),
+            }
+            return KeyOutcome::Continue;
+        }
+        // `T` tabulates the focused sequence: the same inferred type the `t`
+        // overlay shows, but as columns, with the container's children as rows.
+        KeyCode::Char('T') => {
+            let v = app.active_mut();
+            if let Some(msg) = v.open_table(b) {
+                app.flash = Some(msg);
             }
             return KeyOutcome::Continue;
         }
@@ -1757,6 +1945,68 @@ fn process_key(
     KeyOutcome::Continue
 }
 
+/// Keys for a pane in table view. Returns `None` for anything the table doesn't
+/// handle, so the key falls through to the normal-mode bindings.
+fn table_key(
+    app: &mut App,
+    k: ratatui::crossterm::event::KeyEvent,
+    b: &[u8],
+    h: usize,
+    ctrl: bool,
+) -> Option<KeyOutcome> {
+    // One pane row is the column header, so a page is one row shorter than the
+    // tree's.
+    let page = h.saturating_sub(1).max(1);
+    match k.code {
+        // `T` again (or Esc) steps back into the tree, on the row you were reading.
+        KeyCode::Char('T') | KeyCode::Esc => app.active_mut().close_table(b),
+        // The tree-navigation keys land you on a *row*, which a grid can't show —
+        // so they step out of the table first, then run as usual.
+        KeyCode::Char('/') | KeyCode::Char(':') | KeyCode::Char('\'') => {
+            app.active_mut().close_table(b);
+            return None;
+        }
+        // Enter reads the cell in full; y copies it, Y the whole row.
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if let Some(msg) = app.peek_cell(b) {
+                app.flash = Some(msg);
+            }
+        }
+        KeyCode::Char('y') => app.flash = Some(app.yank_cell(b)),
+        KeyCode::Char('Y') => app.flash = Some(app.yank_table_row(b)),
+        // `G` means the *last* row, so it enumerates the rest of the level
+        // (bounded) rather than stopping at whatever the viewport has scanned in.
+        KeyCode::End | KeyCode::Char('G') => {
+            if let Some(msg) = app.active_mut().table_end(b) {
+                app.flash = Some(msg);
+            }
+        }
+        _ => {
+            let t = app.active_mut().table.as_mut()?;
+            let last_row = t.known.saturating_sub(1);
+            let last_col = t.cols.len().saturating_sub(1);
+            match k.code {
+                KeyCode::Down | KeyCode::Char('j') => t.row = (t.row + 1).min(last_row),
+                KeyCode::Up | KeyCode::Char('k') => t.row = t.row.saturating_sub(1),
+                KeyCode::Right | KeyCode::Char('l') => t.col = (t.col + 1).min(last_col),
+                KeyCode::Left | KeyCode::Char('h') => t.col = t.col.saturating_sub(1),
+                KeyCode::PageDown => t.row = (t.row + page).min(last_row),
+                KeyCode::PageUp => t.row = t.row.saturating_sub(page),
+                KeyCode::Char('f') if ctrl => t.row = (t.row + page).min(last_row),
+                KeyCode::Char('b') if ctrl => t.row = t.row.saturating_sub(page),
+                KeyCode::Char('d') if ctrl => t.row = (t.row + page / 2).min(last_row),
+                KeyCode::Char('u') if ctrl => t.row = t.row.saturating_sub(page / 2),
+                KeyCode::Home | KeyCode::Char('g') => t.row = 0,
+                // Horizontal ends, vi-style: `0` first column, `$` last.
+                KeyCode::Char('0') | KeyCode::Char('^') => t.col = 0,
+                KeyCode::Char('$') => t.col = last_col,
+                _ => return None,
+            }
+        }
+    }
+    Some(KeyOutcome::Continue)
+}
+
 /// Group an integer with thousands separators: `1234567` → `"1,234,567"`.
 fn group(n: usize) -> String {
     let s = n.to_string();
@@ -1859,11 +2109,21 @@ fn pump_input(app: &mut App, b: &[u8], h: usize, poll_ms: u64) -> std::io::Resul
                 if step != 0 {
                     if let Some(i) = pane_at(app, m.column, m.row)? {
                         let v = &mut app.views[i];
-                        v.focus = if step > 0 {
-                            v.focus + step as usize
-                        } else {
-                            v.focus.saturating_sub((-step) as usize)
+                        // In table view the wheel moves the row cursor; the next
+                        // refresh clamps it to what's been enumerated.
+                        let cur = match v.table.as_ref() {
+                            Some(t) => t.row,
+                            None => v.focus,
                         };
+                        let next = if step > 0 {
+                            cur + step as usize
+                        } else {
+                            cur.saturating_sub((-step) as usize)
+                        };
+                        match v.table.as_mut() {
+                            Some(t) => t.row = next,
+                            None => v.focus = next,
+                        }
                     }
                 }
             }

@@ -6,7 +6,7 @@
 
 use crate::input::TextInput;
 use crate::scanner::Kind;
-use crate::tree::{breadcrumb_segments, join_path};
+use crate::tree::{breadcrumb_segments, join_path, truncate};
 use crate::{App, Mode, View};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -262,6 +262,13 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, view: &View, flash: Optio
             format!(" {msg}"),
             Style::default().fg(Color::Green),
         ))
+    } else if view.table.is_some() {
+        // Table view rebinds the movement keys, so the hint says so rather than
+        // advertising the tree's.
+        Line::from(Span::styled(
+            " ↑/↓ row · ←/→ column · enter read cell · y/Y copy cell/row · T tree · ? help",
+            Style::default().fg(Color::DarkGray),
+        ))
     } else {
         let mut spans = vec![Span::styled(
             " ↑/↓ move · enter expand · / search · : goto · | filter · y copy · ? help · q quit",
@@ -387,6 +394,7 @@ pub(crate) fn render_help(f: &mut Frame, area: Rect) {
         ("←", "collapse / parent"),
         ("wheel", "scroll the pane"),
         ("t", "infer type (TS) · ↵ fold · y copy"),
+        ("T", "table view · h/l column · ↵ read cell"),
         ("c", "count children"),
         ("#", "aggregate numbers (Σ min/max/avg)"),
         ("/", "search · ⇥ scope subtree"),
@@ -829,7 +837,119 @@ pub(crate) fn spinner_frame() -> &'static str {
 /// Draw one pane (title + breadcrumb, then content rows) into `rect`. The active
 /// pane gets a bright title and is the only one to show its cursor bar; the
 /// key/search footer is global (see [`render_footer`]), not per-pane.
+/// One cell, padded to `w` — numbers right-aligned so a column of them lines up
+/// on the units digit, everything else left-aligned. Truncated with `…` when the
+/// value is wider than the column.
+fn cell_text(text: &str, w: usize, right: bool) -> String {
+    let s = truncate(text, w);
+    let pad = " ".repeat(w.saturating_sub(s.chars().count()));
+    if right {
+        format!("{pad}{s}")
+    } else {
+        format!("{s}{pad}")
+    }
+}
+
+/// A pane in table view: a header row of column names over the container's
+/// children, one row each. The row-label gutter (array index or map key) is
+/// pinned at the left, so horizontal scrolling never loses track of which row is
+/// which. The cell under the cursor is drawn reversed, as is its row label.
+fn render_table(f: &mut Frame, rect: Rect, view: &View, active: bool) {
+    let Some(t) = view.table.as_ref() else {
+        return;
+    };
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(rect);
+    let width = chunks[1].width as usize;
+    let cols = t.layout(width);
+
+    // Title: same shape as the tree pane's, with the grid's own position — row
+    // out of rows scanned (`+` while more remain) and which columns are shown.
+    let marker = if view.derived { "↳ " } else { "" };
+    let more = if t.done { "" } else { "+" };
+    let shown = match (cols.first(), cols.last()) {
+        (Some(a), Some(z)) if a.0 != z.0 => format!("cols {}–{}", a.0 + 1, z.0 + 1),
+        (Some(a), _) => format!("col {}", a.0 + 1),
+        _ => "no cols".to_string(),
+    };
+    let hidden = t.total_cols.saturating_sub(t.cols.len());
+    let dropped = if hidden > 0 {
+        format!(" · {hidden} sparse hidden")
+    } else {
+        String::new()
+    };
+    let pos = if t.known == 0 { 0 } else { t.row + 1 };
+    let prefix = format!(
+        " {marker}{}   {pos}/{}{more}   ▦ {} · {shown}/{}{dropped}",
+        view.name,
+        t.known,
+        t.title,
+        t.cols.len(),
+    );
+    let title_style = if active {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(prefix, title_style))),
+        chunks[0],
+    );
+
+    // Header: the pinned gutter's `#`, then each visible column name.
+    let head = Style::default().fg(C_KEY).add_modifier(Modifier::BOLD);
+    let gap = " ".repeat(crate::table::COL_GAP);
+    let mut spans = vec![
+        Span::styled(cell_text("#", t.label_w, false), head),
+        Span::raw(gap.clone()),
+    ];
+    for &(i, _, w) in &cols {
+        let c = &t.cols[i];
+        spans.push(Span::styled(cell_text(&c.label, w, c.num), head));
+        spans.push(Span::raw(gap.clone()));
+    }
+    let mut lines = vec![Line::from(spans)];
+
+    for (n, r) in t.window.iter().enumerate() {
+        let selected = active && t.scroll + n == t.row;
+        let label_style = if selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(C_INDEX)
+        };
+        let mut spans = vec![
+            Span::styled(cell_text(&r.label, t.label_w, false), label_style),
+            Span::raw(gap.clone()),
+        ];
+        for &(i, _, w) in &cols {
+            let col = &t.cols[i];
+            let (text, kind) = match r.cells.get(i) {
+                Some(c) => (c.text.as_str(), c.kind),
+                None => ("", None),
+            };
+            let style = if selected && i == t.col {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                match kind {
+                    Some(k) => Style::default().fg(value_color(k)),
+                    // A row without this field: nothing to color, nothing to show.
+                    None => Style::default(),
+                }
+            };
+            spans.push(Span::styled(cell_text(text, w, col.num), style));
+            spans.push(Span::raw(gap.clone()));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), chunks[1]);
+}
+
 pub(crate) fn render_pane(f: &mut Frame, rect: Rect, view: &View, active: bool, streaming: bool) {
+    if view.table.is_some() {
+        render_table(f, rect, view, active);
+        return;
+    }
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(rect);
 
     // Title: `↳ origin   focus/rows+` plus the focus breadcrumb. Count only real

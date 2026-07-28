@@ -68,6 +68,7 @@ From a checkout: `cargo run --release -- file.json`.
 | `Enter`/`→`/`Space` | expand / collapse a container — or peek a leaf's full value |
 | `←` | collapse, or jump to parent if already collapsed |
 | `t` · `c` · `#` | infer the value's type (TypeScript-style, foldable; `y` copies it) · count a container's children · aggregate its numeric children (count/sum/min/max/mean) |
+| `T` | table view — read a sequence as rows × columns (`←`/`→` move column, `Enter` reads a cell, `T` back) |
 | `/` | search (live — results stream as you type; `Tab` scopes it to the focused subtree) |
 | `Enter`/`↓` · `Shift-Enter`/`↑` (in search) | next / previous match |
 | `:` | jump to a path — absolute or relative to the cursor |
@@ -129,6 +130,32 @@ the richer ones:
   paste straight into your code. Sampling is bounded (2000
   records, a node budget), so it stays instant on huge, deeply-nested data. The
   inference lives in its own module, [src/schema.rs](src/schema.rs).
+- **Table (`T`)** — the same inferred type, turned sideways: press `T` on an
+  array (or a data-keyed map, or a filter-result pane) and the pane becomes a
+  **grid** — one row per element, one column per field, nested records flattened
+  into dotted columns (`addr.city`). Columns come straight from the inference
+  above, so they're ordered like the type, right-aligned when the field is
+  numeric, and the sparse ones (seen in under 5% of sampled rows) are dropped —
+  the title says how many. A nested array or a deeper object stays one `[…]`/`{…}`
+  cell rather than exploding the grid.
+  ```
+   data.json   3/40+   ▦ users · cols 1–5/7
+  #   id  name       active  addr.city  tags
+  0    0  "user0"    true    "NYC"      […]
+  1    1  "user1"    false   "LA"       […]
+  2    2  "user2"    true    "SF"       […]
+  ```
+  Navigation is the grid's: `j`/`k` (or `↑`/`↓`) move the row, `h`/`l` (or
+  `←`/`→`) the column, `0`/`$` jump to the first/last column, `g`/`G` to the first
+  and last row (`G` scans to the real end). `Enter` reads the cell under the
+  cursor in full in the peek overlay, `y` copies that cell, `Y` the whole row's
+  JSON. The row-label gutter (array index, or the map key) is pinned, so scrolling
+  sideways never loses track of which row is which. `T` again steps back into the
+  tree, focused on the row you were reading. Rows are the container's own lazy
+  children — the table enumerates only the screenful it draws, so tabulating a
+  1 GB array costs what scrolling it costs. It pairs naturally with `|`:
+  `.users[] | select(.age > 30)` into a result pane, then `T` to read the hits as
+  a table. See [src/table.rs](src/table.rs).
 - **Count (`c`)** — a container's exact child count (`1,234,567 elements`), a full
   scan but on demand, so you can size a collapsed level without opening it.
 - **Aggregate (`#`)** — the numeric companion to `c`: a one-line **count · sum ·
@@ -253,5 +280,6 @@ which could never have opened the whole file itself.
 | [src/scanner.rs](src/scanner.rs) | byte-range JSON scan + resumable child `Cursor` |
 | [src/main.rs](src/main.rs) | lazy `Node` tree, windowed flatten, multi-pane ratatui viewer, stdin streaming |
 | [src/search.rs](src/search.rs) | background-thread search + cancel + result stream |
-| [src/schema.rs](src/schema.rs) | JSON → structural type inference (the `t` overlay) |
+| [src/schema.rs](src/schema.rs) | JSON → structural type inference (the `t` overlay, and the table's columns) |
+| [src/table.rs](src/table.rs) | the `T` table view: schema-derived columns over the tree's lazy rows |
 | [src/source.rs](src/source.rs) | byte source: memory-mapped file or spilled stream, vs. RAM-buffered fallback |

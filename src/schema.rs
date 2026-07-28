@@ -6,7 +6,9 @@
 //! array elements and map values are unified into a single element type, mixed
 //! scalars become unions, and a data-keyed object becomes `Record<string, T>`.
 //! It's rendered TypeScript-style as a foldable outline (each object block
-//! collapses to `{…}`) and is copyable in full.
+//! collapses to `{…}`) and is copyable in full. The same type also drives the
+//! `T` table view's columns (see [`columns`]), so the grid and the schema can
+//! never disagree about a document's shape.
 //!
 //! Zero-copy: it reads byte ranges through the scanner's `Cursor` and never
 //! materializes a value. Bounded by sampling caps and a global node budget, so it
@@ -366,6 +368,21 @@ pub fn infer(b: &[u8], start: usize, end: usize, kind: Kind, jsonl: bool) -> Typ
     acc.finish()
 }
 
+/// Infer the type of a *synthetic* sequence — values that belong together but
+/// aren't contiguous in the file, like a filter pane's hits. Merged the same way
+/// an array's elements are, and reported as one: `T[]`.
+pub fn infer_seq(b: &[u8], items: impl Iterator<Item = (usize, usize, Kind)>) -> Type {
+    let mut bud = Budget(NODE_BUDGET);
+    let mut el = Acc::default();
+    for (i, (s, e, k)) in items.enumerate() {
+        if i >= TOP_SAMPLE {
+            break;
+        }
+        el.add(b, s, e, k, 1, &mut bud);
+    }
+    Type::Array(Box::new(el.finish()))
+}
+
 // --- rendering (TypeScript-ish) --------------------------------------------
 
 /// The scalar keyword for a leaf type, or `None` for a composite.
@@ -634,6 +651,113 @@ pub fn set_all_open(nodes: &mut [Outline], open: bool) {
     }
 }
 
+// --- table columns ---------------------------------------------------------
+
+/// Deepest object nesting flattened into dotted columns (`user.city`). A field
+/// below that shows as a `{…}` cell instead — a table is a grid, not a tree.
+const COL_DEPTH: usize = 2;
+/// Columns present in fewer than this share of sampled rows are dropped: a key
+/// seen twice in 5000 rows is noise, not a column.
+const MIN_FILL_PCT: usize = 5;
+/// Hard cap on columns, so a pathological record can't build a 4000-wide grid.
+const MAX_COLS: usize = 64;
+
+/// One column of the table view: where its cell lives inside a row, and what to
+/// call it. Derived from the same inferred [`Type`] the `t` overlay renders, so
+/// the table's shape and the schema's never disagree.
+#[derive(Debug, PartialEq, Clone)]
+pub struct Column {
+    /// Field path within a row (`["user","city"]`). Empty when the row *is* the
+    /// value (a sequence of scalars).
+    pub path: Vec<String>,
+    /// Header text — `path` joined with dots, or `value` for a bare sequence.
+    pub label: String,
+    /// True when every value observed here was a number, so cells right-align.
+    pub num: bool,
+    /// Percent of sampled rows carrying this field; 100 = always present.
+    pub fill: usize,
+}
+
+/// The element type of a sequence — what one table row looks like.
+fn element_of(ty: &Type) -> Option<&Type> {
+    match ty {
+        Type::Array(el) => Some(el),
+        Type::Map(_, v) => Some(v),
+        Type::Union(vs) => vs.iter().find_map(element_of),
+        _ => None,
+    }
+}
+
+/// The record fields of a type, looking through a union (rows of mixed shapes
+/// tabulate on the object arm; the others simply leave their cells blank).
+fn record_of(ty: &Type) -> Option<&Vec<Field>> {
+    match ty {
+        Type::Object(f) if !f.is_empty() => Some(f),
+        Type::Union(vs) => vs.iter().find_map(record_of),
+        _ => None,
+    }
+}
+
+/// Flatten a record's fields into columns, descending into nested records up to
+/// [`COL_DEPTH`]. `fill` is the enclosing field's fill rate, so a nested column's
+/// rate compounds (`user` in 50% of rows × `city` in 50% of those = 25%).
+fn push_columns(
+    fields: &[Field],
+    prefix: &mut Vec<String>,
+    fill: usize,
+    depth: usize,
+    out: &mut Vec<Column>,
+) {
+    for f in fields {
+        let own = if f.total == 0 {
+            100
+        } else {
+            f.present * 100 / f.total
+        };
+        let fill = fill * own / 100;
+        prefix.push(f.name.clone());
+        match record_of(&f.ty) {
+            Some(sub) if depth + 1 < COL_DEPTH => push_columns(sub, prefix, fill, depth + 1, out),
+            _ => out.push(Column {
+                label: prefix.join("."),
+                path: prefix.clone(),
+                num: matches!(f.ty, Type::Num),
+                fill,
+            }),
+        }
+        prefix.pop();
+    }
+}
+
+/// Columns for tabulating a value of type `ty`, or `None` when it isn't a
+/// sequence — a lone record has nothing to repeat down the page.
+///
+/// Also returns how many columns the type *has*, before sparse ones are dropped
+/// and the rest capped, so the view can say what it isn't showing.
+pub fn columns(ty: &Type) -> Option<(Vec<Column>, usize)> {
+    let el = element_of(ty)?;
+    let mut cols = Vec::new();
+    match record_of(el) {
+        Some(fields) => push_columns(fields, &mut Vec::new(), 100, 0, &mut cols),
+        // A sequence of scalars (or of arrays) is still a table — one column of
+        // values, which beats no table at all.
+        None => cols.push(Column {
+            path: Vec::new(),
+            label: "value".into(),
+            num: matches!(el, Type::Num),
+            fill: 100,
+        }),
+    }
+    let total = cols.len();
+    // Drop the near-empty columns — unless that's all of them, in which case a
+    // sparse grid still beats an empty one.
+    if cols.iter().any(|c| c.fill >= MIN_FILL_PCT) {
+        cols.retain(|c| c.fill >= MIN_FILL_PCT);
+    }
+    cols.truncate(MAX_COLS);
+    Some((cols, total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -802,6 +926,64 @@ mod tests {
         for line in r.iter().filter(|x| x.depth > 0) {
             assert!(!line.foldable, "{}", line.text);
         }
+    }
+
+    fn cols_of(json: &str) -> (Vec<String>, usize) {
+        let (cols, total) = columns(&ty_of(json)).expect("tabular");
+        (cols.into_iter().map(|c| c.label).collect(), total)
+    }
+
+    #[test]
+    fn a_lone_record_has_no_columns() {
+        assert!(columns(&ty_of(r#"{"a":1,"b":2}"#)).is_none());
+        assert!(columns(&ty_of(r#"42"#)).is_none());
+    }
+
+    #[test]
+    fn sparse_columns_are_dropped_and_counted() {
+        // `rare` shows up in 1 of 100 rows — below the fill floor.
+        let rows: Vec<String> = (0..100)
+            .map(|i| {
+                if i == 0 {
+                    r#"{"a":1,"rare":2}"#.to_string()
+                } else {
+                    r#"{"a":1}"#.to_string()
+                }
+            })
+            .collect();
+        let (labels, total) = cols_of(&format!("[{}]", rows.join(",")));
+        assert_eq!(labels, ["a"]);
+        assert_eq!(total, 2, "the dropped column is still counted");
+    }
+
+    #[test]
+    fn a_nested_columns_fill_rate_compounds_with_its_parents() {
+        // `u` in half the rows, `city` in half of those → 25%.
+        let (cols, _) =
+            columns(&ty_of(r#"[{"u":{"city":"NY"}},{"u":{}},{"x":1},{"x":1}]"#)).unwrap();
+        let city = cols.iter().find(|c| c.label == "u.city").expect("u.city");
+        assert_eq!(city.fill, 25);
+    }
+
+    #[test]
+    fn rows_of_mixed_shapes_tabulate_on_the_record_arm() {
+        let (labels, _) = cols_of(r#"[{"a":1},{"a":2},"loose string"]"#);
+        assert_eq!(labels, ["a"]);
+    }
+
+    #[test]
+    fn a_synthetic_sequence_infers_like_an_array() {
+        // Two objects that aren't siblings in the file (a filter pane's hits).
+        let doc = r#"{"x":{"a":1},"y":{"a":2,"b":"s"}}"#;
+        let b = doc.as_bytes();
+        let items = [
+            (doc.find(r#"{"a":1}"#).unwrap(), doc.len(), Kind::Object),
+            (doc.find(r#"{"a":2"#).unwrap(), doc.len(), Kind::Object),
+        ];
+        let t = to_source(&infer_seq(b, items.into_iter()));
+        assert!(t.contains("a: number"), "{t}");
+        assert!(t.contains("b?: string"), "{t}");
+        assert!(t.trim_end().ends_with("}[]"), "{t}");
     }
 
     #[test]

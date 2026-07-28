@@ -508,6 +508,69 @@ def scenario_explore(binary):
         t.close()
 
 
+def scenario_table(binary):
+    print("table: T grids a sequence, cell cursor, copy, back to the tree")
+    doc = {"users": [
+        {"id": i, "name": f"user{i}", "addr": {"city": ["NYC", "LA", "SF"][i % 3]},
+         "tags": ["a", "b"], **({"vip": True} if i == 0 else {})}
+        for i in range(300)
+    ], "meta": {"n": 300}}
+    t = Tui(binary, doc)
+    try:
+        t.send("T")
+        check("T on a lone record explains itself instead of drawing a grid",
+              "not a sequence" in t.footer(), t)
+
+        t.send(":"); t.send("users"); t.send("\r")
+        t.send("T")
+        head = t.line(1)
+        check("header names the columns, nested ones dotted",
+              head.startswith("#") and "id" in head and "name" in head
+              and "addr.city" in head, t)
+        check("a column below the fill floor is dropped and admitted to",
+              "vip" not in head and "sparse hidden" in t.title(), t)
+        check("rows are the elements, labelled by index",
+              t.line(2).startswith("0 ") and '"user0"' in t.line(2)
+              and '"NYC"' in t.line(2), t)
+        check("a nested array is one cell, not a column explosion",
+              "[…]" in t.line(2), t)
+        check("the title counts rows and columns",
+              "1/" in t.title() and "▦ users" in t.title(), t)
+        check("the footer switches to the grid's keys",
+              "←/→ column" in t.footer(), t)
+
+        # Only the visible window (plus its lookahead) is enumerated: the title's
+        # `+` says the count is still provisional.
+        check("rows stream in lazily rather than all at once",
+              "/300" not in t.title() and "+" in t.title(), t)
+        t.send("G")
+        check("G reaches the real last row", "300/300" in t.title(), t)
+        check("the last element is on screen", '"user299"' in t.dump(), t)
+        t.send("g")
+        check("g returns to the first row", "1/300" in t.title(), t)
+
+        # The cell cursor: →/l walks columns, Enter reads one in full.
+        t.send("jj")      # row 2
+        t.send("ll")      # column 3 (addr.city)
+        t.send("\r")
+        check("Enter peeks the cell under the cursor, named row.column",
+              "peek · 2.addr.city" in t.card() and "SF" in t.card(), t)
+        t.send("\x1b")
+        t.send("y")
+        check("y copies the cell, not the row", "copied value (4 B)" in t.footer(), t)
+        t.send("Y")
+        check("Y copies the whole row", "copied value" in t.footer()
+              and "(4 B)" not in t.footer(), t)
+
+        # Stepping out lands the tree focus on the row that was under the cursor.
+        t.send("T")
+        check("T again returns to the tree, on the row you were reading",
+              "users › [2]" in t.title(), t)
+        check("the grid is gone", "addr.city" not in t.line(1), t)
+    finally:
+        t.close()
+
+
 def scenario_help_overlay(binary):
     print("help: ? overlay + trimmed footer")
     t = Tui(binary, {"a": {"b": 1}, "c": [1, 2, 3]})
@@ -580,6 +643,7 @@ def main():
     scenario_peek(binary)
     scenario_stream_pipe(binary)
     scenario_explore(binary)
+    scenario_table(binary)
     scenario_help_overlay(binary)
     scenario_bookmark_indicator(binary)
 

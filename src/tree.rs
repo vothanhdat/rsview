@@ -20,6 +20,9 @@ use std::time::Instant;
 const PREVIEW_ITEMS: usize = 5;
 /// Max display width of a collapsed preview before it's truncated with `…`.
 const PREVIEW_WIDTH: usize = 64;
+/// Max display width of one value inside a preview — also a table cell's width
+/// cap, since a cell is exactly that: one value, briefly.
+pub const BRIEF_WIDTH: usize = 24;
 /// Bytes the inline preview will step over to reach the *next* sibling before
 /// giving up with `…`. A preview must be cheap to recompute every frame, so it
 /// must never pay a huge `skip_value`: if the next key sits behind a value bigger
@@ -255,28 +258,35 @@ pub fn decode_cap(start: usize, end: usize) -> usize {
 /// A brief one-level rendering of a value for use inside a parent's preview:
 /// nested containers collapse to `{…}`/`[…]`, scalars show their literal.
 fn brief(b: &[u8], rc: &RawChild) -> String {
-    match rc.kind {
+    brief_value(b, rc.start, rc.end, rc.kind)
+}
+
+/// [`brief`] over a bare byte range — what a table cell shows. Bounded like
+/// every other preview: at most `PREVIEW_DECODE_BYTES` decoded, truncated to
+/// `BRIEF_WIDTH`, and containers never descend.
+pub fn brief_value(b: &[u8], start: usize, end: usize, kind: Kind) -> String {
+    match kind {
         Kind::Object => {
-            if container_empty(b, rc.start, rc.end) {
+            if container_empty(b, start, end) {
                 "{}".into()
             } else {
                 "{…}".into()
             }
         }
         Kind::Array => {
-            if container_empty(b, rc.start, rc.end) {
+            if container_empty(b, start, end) {
                 "[]".into()
             } else {
                 "[…]".into()
             }
         }
         Kind::Str => {
-            let e = decode_cap(rc.start, rc.end);
-            format!("\"{}\"", truncate(&decode_str(b, rc.start, e), 24))
+            let e = decode_cap(start, end);
+            format!("\"{}\"", truncate(&decode_str(b, start, e), BRIEF_WIDTH))
         }
         _ => {
-            let e = decode_cap(rc.start, rc.end);
-            truncate(&String::from_utf8_lossy(&b[rc.start..e]), 24)
+            let e = decode_cap(start, end);
+            truncate(&String::from_utf8_lossy(&b[start..e]), BRIEF_WIDTH)
         }
     }
 }
