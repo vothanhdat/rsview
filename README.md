@@ -33,8 +33,8 @@ It picks the right build (Linux x86_64/arm64, macOS Intel/Apple Silicon) and
 drops it in `~/.local/bin`. Or, if you'd rather:
 
 ```sh
-cargo binstall jview      # prebuilt binary via cargo-binstall
-cargo install  jview      # compile from crates.io
+cargo binstall jsonview   # prebuilt binary via cargo-binstall (installs `jview`)
+cargo install  jsonview   # compile from crates.io (installs `jview`)
 ```
 
 Windows binaries (and every release archive) are attached to each

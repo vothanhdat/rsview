@@ -2,7 +2,7 @@ name: release
 
 # Build prebuilt binaries for all common platforms and attach them to the
 # GitHub Release. The archive names are cargo-binstall-compatible, so
-# `cargo binstall jview` pulls these directly.
+# `cargo binstall jsonview` pulls these directly.
 #
 # Two ways to cut a release:
 #   * push a `v*` tag (the classic path), or
@@ -67,7 +67,7 @@ jobs:
             || gh release create "$TAG" \
                  --repo "$GITHUB_REPOSITORY" \
                  --title "jview $TAG" \
-                 --notes "Prebuilt binaries for Linux (x86_64/arm64), macOS (Intel/Apple Silicon), and Windows. Or install with \`cargo binstall jview\`."
+                 --notes "Prebuilt binaries for Linux (x86_64/arm64), macOS (Intel/Apple Silicon), and Windows. Or install with \`cargo binstall jsonview\`."
 
   upload-binaries:
     needs: [resolve, create-release]
