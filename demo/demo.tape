@@ -1,4 +1,4 @@
-# jview demo recording — drives the real binary to a lossless PNG sequence,
+# jsonview demo recording — drives the real binary to a lossless PNG sequence,
 # then assembles a full-color animated WebP for the README. (No GIF: 256-color
 # palette + dithering wreck the text. No video intermediate either: VP9
 # quantization perturbs identical-looking frames just enough that img2webp
@@ -22,7 +22,7 @@
 
 Output frames/
 
-Require jview
+Require jsonview
 
 Set Shell bash
 # Grid is ~2/3 the cols/rows (bigger, more readable text), rendered at 2x pixel
@@ -44,7 +44,7 @@ Sleep 600ms
 # ...opens instantly. The open is captured on-camera here (no Hide). The headless
 # ttyd recorder takes ~2s to first-paint a fresh process — real terminals are
 # instant — so the leading frames are blank; trim them in post if needed.
-Type "jview demo/big.json"
+Type "jsonview demo/big.json"
 Sleep 1s
 Enter
 Sleep 1s

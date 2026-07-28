@@ -29,7 +29,7 @@ pub const STREAM_REBUILD_MS: u128 = 100;
 /// cache instead of resident anonymous RAM, and RSS stays ~flat however large
 /// the stream (the same property the file path has). The temp file is unlinked
 /// the instant it's opened: it has no name on disk, the open fd keeps the inode
-/// alive, and the OS reclaims the space when jview exits — cleanly, even on a
+/// alive, and the OS reclaims the space when jsonview exits — cleanly, even on a
 /// panic or `SIGKILL`. Where spilling isn't available (non-unix, or no writable
 /// temp dir) it falls back to an in-RAM `Vec`, the fully-resident behaviour.
 pub enum StreamStore {
@@ -68,7 +68,7 @@ impl StreamStore {
         // if a prior run was killed in the microseconds before its own unlink —
         // try a few suffixes to be safe.
         for n in 0..8 {
-            let path = dir.join(format!("jview-stream-{}-{}.json", std::process::id(), n));
+            let path = dir.join(format!("jsonview-stream-{}-{}.json", std::process::id(), n));
             if let Ok(file) = OpenOptions::new()
                 .read(true)
                 .append(true)
@@ -76,7 +76,7 @@ impl StreamStore {
                 .open(&path)
             {
                 // Unlink now: no directory entry to clean up, so the space is
-                // reclaimed on exit however jview dies. The fd (and any mmap of
+                // reclaimed on exit however jsonview dies. The fd (and any mmap of
                 // it) keeps the bytes readable meanwhile.
                 let _ = std::fs::remove_file(&path);
                 return Some(StreamStore::Spilled {

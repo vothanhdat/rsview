@@ -1,4 +1,4 @@
-//! jview — proof-of-concept lazy JSON viewer in Rust.
+//! jsonview — proof-of-concept lazy JSON viewer in Rust.
 //!
 //! Demonstrates the core of react-obj-view's CLI in native Rust: a file is
 //! memory-mapped, parsed on expand (subtrees are byte ranges, not materialized
@@ -1401,12 +1401,12 @@ fn process_key(
         }
         // `p` pipes the focused node's raw JSON out: it records the range and
         // quits, and the caller writes that slice to the reserved stdout. Only
-        // meaningful when stdout is redirected (`jview … | jq`) — into a
+        // meaningful when stdout is redirected (`jsonview … | jq`) — into a
         // terminal there's nowhere to pipe, so show a hint instead of quitting.
         KeyCode::Char('p') => {
             if !app.can_extract {
                 app.flash =
-                    Some("pipe jview into a command (e.g. | jq) to extract a node".to_string());
+                    Some("pipe jsonview into a command (e.g. | jq) to extract a node".to_string());
                 return KeyOutcome::Continue;
             }
             // On a filter-result pane, `p` carves out *all* the hits as NDJSON;
@@ -1947,7 +1947,7 @@ const THEME_QUERY_TIMEOUT: Duration = Duration::from_millis(300);
 /// the theme — every other color is a named ANSI color that already follows the
 /// terminal palette. `terminal-colorsaurus` queries the terminal (OSC 11, with
 /// tmux/screen handling and a fast fall-through for terminals that don't support
-/// it); we default to dark on any error. `JVIEW_THEME=light|dark` forces the
+/// it); we default to dark on any error. `JSONVIEW_THEME=light|dark` forces the
 /// result and skips the query — used by the demo recording and the e2e harness,
 /// where the emulated terminal never answers.
 ///
@@ -1956,7 +1956,10 @@ const THEME_QUERY_TIMEOUT: Duration = Duration::from_millis(300);
 /// `pump_input`) so a theme flip while the app was in the background is picked up
 /// when the user returns to it.
 fn detect_dark_background() -> bool {
-    match std::env::var("JVIEW_THEME").ok().as_deref() {
+    let forced = std::env::var("JSONVIEW_THEME")
+        .or_else(|_| std::env::var("JVIEW_THEME")) // pre-rename name, still honored
+        .ok();
+    match forced.as_deref() {
         Some("light") => return false,
         Some("dark") => return true,
         _ => {}
@@ -2009,7 +2012,7 @@ const EXTRACT_HINT: &str = "output piped — press p to extract the focused node
 /// Where an extracted node's JSON goes when the viewer exits after `p`.
 ///
 /// A full-screen TUI and clean piped data can't share fd 1. When stdout is
-/// redirected (`jview f.json | jq`, `> out.json`) we dup the real stdout aside
+/// redirected (`jsonview f.json | jq`, `> out.json`) we dup the real stdout aside
 /// here and point fd 1 at the controlling terminal, so every existing
 /// `stdout()` render/escape lands on the tty while the pipe stays pristine for
 /// the payload. When stdout is already a terminal there's nothing to pipe into,
@@ -2197,7 +2200,7 @@ fn run_file(path: String) -> std::io::Result<()> {
 fn run_stdin() -> std::io::Result<()> {
     let rx = spawn_reader(take_pipe_reader());
     // stdin was the pipe; fd 0 is now the terminal (reattached above). Reserve
-    // stdout so `… | jview | jq` can extract a node into the downstream pipe.
+    // stdout so `… | jsonview | jq` can extract a node into the downstream pipe.
     let payload = reserve_stdout_for_payload();
     let mut store = StreamStore::new();
     let mut jsonl = false;
@@ -2230,11 +2233,13 @@ fn run_stdin() -> std::io::Result<()> {
 }
 
 const USAGE: &str = "\
-jview — browse, navigate and search multi-GB JSON in the terminal
+jsonview — browse, navigate and search multi-GB JSON in the terminal
 
 USAGE:
-    jview <file.json>          open a file
-    cat file.json | jview      or pipe JSON in (NDJSON auto-detected)
+    jsonview <file.json>          open a file
+    cat file.json | jsonview      or pipe JSON in (NDJSON auto-detected)
+
+    (`jview` and `jv` are aliases for the same command)
 
 OPTIONS:
     -h, --help       print this help
@@ -2245,7 +2250,7 @@ Keys: ↑/↓ move · enter expand · / search · : goto · y copy · ? help · 
 fn main() -> std::io::Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("-V" | "--version") => {
-            println!("jview {}", env!("CARGO_PKG_VERSION"));
+            println!("jsonview {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("-h" | "--help") => {
@@ -2255,7 +2260,7 @@ fn main() -> std::io::Result<()> {
         Some(_) => run_file(std::env::args().nth(1).unwrap()),
         None => {
             if std::io::stdin().is_terminal() {
-                eprintln!("usage: jview <file.json>   (or pipe JSON: cat file.json | jview)");
+                eprintln!("usage: jsonview <file.json>   (or pipe JSON: cat file.json | jsonview)");
                 std::process::exit(2);
             }
             run_stdin()
@@ -2586,7 +2591,8 @@ mod tests {
         assert_eq!(inner, 5, "inner object starts at the second brace");
         // Pass a deliberately over-long provisional end (whole doc) to prove
         // skip_value stops at the inner `}` rather than slicing into `,"c":9}`.
-        let path = std::env::temp_dir().join(format!("jview-extract-{}.json", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("jsonview-extract-{}.json", std::process::id()));
         let f = File::create(&path).expect("temp file");
         let sink = Payload {
             enabled: true,
@@ -2612,7 +2618,7 @@ mod tests {
             .map(|(i, _)| (i, b.len()))
             .collect();
         assert_eq!(ranges.len(), 3);
-        let path = std::env::temp_dir().join(format!("jview-batch-{}.json", std::process::id()));
+        let path = std::env::temp_dir().join(format!("jsonview-batch-{}.json", std::process::id()));
         let sink = Payload {
             enabled: true,
             file: Some(File::create(&path).expect("temp file")),

@@ -66,7 +66,7 @@ jobs:
           gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$TAG" \
                  --repo "$GITHUB_REPOSITORY" \
-                 --title "jview $TAG" \
+                 --title "jsonview $TAG" \
                  --notes "Prebuilt binaries for Linux (x86_64/arm64), macOS (Intel/Apple Silicon), and Windows. Or install with \`cargo binstall jsonview\`."
 
   upload-binaries:
@@ -95,12 +95,12 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: refs/tags/${{ needs.resolve.outputs.tag }}
-      - name: Build and upload jview
+      - name: Build and upload jsonview
         uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: jview
+          bin: jsonview
           target: ${{ matrix.target }}
-          # → jview-<target>.tar.gz (.zip on Windows), uploaded to the tag's release.
+          # → jsonview-<target>.tar.gz (.zip on Windows), uploaded to the tag's release.
           archive: $bin-$target
           # Explicit so the action targets the tag on a manual run too (where
           # github.ref is a branch, not the tag).

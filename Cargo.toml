@@ -12,18 +12,17 @@ keywords = ["json", "tui", "viewer", "mmap", "ratatui"]
 categories = ["command-line-utilities", "visualization"]
 exclude = ["/.github"]
 
-# The crate publishes as `jsonview` (a clearer search term than `jview`), but
-# the binary, repo, and GitHub release archives are all `jview` — so keep that
-# as the installed command name.
+# `jsonview` is the real binary. The short `jview` / `jv` aliases are symlinks
+# created by install.sh — Cargo has no alias mechanism, and declaring them as
+# extra [[bin]] targets would link a full copy of the binary for each one.
 [[bin]]
-name = "jview"
+name = "jsonview"
 path = "src/main.rs"
 
-# `cargo binstall jsonview` fetches the prebuilt GitHub release archives, which
-# are named `jview-<target>` (built by .github/workflows/release.yml), not the
-# crate name. Map binstall to them explicitly.
+# `cargo binstall jsonview` fetches the prebuilt GitHub release archives built
+# by .github/workflows/release.yml. Map binstall to their layout explicitly.
 [package.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/jview-{ target }.{ archive-format }"
+pkg-url = "{ repo }/releases/download/v{ version }/jsonview-{ target }.{ archive-format }"
 bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 

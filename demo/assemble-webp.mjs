@@ -19,7 +19,7 @@ import { join } from "node:path";
 
 const inDir = process.argv[2] ?? "frames";
 const out = process.argv[3] ?? "docs/demo.webp";
-const work = join(tmpdir(), `jview-webp-${process.pid}`);
+const work = join(tmpdir(), `jsonview-webp-${process.pid}`);
 mkdirSync(work, { recursive: true });
 
 // Pair frames by sequence index via ffmpeg's two-input glob: input 0 is the

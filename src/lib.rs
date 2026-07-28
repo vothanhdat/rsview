@@ -1,10 +1,11 @@
-//! jview is a terminal JSON viewer with mmap-backed lazy parsing.
+//! jsonview is a terminal JSON viewer with mmap-backed lazy parsing.
 //!
 //! **This crate ships only a binary — there is no public Rust API.**
 //! Install with `cargo install jsonview` (or `cargo binstall jsonview`) and
-//! run the `jview` command. See <https://github.com/vothanhdat/rsview> for
-//! usage, key bindings, and how the lazy byte-range tree keeps memory
-//! near-constant on multi-GB files.
+//! run the `jsonview` command (`jview` and `jv` are aliases installed by
+//! install.sh). See <https://github.com/vothanhdat/rsview> for usage, key
+//! bindings, and how the lazy byte-range tree keeps memory near-constant on
+//! multi-GB files.
 //!
 //! This empty library target exists only so docs.rs (which always invokes
 //! `cargo rustdoc --lib`) can complete its build — without it the docs

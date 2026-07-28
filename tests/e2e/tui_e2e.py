@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""End-to-end TUI tests for jview.
+"""End-to-end TUI tests for jsonview.
 
 Drives the real binary inside a pseudo-terminal and asserts on what it paints,
 using pyte as a headless terminal emulator. This is the kind of thing unit tests
 can't reach — actual key handling, sticky headers, overlays, and the footer.
 
 Usage:
-    python tests/e2e/tui_e2e.py [path-to-jview]      # default: target/release/jview
+    python tests/e2e/tui_e2e.py [path-to-jsonview]   # default: target/release/jsonview
 
 Requires: pyte  (pip install pyte).  Unix only (uses pty.fork).
 Exits 0 if every scenario passes, 1 otherwise.
@@ -31,13 +31,13 @@ FAILS = []
 
 
 class Tui:
-    """A running jview in a pty, with a pyte screen mirroring its output."""
+    """A running jsonview in a pty, with a pyte screen mirroring its output."""
 
     def __init__(self, binary, doc, pipe=False):
-        # File mode passes a path; pipe mode feeds the doc to jview's stdin (the
+        # File mode passes a path; pipe mode feeds the doc to jsonview's stdin (the
         # spill-to-tempfile streaming path) and passes no arguments.
         self.pipe = pipe
-        self.path = f"/tmp/jview_e2e_{os.getpid()}.json"
+        self.path = f"/tmp/jsonview_e2e_{os.getpid()}.json"
         raw = doc if isinstance(doc, (str, bytes)) else json.dumps(doc)
         if isinstance(raw, str):
             raw = raw.encode()
@@ -51,7 +51,7 @@ class Tui:
             # Pin the theme so the background probe (terminal-colorsaurus) is
             # skipped: pyte never answers an OSC 11 query, so leaving it unset
             # would just wait out the timeout on every spawn.
-            os.environ["JVIEW_THEME"] = "dark"
+            os.environ["JSONVIEW_THEME"] = "dark"
             if pipe:
                 r, w = os.pipe()
                 if os.fork() == 0:  # grandchild feeds the pipe, then EOFs
@@ -375,7 +375,7 @@ def scenario_peek(binary):
 def scenario_stream_pipe(binary):
     print("stream: piped stdin renders, searches, and cleans up its spill file")
     import glob
-    pre = set(glob.glob("/tmp/jview-stream-*"))
+    pre = set(glob.glob("/tmp/jsonview-stream-*"))
     # NDJSON piped in (not a file) exercises the spill-to-tempfile path.
     doc = "\n".join(json.dumps({"id": i, "tag": "NEEDLE" if i == 40 else "x"})
                     for i in range(60))
@@ -385,7 +385,7 @@ def scenario_stream_pipe(binary):
         check("piped stream renders as it arrives",
               "id" in scr and "stdin" in t.title(), t)
         # While running, the spill file is unlinked (no visible name) yet held open.
-        named = set(glob.glob("/tmp/jview-stream-*")) - pre
+        named = set(glob.glob("/tmp/jsonview-stream-*")) - pre
         check("spill temp file is unlinked (no lingering name)", not named, t)
         # Search runs over the spilled mmap and finds a row deep in the stream.
         t.send("/"); t.send("NEEDLE"); t.pump(0.8)
@@ -396,7 +396,7 @@ def scenario_stream_pipe(binary):
     finally:
         t.close()
         t.pump(0.2)
-    leftover = set(glob.glob("/tmp/jview-stream-*")) - pre
+    leftover = set(glob.glob("/tmp/jsonview-stream-*")) - pre
     check("no spill temp files leak after exit", not leftover, t)
 
 
@@ -541,7 +541,7 @@ def scenario_bookmark_indicator(binary):
 
 
 def main():
-    binary = sys.argv[1] if len(sys.argv) > 1 else "target/release/jview"
+    binary = sys.argv[1] if len(sys.argv) > 1 else "target/release/jsonview"
     if not os.path.exists(binary):
         sys.exit(f"binary not found: {binary} (build it: cargo build --release)")
     binary = os.path.abspath(binary)

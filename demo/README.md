@@ -31,11 +31,11 @@ rm -rf frames demo/big.json
   with `-d <ms>` matched to the tape's `Set Framerate`. End result keeps the
   blinking cursor at the shell prompt that the cursor-less path was dropping.
 - **`JVIEW_NO_ENHANCED_KEYS=1` is required** on the vhs invocation. vhs records
-  through a headless `ttyd` terminal that never answers jview's keyboard-
-  enhancement probe, so without it jview stalls ~2s on a blank screen at startup
+  through a headless `ttyd` terminal that never answers jsonview's keyboard-
+  enhancement probe, so without it jsonview stalls ~2s on a blank screen at startup
   (a real terminal replies instantly — actual users never see this). vhs passes
   its own environment down to the recorded shell, which is how the var reaches
-  jview.
+  jsonview.
 
 `demo/big.json` and the intermediate `frames/` are git-ignored (huge,
 reproducible). Commit only the rendered `docs/demo.webp`.

@@ -450,7 +450,7 @@ pub fn make_root(b: &[u8], name: &str, jsonl: bool) -> Node {
     } else {
         let rstart = skip_ws(b, 0, b.len());
         if rstart >= b.len() {
-            // Empty / whitespace-only input (e.g. `jview </dev/null`, or a stream
+            // Empty / whitespace-only input (e.g. `jsonview </dev/null`, or a stream
             // with no data yet): show an empty root rather than indexing past the
             // buffer in value_kind.
             (rstart, Kind::Null, false)
