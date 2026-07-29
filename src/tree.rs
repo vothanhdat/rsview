@@ -45,6 +45,27 @@ const SKIP_CHUNK_BYTES: usize = 2 << 20; // 2 MiB
 /// level — a key past this many siblings reports "not found" rather than hanging.
 const GOTO_SCAN_CAP: usize = 100_000;
 
+/// Where a node's children come from — the one question every consumer of a
+/// level has to answer before it scans anything.
+///
+/// Most nodes are [`Range`](Children::Range): the children are inside the node's
+/// own bytes. The two synthetic roots are not, each for its own reason, and a
+/// consumer that assumes `Range` reports on the wrong bytes entirely — so the
+/// answer lives here, on the node, rather than being re-derived at each call site.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Children {
+    /// A bracketed container: scan `[start, end)` for them. The normal case.
+    Range,
+    /// The NDJSON root: one document per line across `[start, end)`.
+    Lines,
+    /// Fed from outside — a filter pane's hits, collected by its worker from all
+    /// over the document. `children` is the whole truth about this level;
+    /// `[start, end)` records only the region that was searched, so anything
+    /// derived from it (a count, an aggregate, a copy, a search scope) would be
+    /// about the document, not about these values.
+    External,
+}
+
 /// A lazily-expanding tree node. Children are scanned on demand from `cursor`
 /// (resumable), so a collapsed node costs O(1) and a huge level only enumerates
 /// as far as it's scrolled.
@@ -59,9 +80,8 @@ pub struct Node {
     pub end_exact: bool,
     pub kind: Kind,
     pub is_index: bool,
-    /// Synthetic NDJSON root: children are the documents, enumerated by a
-    /// `Cursor::lines` instead of a bracketed-container cursor.
-    pub jsonl: bool,
+    /// How this node's children are enumerated. See [`Children`].
+    pub children_from: Children,
     pub has_children: bool,
     pub expanded: bool,
     pub done: bool,
@@ -74,13 +94,28 @@ impl Node {
         matches!(self.kind, Kind::Object | Kind::Array)
     }
 
-    /// The right child-cursor for this node: a line stream for the NDJSON root,
-    /// otherwise a normal bracketed-container cursor.
-    fn make_cursor(&self) -> Cursor {
-        if self.jsonl {
-            Cursor::lines(self.start, self.end)
-        } else {
-            Cursor::new(self.start, self.end, matches!(self.kind, Kind::Array))
+    /// The NDJSON root, whose children are lines rather than bracketed values.
+    pub fn is_lines(&self) -> bool {
+        self.children_from == Children::Lines
+    }
+
+    /// A level fed from outside the byte range (filter hits) — see
+    /// [`Children::External`]. Its `children` are the level; its range is not.
+    pub fn is_external(&self) -> bool {
+        self.children_from == Children::External
+    }
+
+    /// The right child-cursor for this node, or `None` when its children don't
+    /// come from its bytes at all.
+    fn make_cursor(&self) -> Option<Cursor> {
+        match self.children_from {
+            Children::Lines => Some(Cursor::lines(self.start, self.end)),
+            Children::Range => Some(Cursor::new(
+                self.start,
+                self.end,
+                matches!(self.kind, Kind::Array),
+            )),
+            Children::External => None,
         }
     }
 
@@ -96,7 +131,7 @@ impl Node {
             end_exact: rc.end_exact,
             kind: rc.kind,
             is_index: rc.is_index,
-            jsonl: false,
+            children_from: Children::Range,
             has_children: has,
             expanded: false,
             done: false,
@@ -113,7 +148,7 @@ impl Node {
         // Init the child cursor on first expand only; collapse keeps the cursor +
         // already-scanned children so re-expand resumes instead of rescanning.
         if self.expanded && self.cursor.is_none() && self.children.is_empty() && !self.done {
-            self.cursor = Some(self.make_cursor());
+            self.cursor = self.make_cursor();
         }
     }
 
@@ -129,7 +164,13 @@ impl Node {
             match nx {
                 Some(rc) => self.children.push(Node::from_raw(rc, b)),
                 None => {
-                    self.done = true;
+                    // An external level runs out of children whenever its feeder
+                    // is behind, which says nothing about whether it's finished —
+                    // only the feeder knows that, and it sets `done` itself. (So
+                    // this must not *clear* the flag either.)
+                    if !self.is_external() {
+                        self.done = true;
+                    }
                     break;
                 }
             }
@@ -210,7 +251,24 @@ impl Node {
     fn collapsed_preview(&self, b: &[u8]) -> String {
         let arr = matches!(self.kind, Kind::Array);
         let (open, close) = if arr { ("[", "]") } else { ("{", "}") };
-        let mut cur = self.make_cursor();
+        // An external level has no cursor: preview the children it was handed.
+        let Some(mut cur) = self.make_cursor() else {
+            let n = self.children.len();
+            let mut parts: Vec<String> = self.children[..n.min(PREVIEW_ITEMS)]
+                .iter()
+                .map(|c| brief_value(b, c.start, c.end, c.kind))
+                .collect();
+            if parts.is_empty() {
+                return format!("{open}{close}");
+            }
+            if n > PREVIEW_ITEMS {
+                parts.push("…".into());
+            }
+            return truncate(
+                &format!("{open} {} {close}", parts.join(", ")),
+                PREVIEW_WIDTH,
+            );
+        };
         let mut parts: Vec<String> = Vec::new();
         let mut more = false;
         loop {
@@ -477,7 +535,11 @@ pub fn make_root(b: &[u8], name: &str, jsonl: bool) -> Node {
         end_exact: false, // provisional (to EOF) — copy re-resolves bounded by its cap
         kind,
         is_index: false,
-        jsonl,
+        children_from: if jsonl {
+            Children::Lines
+        } else {
+            Children::Range
+        },
         has_children: has,
         expanded: false,
         done: false,
@@ -504,7 +566,7 @@ pub fn make_subroot(b: &[u8], label: String, start: usize, end: usize, kind: Kin
         end_exact: true, // caller passed the node's already-resolved real end
         kind,
         is_index: false,
-        jsonl: false,
+        children_from: Children::Range,
         has_children: has,
         expanded: false,
         done: false,
@@ -772,10 +834,13 @@ pub fn set_expanded(root: &mut Node, b: &[u8], path: &[usize]) {
 /// end). `None` for a scalar. Backs the `c` key: "how big is this?" without
 /// expanding a possibly-huge level.
 pub fn count_children(node: &Node, b: &[u8]) -> Option<usize> {
-    if !node.jsonl && !matches!(node.kind, Kind::Object | Kind::Array) {
+    if !node.is_lines() && !matches!(node.kind, Kind::Object | Kind::Array) {
         return None;
     }
-    let mut cur = node.make_cursor();
+    // An external level is its `children` — there's nothing to scan.
+    let Some(mut cur) = node.make_cursor() else {
+        return Some(node.children.len());
+    };
     let mut n = 0usize;
     while cur.next(b).is_some() {
         n += 1;
@@ -809,10 +874,9 @@ impl NumStats {
 /// counted in `total` but skipped; `None` for a scalar (not a container), and
 /// `count == 0` when a container holds no numbers.
 pub fn aggregate_numbers(node: &Node, b: &[u8]) -> Option<NumStats> {
-    if !node.jsonl && !matches!(node.kind, Kind::Object | Kind::Array) {
+    if !node.is_lines() && !matches!(node.kind, Kind::Object | Kind::Array) {
         return None;
     }
-    let mut cur = node.make_cursor();
     let mut s = NumStats {
         count: 0,
         total: 0,
@@ -820,10 +884,10 @@ pub fn aggregate_numbers(node: &Node, b: &[u8]) -> Option<NumStats> {
         min: f64::INFINITY,
         max: f64::NEG_INFINITY,
     };
-    while let Some(rc) = cur.next(b) {
+    let fold = |start: usize, end: usize, kind: Kind, s: &mut NumStats| {
         s.total += 1;
-        if rc.kind == Kind::Number {
-            if let Some(x) = std::str::from_utf8(&b[rc.start..rc.end])
+        if kind == Kind::Number {
+            if let Some(x) = std::str::from_utf8(&b[start..end])
                 .ok()
                 .and_then(|t| t.trim().parse::<f64>().ok())
             {
@@ -833,6 +897,16 @@ pub fn aggregate_numbers(node: &Node, b: &[u8]) -> Option<NumStats> {
                 s.max = s.max.max(x);
             }
         }
+    };
+    // An external level is its `children` — fold those, not the searched range.
+    let Some(mut cur) = node.make_cursor() else {
+        for c in &node.children {
+            fold(c.start, c.end, c.kind, &mut s);
+        }
+        return Some(s);
+    };
+    while let Some(rc) = cur.next(b) {
+        fold(rc.start, rc.end, rc.kind, &mut s);
     }
     Some(s)
 }
@@ -895,5 +969,86 @@ mod agg_tests {
     #[test]
     fn scalar_is_not_a_container() {
         assert!(stats("42").is_none());
+    }
+}
+
+/// A level whose children come from outside its byte range (a filter pane's
+/// hits). Everything that reports on a level has to read `children`, not the
+/// range — the range is the region that was *searched*.
+#[cfg(test)]
+mod external_tests {
+    use super::*;
+
+    /// The three prices in `doc`, as an external level whose own range spans the
+    /// whole document — exactly the shape `launch_filter` builds.
+    fn hits_level(doc: &str) -> Node {
+        let b = doc.as_bytes();
+        let children: Vec<Node> = doc
+            .match_indices(|c: char| c.is_ascii_digit())
+            .map(|(i, s)| Node {
+                label: format!("hit{i}"),
+                start: i,
+                end: i + s.len(),
+                end_exact: true,
+                kind: Kind::Number,
+                is_index: false,
+                children_from: Children::Range,
+                has_children: false,
+                expanded: false,
+                done: true,
+                children: Vec::new(),
+                cursor: None,
+            })
+            .collect();
+        Node {
+            label: "| filter".into(),
+            start: 0,
+            end: b.len(),
+            end_exact: false,
+            kind: Kind::Array,
+            is_index: false,
+            children_from: Children::External,
+            has_children: !children.is_empty(),
+            expanded: true,
+            done: false,
+            children,
+            cursor: None,
+        }
+    }
+
+    #[test]
+    fn counting_an_external_level_counts_its_children_not_its_range() {
+        let doc = r#"{"a":1,"b":2,"c":3,"tail":"zzzz"}"#;
+        let n = hits_level(doc);
+        assert_eq!(count_children(&n, doc.as_bytes()), Some(3));
+    }
+
+    #[test]
+    fn aggregating_an_external_level_folds_its_children() {
+        let doc = r#"{"a":1,"b":2,"c":3,"tail":"zzzz"}"#;
+        let s = aggregate_numbers(&hits_level(doc), doc.as_bytes()).unwrap();
+        assert_eq!((s.count, s.total, s.sum), (3, 3, 6.0));
+    }
+
+    #[test]
+    fn an_external_level_never_builds_a_cursor_over_its_range() {
+        let doc = r#"{"a":1}"#;
+        assert!(hits_level(doc).make_cursor().is_none());
+    }
+
+    #[test]
+    fn running_out_of_children_doesnt_finish_an_external_level() {
+        // The feeder is behind, not done — only it can say the level is complete.
+        let doc = r#"{"a":1}"#;
+        let mut n = hits_level(doc);
+        n.ensure_child(doc.as_bytes(), 99);
+        assert!(!n.done, "an empty scan must not declare the level finished");
+    }
+
+    #[test]
+    fn a_collapsed_external_level_previews_its_children() {
+        let doc = r#"{"a":1,"b":2,"c":3,"tail":"zzzz"}"#;
+        let p = hits_level(doc).collapsed_preview(doc.as_bytes());
+        assert_eq!(p, "[ 1, 2, 3 ]");
     }
 }

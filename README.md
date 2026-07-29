@@ -202,6 +202,14 @@ the richer ones:
   intentional divergences from jq keep it zero-copy: a slice yields its elements
   as a stream rather than a new sub-array, and cross-type comparisons are simply
   unequal/unordered.
+
+  A result pane's rows are values from all over the file, so the pane's own root
+  is that **list of hits**, not a slice of the document — and everything that
+  reports on a level reads the hits: `c` counts them, `#` totals them, `y` copies
+  them (NDJSON, like `p`), `t`/`T` infer and tabulate *their* shape. Two keys
+  need a byte range and so aren't offered there: `s`/`o` (split a hit instead)
+  and `Tab`-scoping a search. Pressing `|` again re-runs over the same value the
+  first filter scanned, which is what makes `|` then `↑` an *edit-and-rerun*.
 - **Peek (`Enter` on a leaf)** — rows truncate a value to keep one line each, so a
   long string, a URL, an embedded-JSON blob, or a multi-line log line gets cut off
   with `…`. Press `Enter`/`Space` on a scalar (there's nothing to expand) to open a
@@ -216,7 +224,9 @@ the richer ones:
 - **Copy (`y`/`Y`)** — goes through the terminal via
   [OSC 52](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Operating-System-Commands),
   so it needs no clipboard library and **works over SSH** (capped ~1 MiB; in tmux
-  set `set -g set-clipboard on`).
+  set `set -g set-clipboard on`). On a **filter-result pane**, `y` on the result
+  list copies *every* hit as NDJSON — the same bytes `p` writes there, just to the
+  clipboard and capped.
 - **Pipe out (`p`)** — when you redirect jsonview's output
   (`jsonview big.json | jq …`, or `> node.json`), the UI renders on your terminal
   and `p` writes the focused node's raw JSON to that pipe/file, then quits. The
@@ -278,6 +288,7 @@ which could never have opened the whole file itself.
 | File | Role |
 | --- | --- |
 | [src/scanner.rs](src/scanner.rs) | byte-range JSON scan + resumable child `Cursor` |
+| [src/tree.rs](src/tree.rs) | the lazy `Node` tree: byte ranges, windowed flatten, and where each level's children come from |
 | [src/main.rs](src/main.rs) | lazy `Node` tree, windowed flatten, multi-pane ratatui viewer, stdin streaming |
 | [src/search.rs](src/search.rs) | background-thread search + cancel + result stream |
 | [src/schema.rs](src/schema.rs) | JSON → structural type inference (the `t` overlay, and the table's columns) |

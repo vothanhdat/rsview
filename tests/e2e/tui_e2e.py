@@ -313,6 +313,50 @@ def scenario_filter(binary):
     finally:
         t.close()
 
+    # The result list is a level whose values live all over the document, so
+    # every key that reports on a level has to read the hits, not the region that
+    # was searched.
+    t = Tui(binary, {"items": [{"price": i} for i in range(1, 11)], "tail": "z"})
+    try:
+        t.send("|"); t.send(".items[] | .price"); t.send("\r")
+        t.pump(0.8)
+        t.send("g")                       # focus the result list itself
+        t.send("c")
+        check("c counts the hits, not the searched region",
+              "10 elements" in t.footer(), t)
+        t.send("#")
+        check("# aggregates the hits (the README's filter-then-total workflow)",
+              "10 numbers" in t.footer() and "Σ 55" in t.footer()
+              and "avg 5.5" in t.footer(), t)
+        t.send("y")
+        check("y copies every hit, one value per line like p",
+              "copied 10 values" in t.footer(), t)
+        t.send("t")
+        check("t infers the hits' type, not the document's",
+              "number[]" in t.card(), t)
+        t.send("\x1b")
+        t.send("T")
+        check("T tabulates the hits", "▦" in t.title() and "value" in t.line(1), t)
+        check("rows are labelled by where each hit came from",
+              "items[0].price" in t.line(2), t)
+        t.send("T")                       # back to the tree — on the row we were on
+        t.send("g")                       # so re-focus the result list
+        # Keys that need a byte range say so instead of acting on the wrong one.
+        t.send("s")
+        check("s explains that a result list has no range to split at",
+              "split a result" in t.footer(), t)
+        t.send("/"); t.send("1")
+        check("no scope hint is offered — the hits aren't one range",
+              "scope" not in t.footer(), t)
+        t.send("\x1b")
+        # `|` then `↑` (edit the last filter) re-runs over what the first run
+        # scanned — from here the pane's own root is the hits, not a range.
+        t.send("|"); t.send("\x1b[A"); t.send("\r"); t.pump(0.8)
+        check("re-running an edited filter from a result pane finds the hits again",
+              "items[0].price" in t.dump(), t)
+    finally:
+        t.close()
+
     # Regex string match with the ~ operator inside select.
     t = Tui(binary, {"files": [
         {"name": "report.pdf"},

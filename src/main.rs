@@ -25,7 +25,7 @@ use table::Table;
 use tree::{
     aggregate_numbers, breadcrumb_segments, collect_expanded, count_children, expand_to, flatten,
     get, get_mut, join_path, make_root, make_subroot, parse_path, resolve_with_climb, set_expanded,
-    truncate, Node, Row,
+    truncate, Children, Node, Row,
 };
 
 use memmap2::Mmap;
@@ -331,6 +331,8 @@ pub(crate) struct View {
     /// The running filter for a *result* pane: its streamed hits become this
     /// pane's synthetic-array children. `None` for ordinary panes.
     pub(crate) filter: Option<Filter>,
+    /// What that filter ran over, so an edited re-run starts from the same value.
+    pub(crate) filter_scope: Option<FilterScope>,
     /// How many of `filter.hits` are already materialized as root children.
     pub(crate) filter_added: usize,
     /// The open value-peek overlay, if any (`Mode::Peek`).
@@ -385,6 +387,7 @@ impl View {
             filter_query: TextInput::default(),
             filter_error: None,
             filter: None,
+            filter_scope: None,
             filter_added: 0,
             peek: None,
             schema: None,
@@ -498,12 +501,17 @@ impl View {
     fn scope_of_focus(&self) -> Option<Scope> {
         let row = self.rows.get(self.focus)?;
         let node = get(&self.root, &row.path);
-        if node.jsonl || matches!(node.kind, Kind::Object | Kind::Array) {
+        // An external level's bytes are scattered — there's no one range to hand
+        // the search worker, so it simply isn't scopable (no `⇥ scope` hint).
+        if node.is_external() {
+            return None;
+        }
+        if node.is_lines() || matches!(node.kind, Kind::Object | Kind::Array) {
             Some(Scope {
                 start: node.start,
                 end: node.end,
                 kind: node.kind,
-                jsonl: node.jsonl,
+                jsonl: node.is_lines(),
                 path: row.path.clone(),
                 label: row.label.clone(),
             })
@@ -554,7 +562,7 @@ impl View {
                 self.root.start,
                 self.root.end,
                 self.root.kind,
-                self.root.jsonl,
+                self.root.is_lines(),
             ),
         };
         self.search = Some(Search::spawn(
@@ -608,7 +616,7 @@ impl View {
                 end_exact,
                 kind,
                 is_index: false,
-                jsonl: false,
+                children_from: Children::Range,
                 has_children: has,
                 expanded: false,
                 done: false,
@@ -619,6 +627,12 @@ impl View {
         }
         if self.filter_added > 0 {
             self.root.has_children = true;
+        }
+        // The worker is the only one who knows the level is complete — an external
+        // node can't tell by running out of children. Pass it on, so `flatten` and
+        // the table stop showing the count as provisional.
+        if self.filter.as_ref().is_some_and(|f| f.finished) {
+            self.root.done = true;
         }
     }
 
@@ -769,16 +783,15 @@ impl View {
     fn infer_focused(&self, b: &[u8]) -> Option<(String, schema::Type)> {
         let row = self.rows.get(self.focus)?;
         let node = get(&self.root, &row.path);
-        if !node.jsonl && !matches!(node.kind, Kind::Object | Kind::Array) {
+        if !node.is_lines() && !matches!(node.kind, Kind::Object | Kind::Array) {
             return None;
         }
-        // A filter-result pane's root is synthetic: its children are hits from all
-        // over the document, so its type comes from *them*. Its byte range is the
-        // range that was searched, which would infer something else entirely.
-        let ty = if self.filter.is_some() && row.path.is_empty() {
+        // An external level's type comes from its children; its byte range is the
+        // region that was searched, which would infer something else entirely.
+        let ty = if node.is_external() {
             schema::infer_seq(b, node.children.iter().map(|c| (c.start, c.end, c.kind)))
         } else {
-            schema::infer(b, node.start, node.end, node.kind, node.jsonl)
+            schema::infer(b, node.start, node.end, node.kind, node.is_lines())
         };
         Some((row.label.clone(), ty))
     }
@@ -844,11 +857,6 @@ impl View {
             node.toggle();
         }
         t.refresh(node, b, vis, w);
-        // On a filter-result pane the rows arrive from the worker, not a cursor,
-        // so "is that all of them?" is the filter's answer, not the node's.
-        if let Some(f) = self.filter.as_ref() {
-            t.done = f.finished;
-        }
         self.table = Some(t);
     }
 
@@ -958,6 +966,17 @@ pub(crate) struct App {
     pub(crate) filter_history: History,
 }
 
+/// The value a filter was evaluated over. Kept on the result pane it produced,
+/// so an edited re-run (`|` then `↑`) starts where the first run started — the
+/// result pane's own root is the hits, which have no range of their own.
+#[derive(Clone, Copy)]
+pub(crate) struct FilterScope {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) kind: Kind,
+    pub(crate) jsonl: bool,
+}
+
 /// A parsed, ready-to-run filter plus the pane range it should evaluate over.
 pub(crate) struct PendingFilter {
     pub(crate) program: Program,
@@ -989,19 +1008,37 @@ impl App {
 
     /// Byte range of the active pane's focused node (its raw JSON value/subtree).
     fn focused_range(&self) -> Option<(usize, usize)> {
+        let node = self.focused_node()?;
+        Some((node.start, node.end))
+    }
+
+    /// The active pane's focused node, if it has a focused row.
+    fn focused_node(&self) -> Option<&Node> {
         let v = self.active_view();
         let row = v.rows.get(v.focus)?;
-        let node = get(&v.root, &row.path);
-        Some((node.start, node.end))
+        Some(get(&v.root, &row.path))
+    }
+
+    /// Whether the focus is a level fed from outside its byte range (a filter
+    /// pane's result list) — the keys that slice or re-root a range can't serve it.
+    fn focus_is_external(&self) -> bool {
+        self.focused_node().is_some_and(|n| n.is_external())
     }
 
     /// Copy the focused node's raw JSON (a scalar literal, or a whole subtree) to
     /// the terminal clipboard. Clamped to `COPY_MAX_BYTES`. Returns a status line.
     fn yank_value(&self, b: &[u8]) -> String {
-        match self.focused_range() {
-            Some((s, prov_end)) => copy_range(b, s, prov_end),
-            None => "nothing to copy".to_string(),
+        let Some(node) = self.focused_node() else {
+            return "nothing to copy".to_string();
+        };
+        // An external level has no single slice to copy — its values are scattered.
+        // Copy them the way `p` writes them: one raw value per line.
+        if node.is_external() {
+            let ranges: Vec<(usize, usize)> =
+                node.children.iter().map(|c| (c.start, c.end)).collect();
+            return copy_ndjson(b, &ranges);
         }
+        copy_range(b, node.start, node.end)
     }
 
     /// The active pane's table and the container node it's drawn over.
@@ -1197,6 +1234,11 @@ impl App {
         if !node.is_container() || !node.has_children {
             return None;
         }
+        // A pane is rooted at a byte range, and an external level hasn't got one
+        // that holds its values — split at a result instead.
+        if node.is_external() {
+            return None;
+        }
         // Chain the origin label off a derived pane's own name; start fresh
         // (no filename prefix) for the document pane.
         let base = if src.derived {
@@ -1277,9 +1319,10 @@ impl App {
         // a narrow split pane; the full expression is what the user just typed.
         let name = format!("| {}", truncate(&pf.expr, 28));
         // A synthetic, pre-expanded array whose children are appended by
-        // `View::pump_filter`. It owns no cursor: the worker, not a byte range,
-        // is its source of children (`start`/`end` are the searched range, so a
-        // whole-root copy still slices something sane).
+        // `View::pump_filter`: the worker, not a byte range, is its source of
+        // children, which is what `Children::External` tells every consumer.
+        // `start`/`end` record the region that was searched — useful context, but
+        // never the level itself.
         let root = Node {
             label: name.clone(),
             start: pf.start,
@@ -1287,7 +1330,7 @@ impl App {
             end_exact: false,
             kind: Kind::Array,
             is_index: false,
-            jsonl: false,
+            children_from: Children::External,
             has_children: false,
             expanded: true,
             done: false,
@@ -1300,6 +1343,12 @@ impl App {
         v.id = id;
         v.parent = Some(parent);
         v.filter = Some(filter);
+        v.filter_scope = Some(FilterScope {
+            start: pf.start,
+            end: pf.end,
+            kind: pf.kind,
+            jsonl: pf.jsonl,
+        });
         self.views.push(v);
         self.active = self.views.len() - 1;
     }
@@ -1315,14 +1364,7 @@ fn copy_range(b: &[u8], start: usize, prov_end: usize) -> String {
     let cap = start.saturating_add(COPY_MAX_BYTES);
     let e = skip_value(b, start, prov_end.min(cap));
     let truncated = e >= cap && cap < prov_end;
-    let slice = &b[start..e];
-    // Trim trailing whitespace — the document root's range runs to EOF, so it
-    // would otherwise carry the file's final newline.
-    let cut = slice
-        .iter()
-        .rposition(|c| !c.is_ascii_whitespace())
-        .map_or(0, |p| p + 1);
-    let slice = &slice[..cut];
+    let slice = trim_value(b, start, e);
     copy_to_clipboard(slice);
     let n = slice.len();
     if truncated {
@@ -1332,6 +1374,50 @@ fn copy_range(b: &[u8], start: usize, prov_end: usize) -> String {
         )
     } else {
         format!("copied value ({n} B)")
+    }
+}
+
+/// One value's bytes, trailing whitespace trimmed — the document root's range
+/// runs to EOF, so it would otherwise carry the file's final newline.
+fn trim_value(b: &[u8], start: usize, end: usize) -> &[u8] {
+    let slice = &b[start..end];
+    let cut = slice
+        .iter()
+        .rposition(|c| !c.is_ascii_whitespace())
+        .map_or(0, |p| p + 1);
+    &slice[..cut]
+}
+
+/// Copy several values as NDJSON — one raw value per line, exactly what `p`
+/// writes for the same set (see [`write_extract_all`]). Backs `y` on a level
+/// whose values are scattered, where there's no one slice to copy. Stops at the
+/// clipboard cap and says how many values made it.
+fn copy_ndjson(b: &[u8], ranges: &[(usize, usize)]) -> String {
+    if ranges.is_empty() {
+        return "nothing to copy".to_string();
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut written = 0usize;
+    for &(start, prov_end) in ranges {
+        let end = skip_value(b, start, prov_end);
+        let slice = trim_value(b, start, end);
+        if out.len() + slice.len() + 1 > COPY_MAX_BYTES {
+            break;
+        }
+        out.extend_from_slice(slice);
+        out.push(b'\n');
+        written += 1;
+    }
+    copy_to_clipboard(&out);
+    let n = out.len();
+    if written < ranges.len() {
+        format!(
+            "copied {written} of {} values ({n} B — {} KiB cap)",
+            ranges.len(),
+            COPY_MAX_BYTES >> 10
+        )
+    } else {
+        format!("copied {written} values ({n} B)")
     }
 }
 
@@ -1504,10 +1590,20 @@ fn process_key(
                 }
                 match parse_pipeline(&expr) {
                     Ok(program) => {
-                        let (start, end, kind, jsonl) = {
-                            let r = &app.active_view().root;
-                            (r.start, r.end, r.kind, r.jsonl)
+                        // A result pane's own root is the *hits* — no single
+                        // range to filter — so it re-runs over the scope its
+                        // filter ran over. That's what `|` `↑` (edit the last
+                        // filter) means from there.
+                        let sc = {
+                            let v = app.active_view();
+                            v.filter_scope.unwrap_or(FilterScope {
+                                start: v.root.start,
+                                end: v.root.end,
+                                kind: v.root.kind,
+                                jsonl: v.root.is_lines(),
+                            })
                         };
+                        let (start, end, kind, jsonl) = (sc.start, sc.end, sc.kind, sc.jsonl);
                         app.filter_history.record(&expr);
                         app.pending_filter = Some(PendingFilter {
                             program,
@@ -1748,7 +1844,7 @@ fn process_key(
                 let node = get(&v.root, &row.path);
                 match count_children(node, b) {
                     Some(n) => {
-                        let what = if matches!(node.kind, Kind::Array) || node.jsonl {
+                        let what = if matches!(node.kind, Kind::Array) || node.is_lines() {
                             "elements"
                         } else {
                             "entries"
@@ -1868,6 +1964,13 @@ fn process_key(
         }
         KeyCode::Char('x') => {
             app.close_active();
+            return KeyOutcome::Continue;
+        }
+        // A pane is a byte range, so splitting at a result *list* has nothing to
+        // root itself in — say so rather than opening a pane over the region that
+        // was searched.
+        KeyCode::Char('s') | KeyCode::Char('o') if app.focus_is_external() => {
+            app.flash = Some("split a result, not the result list".to_string());
             return KeyOutcome::Continue;
         }
         KeyCode::Char('s') => {
